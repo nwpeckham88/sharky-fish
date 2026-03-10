@@ -201,6 +201,9 @@
 					{/if}
 
 					{#if metadataResults}
+						{#if metadataResults.provider_used}
+							<div class="text-[11px] text-[color:var(--ink-muted)]">Searched: <span class="font-semibold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]">{metadataResults.provider_used}</span></div>
+						{/if}
 						<div class="space-y-2">
 							{#if metadataResults.matches.length === 0}
 								<div class="text-xs text-[color:var(--ink-muted)]">No matches found.</div>

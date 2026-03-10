@@ -125,6 +125,11 @@
 		{ value: 'openai', label: 'OpenAI API' },
 	];
 
+	const METADATA_PROVIDERS = [
+		{ value: 'omdb', label: 'OMDb (IMDb-backed)' },
+		{ value: 'tvdb', label: 'TVDB' }
+	] as const;
+
 	function generateLibraryId(name: string): string {
 		return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 	}
@@ -499,10 +504,19 @@
 						<input type="password" value={config.internet_metadata.tvdb_pin ?? ''} oninput={(e) => { if (config) config.internet_metadata.tvdb_pin = (e.target as HTMLInputElement).value || null; }} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
 					</label>
 					<label class="block">
+						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Default Search Provider</span>
+						<select bind:value={config.internet_metadata.default_provider} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]">
+							{#each METADATA_PROVIDERS as { value, label }}
+								<option {value}>{label}</option>
+							{/each}
+						</select>
+						<span class="mt-1 block text-xs text-[color:var(--ink-muted)]">If both API keys are configured, only this provider will be queried by default.</span>
+					</label>
+					<label class="block">
 						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">User Agent</span>
 						<input type="text" bind:value={config.internet_metadata.user_agent} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
 					</label>
-					<p class="text-xs text-[color:var(--ink-muted)]">Library metadata lookup uses OMDb and TVDB. Without API keys, lookup will return warnings and no internet results.</p>
+					<p class="text-xs text-[color:var(--ink-muted)]">Lookup behavior: one configured API key = only that provider searched. Both configured = only default provider searched.</p>
 				</div>
 			</div>
 

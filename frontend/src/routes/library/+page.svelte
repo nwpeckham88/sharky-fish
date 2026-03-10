@@ -708,8 +708,11 @@
 						{#if internetMetadataError}
 							<div class="rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{internetMetadataError}</div>
 						{:else if internetMetadataLoading}
-							<div class="text-xs text-[color:var(--ink-muted)]">Querying providers…</div>
+							<div class="text-xs text-[color:var(--ink-muted)]">Querying provider…</div>
 						{:else if internetMetadata}
+							{#if internetMetadata.provider_used}
+								<div class="mb-2 text-[11px] text-[color:var(--ink-muted)]">Searched: <span class="font-semibold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]">{internetMetadata.provider_used}</span></div>
+							{/if}
 							{#if internetMetadata.matches.length === 0}
 								<div class="text-xs text-[color:var(--ink-muted)]">No matches found for "{internetMetadata.query}".</div>
 							{:else}

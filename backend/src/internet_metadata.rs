@@ -25,6 +25,7 @@ pub struct InternetMetadataResponse {
     pub query: String,
     pub parsed_year: Option<u16>,
     pub media_hint: Option<String>,
+    pub provider_used: Option<String>,
     pub matches: Vec<InternetMetadataMatch>,
     pub warnings: Vec<String>,
 }
@@ -52,39 +53,78 @@ pub async fn lookup_for_library_path(config: &AppConfig, relative_path: &str) ->
     let mut matches: Vec<InternetMetadataMatch> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
 
-    if let Some(key) = config.internet_metadata.omdb_api_key.as_deref().filter(|k| !k.trim().is_empty()) {
-        match lookup_omdb(&client, key.trim(), &query, parsed_year, media_hint.as_deref()).await {
-            Ok(mut found) => matches.append(&mut found),
-            Err(e) => warnings.push(format!("OMDb lookup failed: {}", e)),
-        }
-    } else {
-        warnings.push("OMDb API key not configured".into());
-    }
+    let omdb_key = config
+        .internet_metadata
+        .omdb_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
+    let tvdb_key = config
+        .internet_metadata
+        .tvdb_api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|k| !k.is_empty());
 
-    if let Some(key) = config.internet_metadata.tvdb_api_key.as_deref().filter(|k| !k.trim().is_empty()) {
-        match lookup_tvdb(
-            &client,
-            key.trim(),
-            config.internet_metadata.tvdb_pin.as_deref(),
-            &query,
-            media_hint.as_deref(),
-        )
-        .await
-        {
-            Ok(mut found) => matches.append(&mut found),
-            Err(e) => warnings.push(format!("TVDB lookup failed: {}", e)),
+    let selected_provider = choose_provider(
+        omdb_key.is_some(),
+        tvdb_key.is_some(),
+        &config.internet_metadata.default_provider,
+    );
+
+    match selected_provider.as_deref() {
+        Some("omdb") => {
+            if let Some(key) = omdb_key {
+                match lookup_omdb(&client, key, &query, parsed_year, media_hint.as_deref()).await {
+                    Ok(mut found) => matches.append(&mut found),
+                    Err(e) => warnings.push(format!("OMDb lookup failed: {}", e)),
+                }
+            }
         }
-    } else {
-        warnings.push("TVDB API key not configured".into());
+        Some("tvdb") => {
+            if let Some(key) = tvdb_key {
+                match lookup_tvdb(
+                    &client,
+                    key,
+                    config.internet_metadata.tvdb_pin.as_deref(),
+                    &query,
+                    media_hint.as_deref(),
+                )
+                .await
+                {
+                    Ok(mut found) => matches.append(&mut found),
+                    Err(e) => warnings.push(format!("TVDB lookup failed: {}", e)),
+                }
+            }
+        }
+        None => warnings.push("No metadata provider API key configured".into()),
+        _ => warnings.push("Unknown default metadata provider configured".into()),
     }
 
     Ok(InternetMetadataResponse {
         query,
         parsed_year,
         media_hint,
+        provider_used: selected_provider,
         matches,
         warnings,
     })
+}
+
+fn choose_provider(has_omdb: bool, has_tvdb: bool, configured_default: &str) -> Option<String> {
+    match (has_omdb, has_tvdb) {
+        (false, false) => None,
+        (true, false) => Some("omdb".into()),
+        (false, true) => Some("tvdb".into()),
+        (true, true) => {
+            let normalized = configured_default.trim().to_ascii_lowercase();
+            if normalized == "omdb" || normalized == "tvdb" {
+                Some(normalized)
+            } else {
+                Some("omdb".into())
+            }
+        }
+    }
 }
 
 fn extract_title_and_year(relative_path: &str) -> (String, Option<u16>) {

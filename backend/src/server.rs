@@ -311,6 +311,7 @@ async fn get_library_internet_metadata_bulk(
                         query: path.clone(),
                         parsed_year: None,
                         media_hint: None,
+                        provider_used: None,
                         matches: Vec::new(),
                         warnings: vec![error.to_string()],
                     });

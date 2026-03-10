@@ -118,6 +118,7 @@ export interface InternetMetadataResponse {
 	query: string;
 	parsed_year: number | null;
 	media_hint: string | null;
+	provider_used: string | null;
 	matches: InternetMetadataMatch[];
 	warnings: string[];
 }
@@ -187,6 +188,7 @@ export interface InternetMetadataConfig {
 	tvdb_api_key: string | null;
 	tvdb_pin: string | null;
 	user_agent: string;
+	default_provider: 'omdb' | 'tvdb';
 }
 
 export interface AppConfig {

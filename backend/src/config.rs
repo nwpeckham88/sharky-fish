@@ -59,6 +59,9 @@ pub struct InternetMetadataConfig {
     pub tvdb_pin: Option<String>,
     /// User-Agent sent to internet metadata services.
     pub user_agent: String,
+    /// Default provider when multiple metadata sources are configured.
+    #[serde(default = "default_metadata_provider")]
+    pub default_provider: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +147,10 @@ fn default_bulk_metadata_max_inflight() -> usize {
     2
 }
 
+fn default_metadata_provider() -> String {
+    "omdb".into()
+}
+
 /// A named library folder mapped to a subdirectory inside `data_path`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LibraryFolder {
@@ -221,6 +228,7 @@ impl Default for InternetMetadataConfig {
             tvdb_api_key: None,
             tvdb_pin: None,
             user_agent: "sharky-fish/0.1".into(),
+            default_provider: default_metadata_provider(),
         }
     }
 }
