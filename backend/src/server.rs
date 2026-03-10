@@ -5,6 +5,7 @@ use crate::library;
 use crate::library_index;
 use crate::metadata;
 use crate::messages::{LibraryChange, SseEvent};
+use crate::organizer;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -53,6 +54,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/library/internet/bulk", axum::routing::post(get_library_internet_metadata_bulk))
         .route("/api/library/internet/selected", get(get_selected_library_internet_metadata))
+        .route("/api/library/organize", axum::routing::post(organize_library_file))
         .route("/api/libraries", get(list_libraries).post(add_library))
         .route("/api/libraries/{id}", axum::routing::delete(remove_library))
         .route("/api/jobs/{id}", get(get_job))
@@ -114,6 +116,16 @@ struct LibraryInternetMetadataBulkRequest {
 struct SaveSelectedInternetMetadataRequest {
     path: String,
     selected: internet_metadata::InternetMetadataMatch,
+}
+
+#[derive(Deserialize)]
+struct OrganizeLibraryFileRequest {
+    path: String,
+    library_id: Option<String>,
+    selected: Option<internet_metadata::InternetMetadataMatch>,
+    season: Option<u32>,
+    episode: Option<u32>,
+    apply: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -363,6 +375,66 @@ async fn get_selected_library_internet_metadata(
         selected,
     })
     .into_response()
+}
+
+async fn organize_library_file(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<OrganizeLibraryFileRequest>,
+) -> impl IntoResponse {
+    let relative_path = request.path.trim();
+    if relative_path.is_empty() {
+        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+    }
+
+    let selected = if let Some(selected) = request.selected {
+        selected
+    } else {
+        let Some(row) = (match db::fetch_selected_internet_metadata(&state.pool, relative_path).await {
+            Ok(value) => value,
+            Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        }) else {
+            return (StatusCode::BAD_REQUEST, "selected metadata missing; run metadata lookup first").into_response();
+        };
+
+        let genres = serde_json::from_str::<Vec<String>>(&row.genres_json).unwrap_or_default();
+        internet_metadata::InternetMetadataMatch {
+            provider: row.provider,
+            title: row.title,
+            year: row.year.map(|v| v as u16),
+            media_kind: row.media_kind,
+            imdb_id: row.imdb_id,
+            tvdb_id: row.tvdb_id.map(|v| v as u64),
+            overview: row.overview,
+            rating: row.rating,
+            genres,
+            poster_url: row.poster_url,
+            source_url: row.source_url,
+        }
+    };
+
+    let config = {
+        let cfg = state.config.read().await;
+        cfg.clone()
+    };
+
+    let apply = request.apply.unwrap_or(false);
+    match organizer::preview_or_apply(
+        &config,
+        &state.library_path,
+        organizer::OrganizeRequest {
+            relative_path: relative_path.to_string(),
+            library_id: request.library_id,
+            selected,
+            season: request.season,
+            episode: request.episode,
+        },
+        apply,
+    )
+    .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
 }
 
 /// SSE endpoint: streams real-time events to the frontend.

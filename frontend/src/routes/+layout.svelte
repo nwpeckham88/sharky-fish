@@ -19,6 +19,7 @@
 		{ href: '/', label: 'Dashboard', icon: 'dashboard' },
 		{ href: '/intake', label: 'Intake', icon: 'intake' },
 		{ href: '/library', label: 'Library', icon: 'library' },
+		{ href: '/organize', label: 'File Organization', icon: 'organize' },
 		{ href: '/forge', label: 'The Forge', icon: 'forge' },
 		{ href: '/settings', label: 'Settings', icon: 'settings' },
 	] as const;
@@ -113,6 +114,8 @@
 							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
 						{:else if item.icon === 'library'}
 							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg>
+						{:else if item.icon === 'organize'}
+							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 6h18"/><path d="M7 12h10"/><path d="M10 18h4"/></svg>
 						{:else if item.icon === 'forge'}
 							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
 						{:else if item.icon === 'settings'}
@@ -141,6 +144,7 @@
 						{#if page.url.pathname === '/'}Dashboard
 						{:else if page.url.pathname.startsWith('/intake')}Intake Triage
 						{:else if page.url.pathname.startsWith('/library')}Library Audit
+						{:else if page.url.pathname.startsWith('/organize')}File Organization
 						{:else if page.url.pathname.startsWith('/forge')}The Forge
 						{:else if page.url.pathname.startsWith('/settings')}Settings
 						{:else}sharky-fish

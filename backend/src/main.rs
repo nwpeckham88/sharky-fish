@@ -6,6 +6,7 @@ mod library;
 mod library_index;
 mod metadata;
 mod messages;
+mod organizer;
 mod server;
 
 use crate::actors::{

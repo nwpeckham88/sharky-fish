@@ -71,6 +71,7 @@
 	// Bulk selection
 	let selectedPaths = $state<Set<string>>(new Set());
 	let bulkMode = $state(false);
+	let expandedShows = $state<Set<string>>(new Set());
 
 	onMount(async () => {
 		const urlQuery = page.url.searchParams.get('q');
@@ -312,6 +313,30 @@
 				: library.filter((i) => i.media_type === typeFilter)
 	);
 
+	const activeLibraryFolder = $derived(
+		activeLibraryId ? libraryFolders.find((l) => l.id === activeLibraryId) ?? null : null
+	);
+
+	const tvShowGroups = $derived.by(() => {
+		if (!activeLibraryFolder || activeLibraryFolder.media_type !== 'tv') {
+			return [] as Array<{ show: string; items: LibraryEntry[] }>;
+		}
+
+		const groups = new Map<string, LibraryEntry[]>();
+		for (const item of filteredLibrary) {
+			const stripped = stripLibraryPrefix(item.relative_path, activeLibraryFolder.path);
+			const parts = stripped.split('/').filter(Boolean);
+			const show = parts[0] ?? 'Unsorted';
+			const arr = groups.get(show) ?? [];
+			arr.push(item);
+			groups.set(show, arr);
+		}
+
+		return Array.from(groups.entries())
+			.map(([show, items]) => ({ show, items: items.sort((a, b) => a.relative_path.localeCompare(b.relative_path)) }))
+			.sort((a, b) => a.show.localeCompare(b.show));
+	});
+
 	const visibleColumnCount = $derived(
 		(bulkMode ? 1 : 0) +
 		1 +
@@ -327,6 +352,7 @@
 		selectedItem = null;
 		selectedMetadata = null;
 		selectedPaths = new Set();
+		expandedShows = new Set();
 		void loadLibrary();
 	}
 
@@ -347,6 +373,21 @@
 	function clearSelection() {
 		selectedPaths = new Set();
 		bulkMode = false;
+	}
+
+	function stripLibraryPrefix(relativePath: string, libraryPath: string): string {
+		const normalized = relativePath.replaceAll('\\', '/');
+		const prefix = libraryPath.endsWith('/') ? libraryPath : `${libraryPath}/`;
+		if (normalized === libraryPath) return '';
+		if (normalized.startsWith(prefix)) return normalized.slice(prefix.length);
+		return normalized;
+	}
+
+	function toggleShow(show: string) {
+		const next = new Set(expandedShows);
+		if (next.has(show)) next.delete(show);
+		else next.add(show);
+		expandedShows = next;
 	}
 
 	function activeLibraryName(): string {
@@ -450,62 +491,97 @@
 <section class="grid gap-5 xl:grid-cols-[minmax(0,1.3fr)_minmax(20rem,0.7fr)]">
 	<!-- File Table -->
 	<div class="overflow-hidden rounded-[1rem] border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.72)]">
-		<table class="w-full text-left text-sm">
-			<thead class="border-b border-[color:var(--line)] bg-[color:rgba(234,223,201,0.6)] text-xs uppercase tracking-[0.18em] text-[color:var(--ink-muted)]">
-				<tr>
-					{#if bulkMode}
-						<th class="w-10 px-3 py-3">
-							<input type="checkbox" checked={filteredLibrary.length > 0 && selectedPaths.size === filteredLibrary.length} onchange={toggleSelectAll} class="accent-[color:var(--accent)]" />
-						</th>
-					{/if}
-					<th class="px-4 py-3">Path</th>
-					<th class="px-4 py-3">Type</th>
-					{#if !activeLibraryId && libraryFolders.length > 0}
-						<th class="px-4 py-3">Library</th>
-					{/if}
-					<th class="px-4 py-3">Size</th>
-					<th class="px-4 py-3">Modified</th>
-				</tr>
-			</thead>
-			<tbody>
-				{#if libraryLoading}
-					<tr><td colspan={visibleColumnCount} class="px-4 py-14 text-center text-[color:var(--ink-muted)]">Scanning library…</td></tr>
-				{:else if filteredLibrary.length === 0}
-					<tr><td colspan={visibleColumnCount} class="px-4 py-14 text-center text-[color:var(--ink-muted)]">No entries match the current filter.</td></tr>
-				{:else}
-					{#each filteredLibrary as item (item.relative_path)}
-						<tr class="cursor-pointer border-b border-[color:rgba(123,105,81,0.14)] last:border-b-0 hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''} {selectedPaths.has(item.relative_path) ? 'bg-[color:rgba(214,180,111,0.08)]' : ''}" onclick={() => { if (bulkMode) { toggleSelect(item.relative_path); } else { loadMetadata(item); } }}>
-							{#if bulkMode}
-								<td class="w-10 px-3 py-3" onclick={(e) => { e.stopPropagation(); toggleSelect(item.relative_path); }}>
-									<input type="checkbox" checked={selectedPaths.has(item.relative_path)} class="accent-[color:var(--accent)]" />
-								</td>
+		{#if activeLibraryFolder?.media_type === 'tv'}
+			<div class="border-b border-[color:var(--line)] bg-[color:rgba(234,223,201,0.6)] px-4 py-3 text-xs uppercase tracking-[0.18em] text-[color:var(--ink-muted)]">
+				TV Shows (Expandable)
+			</div>
+			{#if libraryLoading}
+				<div class="px-4 py-14 text-center text-[color:var(--ink-muted)]">Scanning library…</div>
+			{:else if tvShowGroups.length === 0}
+				<div class="px-4 py-14 text-center text-[color:var(--ink-muted)]">No show entries match the current filter.</div>
+			{:else}
+				<div class="max-h-[38rem] overflow-y-auto">
+					{#each tvShowGroups as group (group.show)}
+						<div class="border-b border-[color:rgba(123,105,81,0.14)]">
+							<button class="flex w-full items-center justify-between px-4 py-3 text-left hover:bg-[color:rgba(214,180,111,0.08)]" onclick={() => toggleShow(group.show)}>
+								<div>
+									<div class="font-semibold text-[color:var(--ink-strong)]">{group.show}</div>
+									<div class="text-xs text-[color:var(--ink-muted)]">{group.items.length} episode file(s)</div>
+								</div>
+								<span class="text-[color:var(--ink-muted)]">{expandedShows.has(group.show) ? '▾' : '▸'}</span>
+							</button>
+							{#if expandedShows.has(group.show)}
+								<div class="bg-[color:rgba(244,236,223,0.5)]">
+									{#each group.items as item (item.relative_path)}
+										<button class="block w-full px-8 py-2.5 text-left text-sm hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''}" onclick={() => loadMetadata(item)}>
+											<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
+											<div class="mt-0.5 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
+										</button>
+									{/each}
+								</div>
 							{/if}
-							<td class="px-4 py-3">
-								<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
-								<div class="mt-0.5 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
-							</td>
-							<td class="px-4 py-3">
-								<span class="status-chip {item.media_type === 'video' ? 'processing' : item.media_type === 'audio' ? 'completed' : ''}">{item.media_type}</span>
-							</td>
-							{#if !activeLibraryId && libraryFolders.length > 0}
-								<td class="px-4 py-3">
-									{#if item.library_id}
-										{@const lib = libraryFolders.find((l) => l.id === item.library_id)}
-										{#if lib}
-											<span class="rounded-full bg-[color:rgba(214,180,111,0.15)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-strong)]">{lib.name}</span>
-										{/if}
-									{:else}
-										<span class="text-[color:var(--ink-muted)] text-xs">—</span>
-									{/if}
-								</td>
-							{/if}
-							<td class="px-4 py-3 text-[color:var(--ink-strong)]">{formatBytes(item.size_bytes)}</td>
-							<td class="px-4 py-3 text-[color:var(--ink-muted)]">{formatTimestamp(item.modified_at)}</td>
-						</tr>
+						</div>
 					{/each}
-				{/if}
-			</tbody>
-		</table>
+				</div>
+			{/if}
+		{:else}
+			<table class="w-full text-left text-sm">
+				<thead class="border-b border-[color:var(--line)] bg-[color:rgba(234,223,201,0.6)] text-xs uppercase tracking-[0.18em] text-[color:var(--ink-muted)]">
+					<tr>
+						{#if bulkMode}
+							<th class="w-10 px-3 py-3">
+								<input type="checkbox" checked={filteredLibrary.length > 0 && selectedPaths.size === filteredLibrary.length} onchange={toggleSelectAll} class="accent-[color:var(--accent)]" />
+							</th>
+						{/if}
+						<th class="px-4 py-3">Path</th>
+						<th class="px-4 py-3">Type</th>
+						{#if !activeLibraryId && libraryFolders.length > 0}
+							<th class="px-4 py-3">Library</th>
+						{/if}
+						<th class="px-4 py-3">Size</th>
+						<th class="px-4 py-3">Modified</th>
+					</tr>
+				</thead>
+				<tbody>
+					{#if libraryLoading}
+						<tr><td colspan={visibleColumnCount} class="px-4 py-14 text-center text-[color:var(--ink-muted)]">Scanning library…</td></tr>
+					{:else if filteredLibrary.length === 0}
+						<tr><td colspan={visibleColumnCount} class="px-4 py-14 text-center text-[color:var(--ink-muted)]">No entries match the current filter.</td></tr>
+					{:else}
+						{#each filteredLibrary as item (item.relative_path)}
+							<tr class="cursor-pointer border-b border-[color:rgba(123,105,81,0.14)] last:border-b-0 hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''} {selectedPaths.has(item.relative_path) ? 'bg-[color:rgba(214,180,111,0.08)]' : ''}" onclick={() => { if (bulkMode) { toggleSelect(item.relative_path); } else { loadMetadata(item); } }}>
+								{#if bulkMode}
+									<td class="w-10 px-3 py-3" onclick={(e) => { e.stopPropagation(); toggleSelect(item.relative_path); }}>
+										<input type="checkbox" checked={selectedPaths.has(item.relative_path)} class="accent-[color:var(--accent)]" />
+									</td>
+								{/if}
+								<td class="px-4 py-3">
+									<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
+									<div class="mt-0.5 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
+								</td>
+								<td class="px-4 py-3">
+									<span class="status-chip {item.media_type === 'video' ? 'processing' : item.media_type === 'audio' ? 'completed' : ''}">{item.media_type}</span>
+								</td>
+								{#if !activeLibraryId && libraryFolders.length > 0}
+									<td class="px-4 py-3">
+										{#if item.library_id}
+											{@const lib = libraryFolders.find((l) => l.id === item.library_id)}
+											{#if lib}
+												<span class="rounded-full bg-[color:rgba(214,180,111,0.15)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-strong)]">{lib.name}</span>
+											{/if}
+										{:else}
+											<span class="text-[color:var(--ink-muted)] text-xs">—</span>
+										{/if}
+									</td>
+								{/if}
+								<td class="px-4 py-3 text-[color:var(--ink-strong)]">{formatBytes(item.size_bytes)}</td>
+								<td class="px-4 py-3 text-[color:var(--ink-muted)]">{formatTimestamp(item.modified_at)}</td>
+							</tr>
+						{/each}
+					{/if}
+				</tbody>
+			</table>
+		{/if}
 	</div>
 
 	<!-- Metadata Panel -->

@@ -143,6 +143,13 @@ export interface LibraryChangeEvent {
 	occurred_at: number;
 }
 
+export interface OrganizeLibraryResult {
+	current_relative_path: string;
+	target_relative_path: string;
+	changed: boolean;
+	applied: boolean;
+}
+
 export interface VideoStandards {
 	codec: string;
 	max_bitrate_mbps: number;
@@ -297,6 +304,26 @@ export async function fetchLibraryEvents(limit = 24): Promise<LibraryChangeEvent
 export async function triggerLibraryRescan(): Promise<void> {
 	const res = await fetch(`${BASE}/library/rescan`, { method: 'POST' });
 	if (!res.ok) throw new Error(`Failed to trigger library rescan: ${res.status}`);
+}
+
+export async function organizeLibraryFile(input: {
+	path: string;
+	library_id?: string;
+	selected?: InternetMetadataMatch;
+	season?: number;
+	episode?: number;
+	apply?: boolean;
+}): Promise<OrganizeLibraryResult> {
+	const res = await fetch(`${BASE}/library/organize`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(input)
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to organize library file: ${res.status}`);
+	}
+	return res.json();
 }
 
 export async function fetchConfig(): Promise<AppConfig> {
