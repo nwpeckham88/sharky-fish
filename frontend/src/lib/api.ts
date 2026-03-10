@@ -89,6 +89,42 @@ export interface LibraryMetadata {
 	cached: boolean;
 }
 
+export interface InternetMetadataMatch {
+	provider: string;
+	title: string;
+	year: number | null;
+	media_kind: string;
+	imdb_id: string | null;
+	tvdb_id: number | null;
+	overview: string | null;
+	rating: number | null;
+	genres: string[];
+	poster_url: string | null;
+	source_url: string | null;
+}
+
+export interface InternetMetadataResponse {
+	query: string;
+	parsed_year: number | null;
+	media_hint: string | null;
+	matches: InternetMetadataMatch[];
+	warnings: string[];
+}
+
+export interface InternetMetadataBulkItem {
+	path: string;
+	result: InternetMetadataResponse;
+}
+
+export interface InternetMetadataBulkResponse {
+	items: InternetMetadataBulkItem[];
+}
+
+export interface SelectedInternetMetadataResponse {
+	path: string;
+	selected: InternetMetadataMatch;
+}
+
 export interface LibraryChangeEvent {
 	relative_path: string;
 	path: string;
@@ -128,6 +164,13 @@ export interface LlmConfig {
 	api_key: string | null;
 }
 
+export interface InternetMetadataConfig {
+	omdb_api_key: string | null;
+	tvdb_api_key: string | null;
+	tvdb_pin: string | null;
+	user_agent: string;
+}
+
 export interface AppConfig {
 	data_path: string;
 	ingest_path: string;
@@ -139,6 +182,7 @@ export interface AppConfig {
 	golden_standards: GoldenStandards;
 	system_prompt: string;
 	libraries: LibraryFolder[];
+	internet_metadata: InternetMetadataConfig;
 }
 
 export interface LibraryFolder {
@@ -189,6 +233,41 @@ export async function fetchLibraryMetadata(relativePath: string): Promise<Librar
 	const params = new URLSearchParams({ path: relativePath });
 	const res = await fetch(`${BASE}/library/metadata?${params.toString()}`);
 	if (!res.ok) throw new Error(`Failed to fetch metadata for ${relativePath}: ${res.status}`);
+	return res.json();
+}
+
+export async function fetchLibraryInternetMetadata(relativePath: string): Promise<InternetMetadataResponse> {
+	const params = new URLSearchParams({ path: relativePath });
+	const res = await fetch(`${BASE}/library/internet?${params.toString()}`);
+	if (!res.ok) throw new Error(`Failed to fetch internet metadata for ${relativePath}: ${res.status}`);
+	return res.json();
+}
+
+export async function fetchLibraryInternetMetadataBulk(paths: string[]): Promise<InternetMetadataBulkResponse> {
+	const res = await fetch(`${BASE}/library/internet/bulk`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ paths })
+	});
+	if (!res.ok) throw new Error(`Failed to fetch bulk internet metadata: ${res.status}`);
+	return res.json();
+}
+
+export async function saveSelectedLibraryInternetMetadata(path: string, selected: InternetMetadataMatch): Promise<SelectedInternetMetadataResponse> {
+	const res = await fetch(`${BASE}/library/internet`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ path, selected })
+	});
+	if (!res.ok) throw new Error(`Failed to save selected internet metadata for ${path}: ${res.status}`);
+	return res.json();
+}
+
+export async function fetchSelectedLibraryInternetMetadata(path: string): Promise<SelectedInternetMetadataResponse | null> {
+	const params = new URLSearchParams({ path });
+	const res = await fetch(`${BASE}/library/internet/selected?${params.toString()}`);
+	if (res.status === 204) return null;
+	if (!res.ok) throw new Error(`Failed to fetch selected internet metadata for ${path}: ${res.status}`);
 	return res.json();
 }
 

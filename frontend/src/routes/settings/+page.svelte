@@ -482,6 +482,30 @@
 				</div>
 			</div>
 
+			<!-- Internet Metadata Providers -->
+			<div class="rounded-[1rem] border border-[color:var(--line)] p-5">
+				<h3 class="section-label mb-4">Internet Metadata</h3>
+				<div class="space-y-4">
+					<label class="block">
+						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">OMDb API Key <span class="font-normal">(IMDb-backed)</span></span>
+						<input type="password" value={config.internet_metadata.omdb_api_key ?? ''} oninput={(e) => { if (config) config.internet_metadata.omdb_api_key = (e.target as HTMLInputElement).value || null; }} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
+					</label>
+					<label class="block">
+						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">TVDB API Key</span>
+						<input type="password" value={config.internet_metadata.tvdb_api_key ?? ''} oninput={(e) => { if (config) config.internet_metadata.tvdb_api_key = (e.target as HTMLInputElement).value || null; }} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
+					</label>
+					<label class="block">
+						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">TVDB PIN <span class="font-normal">(optional)</span></span>
+						<input type="password" value={config.internet_metadata.tvdb_pin ?? ''} oninput={(e) => { if (config) config.internet_metadata.tvdb_pin = (e.target as HTMLInputElement).value || null; }} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
+					</label>
+					<label class="block">
+						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">User Agent</span>
+						<input type="text" bind:value={config.internet_metadata.user_agent} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
+					</label>
+					<p class="text-xs text-[color:var(--ink-muted)]">Library metadata lookup uses OMDb and TVDB. Without API keys, lookup will return warnings and no internet results.</p>
+				</div>
+			</div>
+
 			<!-- Storage (read-only, set via container volumes) -->
 			<div class="rounded-[1rem] border border-[color:var(--line)] p-5">
 				<h3 class="section-label mb-4">Storage <span class="text-xs font-normal text-[color:var(--ink-muted)]">(set via container volumes)</span></h3>

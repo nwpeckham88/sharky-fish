@@ -1,5 +1,6 @@
 use crate::config::{AppConfig, LibraryFolder};
 use crate::db;
+use crate::internet_metadata;
 use crate::library;
 use crate::metadata;
 use crate::messages::{LibraryChange, SseEvent};
@@ -14,7 +15,9 @@ use axum::{
     Router,
 };
 use futures::stream::Stream;
+use futures::StreamExt;
 use serde::Deserialize;
+use serde::Serialize;
 use sqlx::SqlitePool;
 use std::convert::Infallible;
 use std::path::Path;
@@ -22,7 +25,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tokio_stream::wrappers::BroadcastStream;
-use tokio_stream::StreamExt;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
 
@@ -42,6 +44,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/library", get(list_library))
         .route("/api/library/events", get(list_library_events))
         .route("/api/library/metadata", get(get_library_metadata))
+        .route(
+            "/api/library/internet",
+            get(get_library_internet_metadata).post(save_selected_library_internet_metadata),
+        )
+        .route("/api/library/internet/bulk", axum::routing::post(get_library_internet_metadata_bulk))
+        .route("/api/library/internet/selected", get(get_selected_library_internet_metadata))
         .route("/api/libraries", get(list_libraries).post(add_library))
         .route("/api/libraries/{id}", axum::routing::delete(remove_library))
         .route("/api/jobs/{id}", get(get_job))
@@ -87,6 +95,28 @@ struct LibraryMetadataQuery {
 #[derive(Deserialize)]
 struct LibraryEventsQuery {
     limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct LibraryInternetMetadataQuery {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct LibraryInternetMetadataBulkRequest {
+    paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SaveSelectedInternetMetadataRequest {
+    path: String,
+    selected: internet_metadata::InternetMetadataMatch,
+}
+
+#[derive(Serialize)]
+struct SelectedInternetMetadataResponse {
+    path: String,
+    selected: internet_metadata::InternetMetadataMatch,
 }
 
 async fn list_jobs(
@@ -170,12 +200,124 @@ async fn list_library_events(
     }
 }
 
+async fn get_library_internet_metadata(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<LibraryInternetMetadataQuery>,
+) -> impl IntoResponse {
+    let config = {
+        let cfg = state.config.read().await;
+        cfg.clone()
+    };
+
+    match internet_metadata::lookup_for_library_path(&config, &params.path).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+async fn get_library_internet_metadata_bulk(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<LibraryInternetMetadataBulkRequest>,
+) -> impl IntoResponse {
+    if request.paths.is_empty() {
+        return Json(internet_metadata::InternetMetadataBulkResponse { items: Vec::new() }).into_response();
+    }
+
+    if request.paths.len() > 500 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "paths length must be <= 500",
+        )
+            .into_response();
+    }
+
+    let config = {
+        let cfg = state.config.read().await;
+        cfg.clone()
+    };
+
+    let items = futures::stream::iter(request.paths.into_iter())
+        .map(|path| {
+            let cfg = config.clone();
+            async move {
+                let result = internet_metadata::lookup_for_library_path(&cfg, &path)
+                    .await
+                    .unwrap_or_else(|error| internet_metadata::InternetMetadataResponse {
+                        query: path.clone(),
+                        parsed_year: None,
+                        media_hint: None,
+                        matches: Vec::new(),
+                        warnings: vec![error.to_string()],
+                    });
+                internet_metadata::InternetMetadataBulkItem { path, result }
+            }
+        })
+        .buffer_unordered(6)
+        .collect::<Vec<_>>()
+        .await;
+
+    Json(internet_metadata::InternetMetadataBulkResponse { items }).into_response()
+}
+
+async fn save_selected_library_internet_metadata(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<SaveSelectedInternetMetadataRequest>,
+) -> impl IntoResponse {
+    if request.path.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+    }
+
+    match db::upsert_selected_internet_metadata(&state.pool, request.path.trim(), &request.selected).await {
+        Ok(()) => Json(SelectedInternetMetadataResponse {
+            path: request.path.trim().to_string(),
+            selected: request.selected,
+        })
+        .into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_selected_library_internet_metadata(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<LibraryInternetMetadataQuery>,
+) -> impl IntoResponse {
+    let row = match db::fetch_selected_internet_metadata(&state.pool, &params.path).await {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    };
+
+    let Some(row) = row else {
+        return StatusCode::NO_CONTENT.into_response();
+    };
+
+    let genres = serde_json::from_str::<Vec<String>>(&row.genres_json).unwrap_or_default();
+    let selected = internet_metadata::InternetMetadataMatch {
+        provider: row.provider,
+        title: row.title,
+        year: row.year.map(|v| v as u16),
+        media_kind: row.media_kind,
+        imdb_id: row.imdb_id,
+        tvdb_id: row.tvdb_id.map(|v| v as u64),
+        overview: row.overview,
+        rating: row.rating,
+        genres,
+        poster_url: row.poster_url,
+        source_url: row.source_url,
+    };
+
+    Json(SelectedInternetMetadataResponse {
+        path: row.relative_path,
+        selected,
+    })
+    .into_response()
+}
+
 /// SSE endpoint: streams real-time events to the frontend.
 async fn sse_handler(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = state.sse_tx.subscribe();
-    let stream = BroadcastStream::new(rx).filter_map(|result| {
+    let stream = BroadcastStream::new(rx).filter_map(|result| async move {
         result.ok().map(|event| {
             let json = serde_json::to_string(&event).unwrap_or_default();
             Ok(Event::default().data(json))

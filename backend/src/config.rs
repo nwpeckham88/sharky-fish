@@ -29,6 +29,21 @@ pub struct AppConfig {
     /// Named library folders within `data_path`.
     #[serde(default)]
     pub libraries: Vec<LibraryFolder>,
+    /// Internet metadata providers (OMDb/TVDB) used for title enrichment.
+    #[serde(default)]
+    pub internet_metadata: InternetMetadataConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InternetMetadataConfig {
+    /// OMDb API key (OMDb provides IMDb-backed metadata).
+    pub omdb_api_key: Option<String>,
+    /// TVDB API key.
+    pub tvdb_api_key: Option<String>,
+    /// Optional TVDB PIN.
+    pub tvdb_pin: Option<String>,
+    /// User-Agent sent to internet metadata services.
+    pub user_agent: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +169,18 @@ impl Default for AppConfig {
             golden_standards: GoldenStandards::default(),
             system_prompt: String::new(),
             libraries: Vec::new(),
+            internet_metadata: InternetMetadataConfig::default(),
+        }
+    }
+}
+
+impl Default for InternetMetadataConfig {
+    fn default() -> Self {
+        Self {
+            omdb_api_key: None,
+            tvdb_api_key: None,
+            tvdb_pin: None,
+            user_agent: "sharky-fish/0.1".into(),
         }
     }
 }

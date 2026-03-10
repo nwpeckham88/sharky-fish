@@ -4,11 +4,17 @@
 	import {
 		fetchLibrary,
 		fetchLibraryMetadata,
+		fetchLibraryInternetMetadata,
+		fetchLibraryInternetMetadataBulk,
+		saveSelectedLibraryInternetMetadata,
+		fetchSelectedLibraryInternetMetadata,
 		fetchLibraryEvents,
 		fetchLibraries,
 		type LibraryEntry,
 		type LibraryFolder,
 		type LibraryMetadata,
+		type InternetMetadataMatch,
+		type InternetMetadataResponse,
 		type LibraryResponse,
 		type LibraryRoots,
 		type LibrarySummary,
@@ -25,6 +31,14 @@
 	let selectedMetadata = $state<LibraryMetadata | null>(null);
 	let metadataLoading = $state(false);
 	let metadataError = $state('');
+	let internetMetadata = $state<InternetMetadataResponse | null>(null);
+	let internetMetadataLoading = $state(false);
+	let internetMetadataError = $state('');
+	let selectedInternetMatch = $state<InternetMetadataMatch | null>(null);
+	let internetSaveLoading = $state(false);
+	let internetSaveError = $state('');
+	let bulkInternetLoading = $state(false);
+	let bulkInternetStatus = $state('');
 	let libraryLoading = $state(true);
 	let query = $state('');
 	let offset = $state(0);
@@ -104,13 +118,96 @@
 		selectedItem = item;
 		selectedMetadata = null;
 		metadataError = '';
+		internetMetadata = null;
+		internetMetadataError = '';
+		selectedInternetMatch = null;
+		internetSaveError = '';
 		metadataLoading = true;
 		try {
-			selectedMetadata = await fetchLibraryMetadata(item.relative_path);
+			const [metadata, selected] = await Promise.all([
+				fetchLibraryMetadata(item.relative_path),
+				fetchSelectedLibraryInternetMetadata(item.relative_path).catch(() => null)
+			]);
+			selectedMetadata = metadata;
+			selectedInternetMatch = selected?.selected ?? null;
 		} catch (error) {
 			metadataError = error instanceof Error ? error.message : 'Metadata fetch failed';
 		} finally {
 			metadataLoading = false;
+		}
+	}
+
+	async function loadInternetMetadata(item: LibraryEntry) {
+		internetMetadataLoading = true;
+		internetMetadataError = '';
+		internetSaveError = '';
+		internetMetadata = null;
+		try {
+			internetMetadata = await fetchLibraryInternetMetadata(item.relative_path);
+		} catch (error) {
+			internetMetadataError = error instanceof Error ? error.message : 'Internet metadata lookup failed';
+		} finally {
+			internetMetadataLoading = false;
+		}
+	}
+
+	function matchesSelected(match: InternetMetadataMatch): boolean {
+		if (!selectedInternetMatch) return false;
+		return (
+			selectedInternetMatch.provider === match.provider &&
+			selectedInternetMatch.title === match.title &&
+			selectedInternetMatch.year === match.year &&
+			selectedInternetMatch.imdb_id === match.imdb_id &&
+			selectedInternetMatch.tvdb_id === match.tvdb_id
+		);
+	}
+
+	async function chooseInternetMatch(match: InternetMetadataMatch) {
+		if (!selectedItem) return;
+		internetSaveLoading = true;
+		internetSaveError = '';
+		try {
+			const saved = await saveSelectedLibraryInternetMetadata(selectedItem.relative_path, match);
+			selectedInternetMatch = saved.selected;
+		} catch (error) {
+			internetSaveError = error instanceof Error ? error.message : 'Failed to save selected match';
+		} finally {
+			internetSaveLoading = false;
+		}
+	}
+
+	async function runBulkInternetLookup(autoSelectTop = false) {
+		if (selectedPaths.size === 0) return;
+		bulkInternetLoading = true;
+		bulkInternetStatus = '';
+		internetSaveError = '';
+		try {
+			const paths = Array.from(selectedPaths);
+			const response = await fetchLibraryInternetMetadataBulk(paths);
+			const withMatches = response.items.filter((item) => item.result.matches.length > 0);
+			const withWarnings = response.items.filter((item) => item.result.warnings.length > 0);
+
+			let autoSelected = 0;
+			if (autoSelectTop) {
+				for (const item of withMatches) {
+					const first = item.result.matches[0];
+					if (!first) continue;
+					await saveSelectedLibraryInternetMetadata(item.path, first);
+					autoSelected += 1;
+				}
+				if (selectedItem) {
+					const refreshed = await fetchSelectedLibraryInternetMetadata(selectedItem.relative_path).catch(() => null);
+					selectedInternetMatch = refreshed?.selected ?? selectedInternetMatch;
+				}
+			}
+
+			bulkInternetStatus = autoSelectTop
+				? `Looked up ${response.items.length} file(s), found matches for ${withMatches.length}, auto-selected ${autoSelected}.`
+				: `Looked up ${response.items.length} file(s), found matches for ${withMatches.length}, warnings on ${withWarnings.length}.`;
+		} catch (error) {
+			bulkInternetStatus = error instanceof Error ? error.message : 'Bulk internet lookup failed';
+		} finally {
+			bulkInternetLoading = false;
 		}
 	}
 
@@ -258,9 +355,12 @@
 	<section class="mb-4 flex items-center gap-3 rounded-xl border border-[color:var(--accent)]/30 bg-[color:var(--accent)]/5 px-4 py-2.5">
 		<span class="text-sm font-semibold text-[color:var(--ink-strong)]">{selectedPaths.size} selected</span>
 		<div class="flex gap-2">
-			<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)]" onclick={() => { /* future: bulk rescan metadata */ }}>Rescan Metadata</button>
-			<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)]" onclick={() => { /* future: queue for processing */ }}>Queue for Processing</button>
+			<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => runBulkInternetLookup(false)} disabled={bulkInternetLoading}>{bulkInternetLoading ? 'Working…' : 'Bulk Lookup Metadata'}</button>
+			<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => runBulkInternetLookup(true)} disabled={bulkInternetLoading}>{bulkInternetLoading ? 'Working…' : 'Auto-Select Top Match'}</button>
 		</div>
+		{#if bulkInternetStatus}
+			<span class="text-xs text-[color:var(--ink-muted)]">{bulkInternetStatus}</span>
+		{/if}
 		<button class="ml-auto text-xs font-semibold text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]" onclick={clearSelection}>Clear</button>
 	</section>
 {/if}
@@ -346,7 +446,12 @@
 			{:else if selectedMetadata}
 				<div class="space-y-3 text-sm">
 					<div>
-						<h4 class="text-lg text-[color:var(--ink-strong)]">{selectedItem.file_name}</h4>
+							<div class="flex flex-wrap items-center justify-between gap-2">
+								<h4 class="text-lg text-[color:var(--ink-strong)]">{selectedItem.file_name}</h4>
+								<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => loadInternetMetadata(selectedItem!)} disabled={internetMetadataLoading}>
+									{internetMetadataLoading ? 'Looking up…' : 'Lookup IMDb/TVDB'}
+								</button>
+							</div>
 						<p class="mt-0.5 break-all font-mono text-[11px] text-[color:var(--ink-muted)]">{selectedMetadata.relative_path}</p>
 					</div>
 					<div class="grid gap-2 sm:grid-cols-2">
@@ -429,6 +534,61 @@
 								</div>
 							{/each}
 						</div>
+					</div>
+
+					<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
+						<div class="mb-2 flex items-center justify-between">
+							<div class="section-label">Internet Metadata</div>
+						</div>
+						{#if selectedInternetMatch}
+							<div class="mb-2 rounded-lg border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-3 py-2 text-xs text-[color:var(--olive)]">
+								Selected: <span class="font-semibold">{selectedInternetMatch.title}{selectedInternetMatch.year ? ` (${selectedInternetMatch.year})` : ''}</span> via {selectedInternetMatch.provider}
+							</div>
+						{/if}
+						{#if internetSaveError}
+							<div class="mb-2 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{internetSaveError}</div>
+						{/if}
+						{#if internetMetadataError}
+							<div class="rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{internetMetadataError}</div>
+						{:else if internetMetadataLoading}
+							<div class="text-xs text-[color:var(--ink-muted)]">Querying providers…</div>
+						{:else if internetMetadata}
+							{#if internetMetadata.matches.length === 0}
+								<div class="text-xs text-[color:var(--ink-muted)]">No matches found for "{internetMetadata.query}".</div>
+							{:else}
+								<div class="space-y-2">
+									{#each internetMetadata.matches as match, index (match.provider + '-' + index)}
+										<div class="rounded-lg bg-[color:rgba(244,236,223,0.7)] px-3 py-2">
+											<div class="flex flex-wrap items-center gap-2">
+												<span class="font-semibold text-[color:var(--ink-strong)]">{match.title}{match.year ? ` (${match.year})` : ''}</span>
+												<span class="rounded-full bg-[color:rgba(214,180,111,0.2)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.12em] text-[color:var(--ink-strong)]">{match.provider}</span>
+												{#if match.media_kind}<span class="text-[10px] uppercase tracking-[0.12em] text-[color:var(--ink-muted)]">{match.media_kind}</span>{/if}
+												{#if match.rating}<span class="text-xs text-[color:var(--ink-muted)]">IMDb {match.rating.toFixed(1)}</span>{/if}
+											</div>
+											{#if match.overview}
+												<p class="mt-1 text-xs text-[color:var(--ink-muted)]">{match.overview}</p>
+											{/if}
+											<div class="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-[color:var(--ink-muted)]">
+												{#if match.imdb_id}<span class="font-mono">{match.imdb_id}</span>{/if}
+												{#if match.tvdb_id}<span class="font-mono">tvdb:{match.tvdb_id}</span>{/if}
+												{#if match.genres.length > 0}<span>{match.genres.join(', ')}</span>{/if}
+												<button class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => chooseInternetMatch(match)} disabled={internetSaveLoading || matchesSelected(match)}>
+													{matchesSelected(match) ? 'Selected' : internetSaveLoading ? 'Saving…' : 'Use this match'}
+												</button>
+												{#if match.source_url}
+													<a href={match.source_url} target="_blank" rel="noreferrer" class="font-semibold text-[color:var(--accent-deep)] hover:underline">Open</a>
+												{/if}
+											</div>
+										</div>
+									{/each}
+								</div>
+							{/if}
+							{#if internetMetadata.warnings.length > 0}
+								<div class="mt-2 text-[11px] text-[color:var(--ink-muted)]">{internetMetadata.warnings.join(' • ')}</div>
+							{/if}
+						{:else}
+							<div class="text-xs text-[color:var(--ink-muted)]">Lookup with OMDb (IMDb-backed) and TVDB using your configured API keys.</div>
+						{/if}
 					</div>
 				</div>
 			{/if}

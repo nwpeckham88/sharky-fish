@@ -1,6 +1,7 @@
 mod actors;
 mod config;
 mod db;
+mod internet_metadata;
 mod library;
 mod metadata;
 mod messages;

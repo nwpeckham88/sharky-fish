@@ -1,5 +1,6 @@
 use anyhow::Result;
 use crate::messages::MediaProbe;
+use crate::internet_metadata::InternetMetadataMatch;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{FromRow, SqlitePool};
 use std::path::Path;
@@ -109,6 +110,26 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS selected_internet_metadata (
+            relative_path   TEXT PRIMARY KEY,
+            provider        TEXT NOT NULL,
+            title           TEXT NOT NULL,
+            year            INTEGER,
+            media_kind      TEXT NOT NULL,
+            imdb_id         TEXT,
+            tvdb_id         INTEGER,
+            overview        TEXT,
+            rating          REAL,
+            genres_json     TEXT NOT NULL,
+            poster_url      TEXT,
+            source_url      TEXT,
+            updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -158,6 +179,23 @@ pub struct LibraryEventRow {
     pub file_path: String,
     pub change_type: String,
     pub occurred_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
+pub struct SelectedInternetMetadataRow {
+    pub relative_path: String,
+    pub provider: String,
+    pub title: String,
+    pub year: Option<i64>,
+    pub media_kind: String,
+    pub imdb_id: Option<String>,
+    pub tvdb_id: Option<i64>,
+    pub overview: Option<String>,
+    pub rating: Option<f64>,
+    pub genres_json: String,
+    pub poster_url: Option<String>,
+    pub source_url: Option<String>,
+    pub updated_at: String,
 }
 
 /// Insert a new job and return its id.
@@ -351,4 +389,64 @@ pub async fn list_library_events(pool: &SqlitePool, limit: i64) -> Result<Vec<Li
     .await?;
 
     Ok(rows)
+}
+
+pub async fn upsert_selected_internet_metadata(
+    pool: &SqlitePool,
+    relative_path: &str,
+    selected: &InternetMetadataMatch,
+) -> Result<()> {
+    let genres_json = serde_json::to_string(&selected.genres)?;
+    sqlx::query(
+        "INSERT INTO selected_internet_metadata (
+            relative_path, provider, title, year, media_kind, imdb_id, tvdb_id, overview,
+            rating, genres_json, poster_url, source_url, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(relative_path) DO UPDATE SET
+            provider = excluded.provider,
+            title = excluded.title,
+            year = excluded.year,
+            media_kind = excluded.media_kind,
+            imdb_id = excluded.imdb_id,
+            tvdb_id = excluded.tvdb_id,
+            overview = excluded.overview,
+            rating = excluded.rating,
+            genres_json = excluded.genres_json,
+            poster_url = excluded.poster_url,
+            source_url = excluded.source_url,
+            updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(relative_path)
+    .bind(&selected.provider)
+    .bind(&selected.title)
+    .bind(selected.year.map(i64::from))
+    .bind(&selected.media_kind)
+    .bind(&selected.imdb_id)
+    .bind(selected.tvdb_id.map(|v| v as i64))
+    .bind(&selected.overview)
+    .bind(selected.rating)
+    .bind(genres_json)
+    .bind(&selected.poster_url)
+    .bind(&selected.source_url)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn fetch_selected_internet_metadata(
+    pool: &SqlitePool,
+    relative_path: &str,
+) -> Result<Option<SelectedInternetMetadataRow>> {
+    let row = sqlx::query_as::<_, SelectedInternetMetadataRow>(
+        "SELECT relative_path, provider, title, year, media_kind, imdb_id, tvdb_id, overview,
+                rating, genres_json, poster_url, source_url, updated_at
+         FROM selected_internet_metadata
+         WHERE relative_path = ?",
+    )
+    .bind(relative_path)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
 }
