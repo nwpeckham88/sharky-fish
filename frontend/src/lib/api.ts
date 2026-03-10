@@ -190,6 +190,11 @@ export interface AppConfig {
 	llm: LlmConfig;
 	max_io_concurrency: number;
 	metadata_prewarm_limit: number;
+	scan_exclude_patterns: string[];
+	scan_concurrency: number;
+	scan_queue_capacity: number;
+	bulk_metadata_concurrency: number;
+	bulk_metadata_max_inflight: number;
 	golden_standards: GoldenStandards;
 	system_prompt: string;
 	libraries: LibraryFolder[];

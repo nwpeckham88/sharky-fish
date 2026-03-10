@@ -89,13 +89,16 @@
 	});
 
 	// React to SSE library changes via the global store
-	const _changeFlags = { skipFirst: true };
+	const _changeFlags = { skipFirstChange: true };
 	$effect(() => {
-		libraryState.changeCount;
 		libraryState.scan;
 		scanStatus = { ...libraryState.scan };
-		if (_changeFlags.skipFirst) {
-			_changeFlags.skipFirst = false;
+	});
+
+	$effect(() => {
+		libraryState.changeCount;
+		if (_changeFlags.skipFirstChange) {
+			_changeFlags.skipFirstChange = false;
 			return;
 		}
 		if (selectedItem && libraryState.latestChange?.relative_path === selectedItem.relative_path) {
@@ -302,7 +305,20 @@
 	}
 
 	const filteredLibrary = $derived(
-		typeFilter === 'all' ? library : library.filter((i) => i.media_type === typeFilter)
+		typeFilter === 'all'
+			? library
+			: typeFilter === 'other'
+				? library.filter((i) => i.media_type !== 'video' && i.media_type !== 'audio')
+				: library.filter((i) => i.media_type === typeFilter)
+	);
+
+	const visibleColumnCount = $derived(
+		(bulkMode ? 1 : 0) +
+		1 +
+		1 +
+		(!activeLibraryId && libraryFolders.length > 0 ? 1 : 0) +
+		1 +
+		1
 	);
 
 	function switchLibrary(id: string | null) {
@@ -453,9 +469,9 @@
 			</thead>
 			<tbody>
 				{#if libraryLoading}
-					<tr><td colspan={bulkMode ? 6 : 5} class="px-4 py-14 text-center text-[color:var(--ink-muted)]">Scanning library…</td></tr>
+					<tr><td colspan={visibleColumnCount} class="px-4 py-14 text-center text-[color:var(--ink-muted)]">Scanning library…</td></tr>
 				{:else if filteredLibrary.length === 0}
-					<tr><td colspan={bulkMode ? 6 : 5} class="px-4 py-14 text-center text-[color:var(--ink-muted)]">No entries match the current filter.</td></tr>
+					<tr><td colspan={visibleColumnCount} class="px-4 py-14 text-center text-[color:var(--ink-muted)]">No entries match the current filter.</td></tr>
 				{:else}
 					{#each filteredLibrary as item (item.relative_path)}
 						<tr class="cursor-pointer border-b border-[color:rgba(123,105,81,0.14)] last:border-b-0 hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''} {selectedPaths.has(item.relative_path) ? 'bg-[color:rgba(214,180,111,0.08)]' : ''}" onclick={() => { if (bulkMode) { toggleSelect(item.relative_path); } else { loadMetadata(item); } }}>

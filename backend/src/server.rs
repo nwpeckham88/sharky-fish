@@ -168,6 +168,14 @@ async fn list_library(
 }
 
 async fn trigger_library_rescan(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match db::fetch_library_scan_state(&state.pool).await {
+        Ok(scan) if scan.status == "running" => {
+            return (StatusCode::CONFLICT, "library rescan already running").into_response();
+        }
+        Ok(_) => {}
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+
     let (libraries, exclude_patterns, scan_concurrency, scan_queue_capacity) = {
         let cfg = state.config.read().await;
         (

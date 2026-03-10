@@ -3,12 +3,15 @@ use crate::db;
 use crate::messages::{LibraryIndexScanProgress, SseEvent};
 
 use anyhow::Result;
-use futures::stream::{self, StreamExt};
+use futures::stream::StreamExt;
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task;
+use tokio_stream::wrappers::ReceiverStream;
 
 #[derive(Debug, Clone)]
 pub struct IndexCandidate {
@@ -37,14 +40,11 @@ pub async fn run_full_rescan(
     }
 
     let run_result = async {
-        let candidates =
-            collect_index_candidates(library_root.clone(), libraries, exclude_patterns).await?;
-        let total = candidates.len();
-        db::update_library_scan_progress(&pool, 0, total).await?;
+        db::update_library_scan_progress(&pool, 0, 0).await?;
         let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(LibraryIndexScanProgress {
             status: "running".into(),
             scanned_items: 0,
-            total_items: total,
+            total_items: 0,
             started_at: Some(started_at),
             completed_at: None,
             last_scan_at: None,
@@ -54,55 +54,134 @@ pub async fn run_full_rescan(
         db::clear_library_index(&pool).await?;
 
         let concurrency = scan_concurrency.max(1);
-        let batch_size = scan_queue_capacity.max(1);
+        let queue_capacity = scan_queue_capacity.max(1);
         let mut scanned_items = 0usize;
 
-        for batch in candidates.chunks(batch_size) {
-            let mut stream = stream::iter(batch.iter().cloned())
-                .map(|candidate| {
-                    let pool = pool.clone();
-                    async move {
-                        db::upsert_library_index_entry(
-                            &pool,
-                            &candidate.relative_path,
-                            &candidate.file_path,
-                            &candidate.file_name,
-                            &candidate.extension,
-                            &candidate.media_type,
-                            candidate.size_bytes,
-                            candidate.modified_at,
-                            candidate.library_id.as_deref(),
-                        )
-                        .await
-                    }
+        let (tx, rx) = mpsc::channel::<IndexCandidate>(queue_capacity);
+        let discovered_total = Arc::new(AtomicUsize::new(0));
+        let producer_total = discovered_total.clone();
+        let producer_root = library_root.clone();
+        let producer_libraries = libraries;
+        let producer_excludes = exclude_patterns;
+
+        let producer = task::spawn_blocking(move || -> Result<()> {
+            if !producer_root.exists() {
+                return Ok(());
+            }
+
+            for entry in walkdir::WalkDir::new(&producer_root)
+                .follow_links(false)
+                .into_iter()
+                .filter_entry(|entry| {
+                    let rel = entry
+                        .path()
+                        .strip_prefix(&producer_root)
+                        .unwrap_or(entry.path())
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    !is_excluded_relative_path(&rel, &producer_excludes)
                 })
-                .buffer_unordered(concurrency);
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.file_type().is_file())
+            {
+                let path = entry.path();
+                let Some(media_type) = detect_media_type(path) else {
+                    continue;
+                };
 
-            while let Some(result) = stream.next().await {
-                result?;
-                scanned_items += 1;
+                let metadata = match entry.metadata() {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
 
-                if scanned_items % 200 == 0 || scanned_items == total {
-                    db::update_library_scan_progress(&pool, scanned_items, total).await?;
-                    let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(LibraryIndexScanProgress {
-                        status: "running".into(),
-                        scanned_items,
-                        total_items: total,
-                        started_at: Some(started_at),
-                        completed_at: None,
-                        last_scan_at: None,
-                        last_error: None,
-                    }));
+                let modified_at = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                    .map(|value| value.as_secs())
+                    .unwrap_or(0);
+                let relative_path = relative_path_string(&producer_root, path);
+                let file_name = path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let extension = path
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or_default()
+                    .to_ascii_lowercase();
+
+                producer_total.fetch_add(1, Ordering::Relaxed);
+                let candidate = IndexCandidate {
+                    relative_path: relative_path.clone(),
+                    file_path: path.display().to_string(),
+                    file_name,
+                    extension,
+                    media_type: media_type.to_string(),
+                    size_bytes: metadata.len(),
+                    modified_at,
+                    library_id: match_library_id(&relative_path, &producer_libraries),
+                };
+
+                if tx.blocking_send(candidate).is_err() {
+                    break;
                 }
             }
+
+            Ok(())
+        });
+
+        let mut stream = ReceiverStream::new(rx)
+            .map(|candidate| {
+                let pool = pool.clone();
+                async move {
+                    db::upsert_library_index_entry(
+                        &pool,
+                        &candidate.relative_path,
+                        &candidate.file_path,
+                        &candidate.file_name,
+                        &candidate.extension,
+                        &candidate.media_type,
+                        candidate.size_bytes,
+                        candidate.modified_at,
+                        candidate.library_id.as_deref(),
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(concurrency);
+
+        while let Some(result) = stream.next().await {
+            result?;
+            scanned_items += 1;
+            let total = discovered_total.load(Ordering::Relaxed).max(scanned_items);
+
+            if scanned_items % 200 == 0 {
+                db::update_library_scan_progress(&pool, scanned_items, total).await?;
+                let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(LibraryIndexScanProgress {
+                    status: "running".into(),
+                    scanned_items,
+                    total_items: total,
+                    started_at: Some(started_at),
+                    completed_at: None,
+                    last_scan_at: None,
+                    last_error: None,
+                }));
+            }
         }
+
+        producer.await??;
+
+        let total = discovered_total.load(Ordering::Relaxed).max(scanned_items);
+        db::update_library_scan_progress(&pool, scanned_items, total).await?;
 
         let completed_at = unix_now();
         db::complete_library_scan(&pool, completed_at, scanned_items).await?;
         let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(LibraryIndexScanProgress {
             status: "idle".into(),
             scanned_items,
-            total_items: scanned_items,
+            total_items: total,
             started_at: Some(started_at),
             completed_at: Some(completed_at),
             last_scan_at: Some(completed_at),
@@ -256,77 +335,6 @@ fn relative_path_string(library_root: &Path, path: &Path) -> String {
         .unwrap_or(path)
         .to_string_lossy()
         .replace('\\', "/")
-}
-
-async fn collect_index_candidates(
-    library_root: PathBuf,
-    libraries: Vec<LibraryFolder>,
-    exclude_patterns: Vec<String>,
-) -> Result<Vec<IndexCandidate>> {
-    task::spawn_blocking(move || -> Result<Vec<IndexCandidate>> {
-        if !library_root.exists() {
-            return Ok(Vec::new());
-        }
-
-        let mut items = Vec::new();
-        for entry in walkdir::WalkDir::new(&library_root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| {
-                let rel = entry
-                    .path()
-                    .strip_prefix(&library_root)
-                    .unwrap_or(entry.path())
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                !is_excluded_relative_path(&rel, &exclude_patterns)
-            })
-            .filter_map(|entry| entry.ok())
-            .filter(|entry| entry.file_type().is_file())
-        {
-            let path = entry.path();
-            let Some(media_type) = detect_media_type(path) else {
-                continue;
-            };
-
-            let metadata = match entry.metadata() {
-                Ok(value) => value,
-                Err(_) => continue,
-            };
-
-            let modified_at = metadata
-                .modified()
-                .ok()
-                .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                .map(|value| value.as_secs())
-                .unwrap_or(0);
-            let relative_path = relative_path_string(&library_root, path);
-            let file_name = path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default()
-                .to_string();
-            let extension = path
-                .extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-
-            items.push(IndexCandidate {
-                relative_path: relative_path.clone(),
-                file_path: path.display().to_string(),
-                file_name,
-                extension,
-                media_type: media_type.to_string(),
-                size_bytes: metadata.len(),
-                modified_at,
-                library_id: match_library_id(&relative_path, &libraries),
-            });
-        }
-
-        Ok(items)
-    })
-    .await?
 }
 
 fn unix_now() -> u64 {
