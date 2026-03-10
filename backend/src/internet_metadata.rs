@@ -144,8 +144,14 @@ fn extract_title_and_year(relative_path: &str) -> (String, Option<u16>) {
         .replace('(', " ")
         .replace(')', " ");
 
+    let tokens = cleaned
+        .split_whitespace()
+        .map(|t| t.trim())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>();
+
     let mut year: Option<u16> = None;
-    for token in cleaned.split_whitespace() {
+    for token in &tokens {
         if token.len() == 4 {
             if let Ok(value) = token.parse::<u16>() {
                 if (1900..=2099).contains(&value) {
@@ -156,24 +162,46 @@ fn extract_title_and_year(relative_path: &str) -> (String, Option<u16>) {
         }
     }
 
-    let normalized = cleaned
-        .split_whitespace()
-        .filter(|t| !t.eq_ignore_ascii_case("1080p")
-            && !t.eq_ignore_ascii_case("2160p")
-            && !t.eq_ignore_ascii_case("720p")
-            && !t.eq_ignore_ascii_case("x264")
-            && !t.eq_ignore_ascii_case("x265")
-            && !t.eq_ignore_ascii_case("h264")
-            && !t.eq_ignore_ascii_case("h265")
-            && !t.eq_ignore_ascii_case("hevc")
-            && !t.eq_ignore_ascii_case("bluray")
-            && !t.eq_ignore_ascii_case("webrip")
-            && !t.eq_ignore_ascii_case("webdl")
-            && !t.eq_ignore_ascii_case("dvdrip")
-            && !t.eq_ignore_ascii_case("remux")
-            && !t.eq_ignore_ascii_case("hdr"))
-        .collect::<Vec<_>>()
-        .join(" ");
+    let year_str = year.map(|y| y.to_string());
+    let mut normalized_tokens: Vec<String> = Vec::new();
+    let mut skip_next_if_numeric_id = false;
+
+    for token in &tokens {
+        let lowered = token.to_ascii_lowercase();
+
+        if skip_next_if_numeric_id {
+            if lowered.chars().all(|c| c.is_ascii_digit()) {
+                skip_next_if_numeric_id = false;
+                continue;
+            }
+            skip_next_if_numeric_id = false;
+        }
+
+        if is_metadata_noise_token(&lowered) {
+            continue;
+        }
+
+        if year_str.as_deref() == Some(token) {
+            continue;
+        }
+
+        if is_external_id_marker(&lowered) {
+            skip_next_if_numeric_id = true;
+            continue;
+        }
+
+        if is_external_id_token(&lowered) {
+            continue;
+        }
+
+        if lowered.chars().all(|c| c.is_ascii_digit()) && lowered.len() > 4 {
+            continue;
+        }
+
+        normalized_tokens.push((*token).to_string());
+    }
+
+    let normalized = normalized_tokens.join(" ");
 
     let query = normalized.trim();
     if query.is_empty() {
@@ -181,6 +209,44 @@ fn extract_title_and_year(relative_path: &str) -> (String, Option<u16>) {
     } else {
         (query.to_string(), year)
     }
+}
+
+fn is_metadata_noise_token(token: &str) -> bool {
+    matches!(
+        token,
+        "1080p"
+            | "2160p"
+            | "720p"
+            | "480p"
+            | "x264"
+            | "x265"
+            | "h264"
+            | "h265"
+            | "hevc"
+            | "bluray"
+            | "webrip"
+            | "webdl"
+            | "dvdrip"
+            | "remux"
+            | "hdr"
+            | "uhd"
+            | "proper"
+            | "repack"
+            | "extended"
+            | "director"
+            | "cut"
+    )
+}
+
+fn is_external_id_marker(token: &str) -> bool {
+    token == "tmdbid" || token == "tvdbid" || token == "imdbid"
+}
+
+fn is_external_id_token(token: &str) -> bool {
+    token.starts_with("tmdbid")
+        || token.starts_with("tvdbid")
+        || token.starts_with("imdbid")
+        || (token.starts_with("tt") && token[2..].chars().all(|c| c.is_ascii_digit()))
 }
 
 fn infer_media_hint(config: &AppConfig, relative_path: &str) -> Option<String> {
