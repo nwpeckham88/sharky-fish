@@ -34,6 +34,7 @@ export interface LibraryEntry {
 	media_type: string;
 	size_bytes: number;
 	modified_at: number | null;
+	library_id: string | null;
 }
 
 export interface LibraryResponse {
@@ -137,6 +138,14 @@ export interface AppConfig {
 	metadata_prewarm_limit: number;
 	golden_standards: GoldenStandards;
 	system_prompt: string;
+	libraries: LibraryFolder[];
+}
+
+export interface LibraryFolder {
+	id: string;
+	name: string;
+	path: string;
+	media_type: 'movie' | 'tv';
 }
 
 const BASE = '/api';
@@ -153,7 +162,12 @@ export async function fetchJob(id: number): Promise<{ job_id: number; tasks: Tas
 	return res.json();
 }
 
-export async function fetchLibrary(query = '', limit = 40, offset = 0): Promise<LibraryResponse> {
+export async function fetchLibrary(
+	query = '',
+	limit = 40,
+	offset = 0,
+	libraryId?: string
+): Promise<LibraryResponse> {
 	const params = new URLSearchParams({
 		limit: String(limit),
 		offset: String(offset)
@@ -161,6 +175,9 @@ export async function fetchLibrary(query = '', limit = 40, offset = 0): Promise<
 
 	if (query.trim()) {
 		params.set('q', query.trim());
+	}
+	if (libraryId) {
+		params.set('library_id', libraryId);
 	}
 
 	const res = await fetch(`${BASE}/library?${params.toString()}`);
@@ -204,5 +221,38 @@ export async function fetchHealth(): Promise<boolean> {
 		return res.ok;
 	} catch {
 		return false;
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Library folder CRUD
+// ---------------------------------------------------------------------------
+
+export async function fetchLibraries(): Promise<LibraryFolder[]> {
+	const res = await fetch(`${BASE}/libraries`);
+	if (!res.ok) throw new Error(`Failed to fetch libraries: ${res.status}`);
+	return res.json();
+}
+
+export async function addLibrary(folder: LibraryFolder): Promise<LibraryFolder> {
+	const res = await fetch(`${BASE}/libraries`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(folder)
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to add library: ${res.status}`);
+	}
+	return res.json();
+}
+
+export async function removeLibrary(id: string): Promise<void> {
+	const res = await fetch(`${BASE}/libraries/${encodeURIComponent(id)}`, {
+		method: 'DELETE'
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to remove library: ${res.status}`);
 	}
 }

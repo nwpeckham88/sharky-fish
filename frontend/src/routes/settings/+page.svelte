@@ -1,16 +1,32 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { fetchConfig, saveConfig, type AppConfig } from '$lib/api';
+	import {
+		fetchConfig,
+		saveConfig,
+		fetchLibraries,
+		addLibrary,
+		removeLibrary,
+		type AppConfig,
+		type LibraryFolder
+	} from '$lib/api';
 
-	let activeTab = $state<'standards' | 'prompt' | 'system'>('standards');
+	let activeTab = $state<'libraries' | 'standards' | 'prompt' | 'system'>('libraries');
 	let config = $state<AppConfig | null>(null);
 	let loading = $state(true);
 	let saving = $state(false);
 	let toast = $state<{ msg: string; ok: boolean } | null>(null);
 
+	// Library folder management
+	let libraries = $state<LibraryFolder[]>([]);
+	let newLib = $state<LibraryFolder>({ id: '', name: '', path: '', media_type: 'movie' });
+	let addingLibrary = $state(false);
+	let libraryError = $state('');
+
 	onMount(async () => {
 		try {
-			config = await fetchConfig();
+			const [cfg, libs] = await Promise.all([fetchConfig(), fetchLibraries()]);
+			config = cfg;
+			libraries = libs;
 		} catch (e) {
 			toast = { msg: 'Failed to load configuration', ok: false };
 		} finally {
@@ -108,6 +124,53 @@
 		{ value: 'ollama', label: 'Ollama (local)' },
 		{ value: 'openai', label: 'OpenAI API' },
 	];
+
+	function generateLibraryId(name: string): string {
+		return name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+	}
+
+	function handleLibNameInput(e: Event) {
+		const value = (e.currentTarget as HTMLInputElement).value;
+		newLib.name = value;
+		if (!newLib.id || newLib.id === generateLibraryId(newLib.name.slice(0, -1) || '')) {
+			newLib.id = generateLibraryId(value);
+		}
+	}
+
+	async function handleAddLibrary() {
+		libraryError = '';
+		if (!newLib.name.trim() || !newLib.path.trim()) {
+			libraryError = 'Name and path are required';
+			return;
+		}
+		if (!newLib.id.trim()) {
+			newLib.id = generateLibraryId(newLib.name);
+		}
+		addingLibrary = true;
+		try {
+			const added = await addLibrary(newLib);
+			libraries = [...libraries, added];
+			newLib = { id: '', name: '', path: '', media_type: 'movie' };
+			toast = { msg: 'Library added', ok: true };
+			setTimeout(() => { toast = null; }, 3000);
+		} catch (e) {
+			libraryError = e instanceof Error ? e.message : 'Failed to add library';
+		} finally {
+			addingLibrary = false;
+		}
+	}
+
+	async function handleRemoveLibrary(id: string) {
+		try {
+			await removeLibrary(id);
+			libraries = libraries.filter((l) => l.id !== id);
+			toast = { msg: 'Library removed', ok: true };
+			setTimeout(() => { toast = null; }, 3000);
+		} catch (e) {
+			toast = { msg: e instanceof Error ? e.message : 'Failed to remove library', ok: false };
+			setTimeout(() => { toast = null; }, 3000);
+		}
+	}
 </script>
 
 <div class="mb-5">
@@ -129,12 +192,81 @@
 
 <!-- Tab Bar -->
 <div class="mb-5 flex gap-1.5 rounded-xl border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-1 w-fit">
-	{#each [['standards', 'Golden Standards'], ['prompt', 'Prompt Playground'], ['system', 'System Profile']] as [key, label] (key)}
+	{#each [['libraries', 'Libraries'], ['standards', 'Golden Standards'], ['prompt', 'Prompt Playground'], ['system', 'System Profile']] as [key, label] (key)}
 		<button class="rounded-lg px-4 py-2 text-sm font-semibold transition-colors {activeTab === key ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => { activeTab = key as typeof activeTab; }}>{label}</button>
 	{/each}
 </div>
 
-{#if activeTab === 'standards'}
+{#if activeTab === 'libraries'}
+	<section class="surface-card p-6">
+		<h2 class="mb-4 text-xl text-[color:var(--ink-strong)]">Library Folders</h2>
+		<p class="mb-6 text-sm text-[color:var(--ink-muted)]">Map folders inside your media volume to named libraries. Similar to Jellyfin, bind-mount your entire media directory and register sub-folders here as Movies, TV Shows, etc.</p>
+
+		<!-- Existing libraries -->
+		{#if libraries.length > 0}
+			<div class="mb-6 space-y-2">
+				{#each libraries as lib (lib.id)}
+					<div class="flex items-center justify-between rounded-xl border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.6)] px-4 py-3">
+						<div class="flex items-center gap-4">
+							<div class="flex h-9 w-9 items-center justify-center rounded-lg bg-[color:var(--accent)]/15">
+								{#if lib.media_type === 'movie'}
+									<svg class="h-5 w-5 text-[color:var(--accent-deep)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><path d="M7 2v20M17 2v20M2 12h20M2 7h5M2 17h5M17 17h5M17 7h5"/></svg>
+								{:else}
+									<svg class="h-5 w-5 text-[color:var(--accent-deep)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="7" width="20" height="15" rx="2" ry="2"/><polyline points="17 2 12 7 7 2"/></svg>
+								{/if}
+							</div>
+							<div>
+								<div class="font-semibold text-[color:var(--ink-strong)]">{lib.name}</div>
+								<div class="flex items-center gap-2 text-xs text-[color:var(--ink-muted)]">
+									<span class="font-mono">{lib.path}</span>
+									<span class="rounded-full bg-[color:rgba(214,180,111,0.2)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.12em] text-[color:var(--ink-strong)]">{lib.media_type}</span>
+								</div>
+							</div>
+						</div>
+						<button onclick={() => handleRemoveLibrary(lib.id)} class="rounded-lg border border-[color:var(--line)] px-3 py-1.5 text-xs font-semibold text-[color:var(--danger)] hover:bg-[color:rgba(138,75,67,0.08)]" title="Remove library">Remove</button>
+					</div>
+				{/each}
+			</div>
+		{:else}
+			<div class="mb-6 rounded-xl border border-dashed border-[color:var(--line)] px-5 py-8 text-center text-sm text-[color:var(--ink-muted)]">
+				No library folders configured. Add one below to get started.
+			</div>
+		{/if}
+
+		<!-- Add New Library -->
+		<div class="rounded-[1rem] border border-[color:var(--line)] p-5">
+			<h3 class="section-label mb-4">Add Library Folder</h3>
+			{#if libraryError}
+				<div class="mb-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-4 py-2.5 text-sm text-[color:var(--danger)]">{libraryError}</div>
+			{/if}
+			<div class="grid gap-4 sm:grid-cols-2">
+				<label class="block">
+					<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Name</span>
+					<input type="text" value={newLib.name} oninput={handleLibNameInput} placeholder="e.g. Movies" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]" />
+				</label>
+				<label class="block">
+					<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Path <span class="font-normal">(relative to data volume)</span></span>
+					<input type="text" bind:value={newLib.path} placeholder="e.g. movies" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
+				</label>
+				<label class="block">
+					<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Content Type</span>
+					<select bind:value={newLib.media_type} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]">
+						<option value="movie">Movies</option>
+						<option value="tv">TV Shows</option>
+					</select>
+				</label>
+				<label class="block">
+					<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">ID <span class="font-normal">(auto-generated)</span></span>
+					<input type="text" bind:value={newLib.id} placeholder="auto" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-muted)]" />
+				</label>
+			</div>
+			<div class="mt-4 flex justify-end">
+				<button onclick={handleAddLibrary} disabled={addingLibrary} class="rounded-lg bg-[color:var(--accent)] px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{addingLibrary ? 'Adding…' : 'Add Library'}</button>
+			</div>
+		</div>
+	</section>
+
+{:else if activeTab === 'standards'}
 	<section class="surface-card p-6">
 		<h2 class="mb-4 text-xl text-[color:var(--ink-strong)]">Golden Standards</h2>
 		<p class="mb-6 text-sm text-[color:var(--ink-muted)]">Define the target encoding profile that the LLM must respect. Files deviating from these standards will be flagged during library audits.</p>

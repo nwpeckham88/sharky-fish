@@ -1,4 +1,4 @@
-use crate::config::AppConfig;
+use crate::config::{AppConfig, LibraryFolder};
 use crate::db;
 use crate::library;
 use crate::metadata;
@@ -42,6 +42,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/library", get(list_library))
         .route("/api/library/events", get(list_library_events))
         .route("/api/library/metadata", get(get_library_metadata))
+        .route("/api/libraries", get(list_libraries).post(add_library))
+        .route("/api/libraries/{id}", axum::routing::delete(remove_library))
         .route("/api/jobs/{id}", get(get_job))
         .route("/api/events", get(sse_handler))
         .route("/api/health", get(health))
@@ -74,6 +76,7 @@ struct LibraryQuery {
     q: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
+    library_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -115,10 +118,17 @@ async fn list_library(
     let limit = params.limit.unwrap_or(40).clamp(1, 200);
     let offset = params.offset.unwrap_or(0);
 
+    let libraries = {
+        let cfg = state.config.read().await;
+        cfg.libraries.clone()
+    };
+
     match library::scan_library(
         state.library_path.clone(),
         state.ingest_path.clone(),
+        libraries,
         params.q,
+        params.library_id,
         limit,
         offset,
     )
@@ -200,4 +210,66 @@ async fn update_config(
     }
     *cfg = updated.clone();
     Json(updated).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Library folder CRUD
+// ---------------------------------------------------------------------------
+
+async fn list_libraries(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cfg = state.config.read().await;
+    Json(cfg.libraries.clone()).into_response()
+}
+
+async fn add_library(
+    State(state): State<Arc<AppState>>,
+    Json(folder): Json<LibraryFolder>,
+) -> impl IntoResponse {
+    // Validate required fields.
+    if folder.id.is_empty() || folder.name.is_empty() || folder.path.is_empty() {
+        return (StatusCode::BAD_REQUEST, "id, name, and path are required").into_response();
+    }
+    if !matches!(folder.media_type.as_str(), "movie" | "tv") {
+        return (StatusCode::BAD_REQUEST, "media_type must be \"movie\" or \"tv\"").into_response();
+    }
+
+    // Validate path doesn't escape data_path (no ".." traversal).
+    if folder.path.contains("..") {
+        return (StatusCode::BAD_REQUEST, "path must not contain '..'").into_response();
+    }
+
+    let mut cfg = state.config.write().await;
+
+    // Check for duplicate id.
+    if cfg.libraries.iter().any(|l| l.id == folder.id) {
+        return (StatusCode::CONFLICT, "A library with this id already exists").into_response();
+    }
+
+    // Verify the target directory exists on disk.
+    let full_path = PathBuf::from(&cfg.data_path).join(&folder.path);
+    if !full_path.is_dir() {
+        return (StatusCode::BAD_REQUEST, "Path does not exist or is not a directory").into_response();
+    }
+
+    cfg.libraries.push(folder.clone());
+    if let Err(e) = cfg.save() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    (StatusCode::CREATED, Json(folder)).into_response()
+}
+
+async fn remove_library(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> impl IntoResponse {
+    let mut cfg = state.config.write().await;
+    let before = cfg.libraries.len();
+    cfg.libraries.retain(|l| l.id != id);
+    if cfg.libraries.len() == before {
+        return (StatusCode::NOT_FOUND, "Library not found").into_response();
+    }
+    if let Err(e) = cfg.save() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    StatusCode::NO_CONTENT.into_response()
 }

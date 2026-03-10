@@ -26,6 +26,9 @@ pub struct AppConfig {
     /// System prompt sent to the LLM for ffmpeg command generation.
     #[serde(default)]
     pub system_prompt: String,
+    /// Named library folders within `data_path`.
+    #[serde(default)]
+    pub libraries: Vec<LibraryFolder>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +94,19 @@ pub struct SubtitleStandards {
 
 fn default_true() -> bool { true }
 
+/// A named library folder mapped to a subdirectory inside `data_path`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryFolder {
+    /// Unique identifier (slug, e.g. "movies", "tv-shows").
+    pub id: String,
+    /// Human-readable name (e.g. "Movies", "TV Shows").
+    pub name: String,
+    /// Relative path within `data_path` (e.g. "movies", "tv").
+    pub path: String,
+    /// Content type: "movie" or "tv".
+    pub media_type: String,
+}
+
 impl Default for SubtitleStandards {
     fn default() -> Self {
         Self {
@@ -137,6 +153,7 @@ impl Default for AppConfig {
             metadata_prewarm_limit: 250,
             golden_standards: GoldenStandards::default(),
             system_prompt: String::new(),
+            libraries: Vec::new(),
         }
     }
 }

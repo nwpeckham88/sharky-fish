@@ -5,7 +5,9 @@
 		fetchLibrary,
 		fetchLibraryMetadata,
 		fetchLibraryEvents,
+		fetchLibraries,
 		type LibraryEntry,
+		type LibraryFolder,
 		type LibraryMetadata,
 		type LibraryResponse,
 		type LibraryRoots,
@@ -32,12 +34,25 @@
 	let queryTimer: ReturnType<typeof setTimeout> | undefined;
 	let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
+	// Library folder tabs
+	let libraryFolders = $state<LibraryFolder[]>([]);
+	let activeLibraryId = $state<string | null>(null);
+
 	// Filter state
 	let typeFilter = $state('all');
+
+	// Bulk selection
+	let selectedPaths = $state<Set<string>>(new Set());
+	let bulkMode = $state(false);
 
 	onMount(async () => {
 		const urlQuery = page.url.searchParams.get('q');
 		if (urlQuery) query = urlQuery;
+		const urlLib = page.url.searchParams.get('library');
+		if (urlLib) activeLibraryId = urlLib;
+		try {
+			libraryFolders = await fetchLibraries();
+		} catch { libraryFolders = []; }
 		await Promise.all([loadLibrary(), loadLibraryEvents()]);
 	});
 
@@ -63,7 +78,7 @@
 	async function loadLibrary() {
 		libraryLoading = true;
 		try {
-			const response: LibraryResponse = await fetchLibrary(query, pageSize, offset);
+			const response: LibraryResponse = await fetchLibrary(query, pageSize, offset, activeLibraryId ?? undefined);
 			library = response.items;
 			librarySummary = response.summary;
 			roots = response.roots;
@@ -158,7 +173,57 @@
 	const filteredLibrary = $derived(
 		typeFilter === 'all' ? library : library.filter((i) => i.media_type === typeFilter)
 	);
+
+	function switchLibrary(id: string | null) {
+		activeLibraryId = id;
+		offset = 0;
+		selectedItem = null;
+		selectedMetadata = null;
+		selectedPaths = new Set();
+		void loadLibrary();
+	}
+
+	function toggleSelect(path: string) {
+		const next = new Set(selectedPaths);
+		if (next.has(path)) { next.delete(path); } else { next.add(path); }
+		selectedPaths = next;
+	}
+
+	function toggleSelectAll() {
+		if (selectedPaths.size === filteredLibrary.length) {
+			selectedPaths = new Set();
+		} else {
+			selectedPaths = new Set(filteredLibrary.map((i) => i.relative_path));
+		}
+	}
+
+	function clearSelection() {
+		selectedPaths = new Set();
+		bulkMode = false;
+	}
+
+	function activeLibraryName(): string {
+		if (!activeLibraryId) return 'All Libraries';
+		return libraryFolders.find((l) => l.id === activeLibraryId)?.name ?? 'Unknown';
+	}
 </script>
+
+<!-- Library Folder Tabs -->
+{#if libraryFolders.length > 0}
+	<section class="mb-5 flex gap-1.5 rounded-xl border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-1 w-fit">
+		<button class="rounded-lg px-4 py-2 text-sm font-semibold transition-colors {activeLibraryId === null ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => switchLibrary(null)}>All</button>
+		{#each libraryFolders as folder (folder.id)}
+			<button class="flex items-center gap-1.5 rounded-lg px-4 py-2 text-sm font-semibold transition-colors {activeLibraryId === folder.id ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => switchLibrary(folder.id)}>
+				{#if folder.media_type === 'movie'}
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><path d="M7 2v20M17 2v20M2 12h20M2 7h5M2 17h5M17 17h5M17 7h5"/></svg>
+				{:else}
+					<svg class="h-3.5 w-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="7" width="20" height="15" rx="2" ry="2"/><polyline points="17 2 12 7 7 2"/></svg>
+				{/if}
+				{folder.name}
+			</button>
+		{/each}
+	</section>
+{/if}
 
 <!-- Summary Stats Row -->
 <section class="mb-5 grid gap-3 sm:grid-cols-5">
@@ -180,10 +245,25 @@
 			<button class="rounded-lg px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {typeFilter === t ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => { typeFilter = t; }}>{t}</button>
 		{/each}
 	</div>
+	<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {bulkMode ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => { bulkMode = !bulkMode; if (!bulkMode) clearSelection(); }}>
+		Select
+	</button>
 	<div class="rounded-xl border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2.5 text-sm text-[color:var(--ink-muted)]">
 		{pageRangeLabel()} of {totalLibrary}
 	</div>
 </section>
+
+<!-- Bulk Actions Bar -->
+{#if bulkMode && selectedPaths.size > 0}
+	<section class="mb-4 flex items-center gap-3 rounded-xl border border-[color:var(--accent)]/30 bg-[color:var(--accent)]/5 px-4 py-2.5">
+		<span class="text-sm font-semibold text-[color:var(--ink-strong)]">{selectedPaths.size} selected</span>
+		<div class="flex gap-2">
+			<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)]" onclick={() => { /* future: bulk rescan metadata */ }}>Rescan Metadata</button>
+			<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)]" onclick={() => { /* future: queue for processing */ }}>Queue for Processing</button>
+		</div>
+		<button class="ml-auto text-xs font-semibold text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]" onclick={clearSelection}>Clear</button>
+	</section>
+{/if}
 
 <!-- Main Content -->
 <section class="grid gap-5 xl:grid-cols-[minmax(0,1.3fr)_minmax(20rem,0.7fr)]">
@@ -192,20 +272,33 @@
 		<table class="w-full text-left text-sm">
 			<thead class="border-b border-[color:var(--line)] bg-[color:rgba(234,223,201,0.6)] text-xs uppercase tracking-[0.18em] text-[color:var(--ink-muted)]">
 				<tr>
+					{#if bulkMode}
+						<th class="w-10 px-3 py-3">
+							<input type="checkbox" checked={filteredLibrary.length > 0 && selectedPaths.size === filteredLibrary.length} onchange={toggleSelectAll} class="accent-[color:var(--accent)]" />
+						</th>
+					{/if}
 					<th class="px-4 py-3">Path</th>
 					<th class="px-4 py-3">Type</th>
+					{#if !activeLibraryId && libraryFolders.length > 0}
+						<th class="px-4 py-3">Library</th>
+					{/if}
 					<th class="px-4 py-3">Size</th>
 					<th class="px-4 py-3">Modified</th>
 				</tr>
 			</thead>
 			<tbody>
 				{#if libraryLoading}
-					<tr><td colspan="4" class="px-4 py-14 text-center text-[color:var(--ink-muted)]">Scanning library…</td></tr>
+					<tr><td colspan={bulkMode ? 6 : 5} class="px-4 py-14 text-center text-[color:var(--ink-muted)]">Scanning library…</td></tr>
 				{:else if filteredLibrary.length === 0}
-					<tr><td colspan="4" class="px-4 py-14 text-center text-[color:var(--ink-muted)]">No entries match the current filter.</td></tr>
+					<tr><td colspan={bulkMode ? 6 : 5} class="px-4 py-14 text-center text-[color:var(--ink-muted)]">No entries match the current filter.</td></tr>
 				{:else}
 					{#each filteredLibrary as item (item.relative_path)}
-						<tr class="cursor-pointer border-b border-[color:rgba(123,105,81,0.14)] last:border-b-0 hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''}" onclick={() => loadMetadata(item)}>
+						<tr class="cursor-pointer border-b border-[color:rgba(123,105,81,0.14)] last:border-b-0 hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''} {selectedPaths.has(item.relative_path) ? 'bg-[color:rgba(214,180,111,0.08)]' : ''}" onclick={() => { if (bulkMode) { toggleSelect(item.relative_path); } else { loadMetadata(item); } }}>
+							{#if bulkMode}
+								<td class="w-10 px-3 py-3" onclick={(e) => { e.stopPropagation(); toggleSelect(item.relative_path); }}>
+									<input type="checkbox" checked={selectedPaths.has(item.relative_path)} class="accent-[color:var(--accent)]" />
+								</td>
+							{/if}
 							<td class="px-4 py-3">
 								<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
 								<div class="mt-0.5 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
@@ -213,6 +306,18 @@
 							<td class="px-4 py-3">
 								<span class="status-chip {item.media_type === 'video' ? 'processing' : item.media_type === 'audio' ? 'completed' : ''}">{item.media_type}</span>
 							</td>
+							{#if !activeLibraryId && libraryFolders.length > 0}
+								<td class="px-4 py-3">
+									{#if item.library_id}
+										{@const lib = libraryFolders.find((l) => l.id === item.library_id)}
+										{#if lib}
+											<span class="rounded-full bg-[color:rgba(214,180,111,0.15)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-strong)]">{lib.name}</span>
+										{/if}
+									{:else}
+										<span class="text-[color:var(--ink-muted)] text-xs">—</span>
+									{/if}
+								</td>
+							{/if}
 							<td class="px-4 py-3 text-[color:var(--ink-strong)]">{formatBytes(item.size_bytes)}</td>
 							<td class="px-4 py-3 text-[color:var(--ink-muted)]">{formatTimestamp(item.modified_at)}</td>
 						</tr>
@@ -351,7 +456,7 @@
 
 <!-- Pagination -->
 <section class="mt-4 flex items-center justify-between gap-3">
-	<div class="text-sm text-[color:var(--ink-muted)]">{librarySummary.video_items} video, {librarySummary.audio_items} audio, {librarySummary.other_items} subtitle assets</div>
+	<div class="text-sm text-[color:var(--ink-muted)]">{activeLibraryName()} · {librarySummary.video_items} video, {librarySummary.audio_items} audio, {librarySummary.other_items} subtitle assets</div>
 	<div class="flex gap-2">
 		<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm font-semibold text-[color:var(--ink-strong)] disabled:opacity-40" onclick={previousPage} disabled={offset === 0}>Previous</button>
 		<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm font-semibold text-[color:var(--ink-strong)] disabled:opacity-40" onclick={nextPage} disabled={offset + pageSize >= totalLibrary}>Next</button>

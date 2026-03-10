@@ -5,6 +5,8 @@ use std::time::UNIX_EPOCH;
 use tokio::task;
 use walkdir::WalkDir;
 
+use crate::config::LibraryFolder;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct LibraryRoots {
     pub library_path: String,
@@ -28,6 +30,8 @@ pub struct LibraryEntry {
     pub media_type: String,
     pub size_bytes: u64,
     pub modified_at: Option<u64>,
+    /// Which configured library folder this file belongs to (if any).
+    pub library_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -43,18 +47,22 @@ pub struct LibraryResponse {
 pub async fn scan_library(
     library_root: PathBuf,
     ingest_root: PathBuf,
+    libraries: Vec<LibraryFolder>,
     query: Option<String>,
+    library_id: Option<String>,
     limit: usize,
     offset: usize,
 ) -> Result<LibraryResponse> {
-    task::spawn_blocking(move || scan_library_blocking(&library_root, &ingest_root, query, limit, offset))
+    task::spawn_blocking(move || scan_library_blocking(&library_root, &ingest_root, &libraries, query, library_id, limit, offset))
         .await?
 }
 
 fn scan_library_blocking(
     library_root: &Path,
     ingest_root: &Path,
+    libraries: &[LibraryFolder],
     query: Option<String>,
+    library_id: Option<String>,
     limit: usize,
     offset: usize,
 ) -> Result<LibraryResponse> {
@@ -67,7 +75,26 @@ fn scan_library_blocking(
         ingest_path: ingest_root.display().to_string(),
     };
 
-    if !library_root.exists() {
+    // Determine which directory to scan based on library_id filter.
+    let scan_root = if let Some(ref lid) = library_id {
+        if let Some(folder) = libraries.iter().find(|l| l.id == *lid) {
+            library_root.join(&folder.path)
+        } else {
+            // Unknown library id — return empty.
+            return Ok(LibraryResponse {
+                items: Vec::new(),
+                total_items: 0,
+                limit,
+                offset,
+                summary: LibrarySummary::default(),
+                roots,
+            });
+        }
+    } else {
+        library_root.to_path_buf()
+    };
+
+    if !scan_root.exists() {
         return Ok(LibraryResponse {
             items: Vec::new(),
             total_items: 0,
@@ -81,7 +108,7 @@ fn scan_library_blocking(
     let mut summary = LibrarySummary::default();
     let mut items = Vec::new();
 
-    for entry in WalkDir::new(library_root)
+    for entry in WalkDir::new(&scan_root)
         .follow_links(false)
         .into_iter()
         .filter_map(|entry| entry.ok())
@@ -125,6 +152,9 @@ fn scan_library_blocking(
             }
         }
 
+        // Match file to a configured library folder.
+        let matched_library_id = match_library_id(&relative_path, libraries);
+
         let file_name = path
             .file_name()
             .and_then(|value| value.to_str())
@@ -143,6 +173,7 @@ fn scan_library_blocking(
             media_type,
             size_bytes,
             modified_at,
+            library_id: matched_library_id,
         });
     }
 
@@ -164,6 +195,21 @@ fn scan_library_blocking(
         summary,
         roots,
     })
+}
+
+/// Match a relative file path to one of the configured library folders.
+fn match_library_id(relative_path: &str, libraries: &[LibraryFolder]) -> Option<String> {
+    for lib in libraries {
+        let prefix = if lib.path.ends_with('/') {
+            lib.path.clone()
+        } else {
+            format!("{}/", lib.path)
+        };
+        if relative_path.starts_with(&prefix) || relative_path == lib.path {
+            return Some(lib.id.clone());
+        }
+    }
+    None
 }
 
 fn detect_media_type(path: &Path) -> Option<String> {
