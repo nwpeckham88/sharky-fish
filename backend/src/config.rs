@@ -44,6 +44,8 @@ pub struct LlmConfig {
 pub struct GoldenStandards {
     pub video: VideoStandards,
     pub audio: AudioStandards,
+    #[serde(default)]
+    pub subtitle: SubtitleStandards,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +68,40 @@ pub struct AudioStandards {
     pub max_channels: String,
 }
 
+/// Subtitle handling mode.
+///   - "keep_all"          – copy every subtitle stream unchanged
+///   - "remove_all"        – strip all subtitle streams
+///   - "keep_preferred"    – keep only streams whose language is in `preferred_languages`
+///   - "keep_forced_only"  – strip all except forced tracks in `preferred_languages`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubtitleStandards {
+    /// Processing mode (see doc above).
+    pub mode: String,
+    /// ISO 639-2/B language codes (e.g. "eng", "spa", "fra").
+    #[serde(default)]
+    pub preferred_languages: Vec<String>,
+    /// Always keep forced subtitle tracks in preferred languages, even in
+    /// modes that would otherwise strip them.
+    #[serde(default = "default_true")]
+    pub keep_forced: bool,
+    /// Keep SDH (hearing-impaired) subtitle tracks.
+    #[serde(default)]
+    pub keep_sdh: bool,
+}
+
+fn default_true() -> bool { true }
+
+impl Default for SubtitleStandards {
+    fn default() -> Self {
+        Self {
+            mode: "keep_preferred".into(),
+            preferred_languages: vec!["eng".into()],
+            keep_forced: true,
+            keep_sdh: false,
+        }
+    }
+}
+
 impl Default for GoldenStandards {
     fn default() -> Self {
         Self {
@@ -79,6 +115,7 @@ impl Default for GoldenStandards {
                 target_true_peak: -2.0,
                 max_channels: "none".into(),
             },
+            subtitle: SubtitleStandards::default(),
         }
     }
 }

@@ -176,7 +176,7 @@
 		<input class="min-w-0 flex-1 bg-transparent text-sm text-[color:var(--ink-strong)] outline-none placeholder:text-[color:var(--ink-muted)]" type="search" placeholder="Search paths, filenames, codecs…" value={query} oninput={handleSearchInput} />
 	</label>
 	<div class="flex gap-1.5 rounded-xl border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-1">
-		{#each ['all', 'video', 'audio', 'other'] as t (t)}
+		{#each ['all', 'video', 'audio', 'subtitle', 'other'] as t (t)}
 			<button class="rounded-lg px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {typeFilter === t ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => { typeFilter = t; }}>{t}</button>
 		{/each}
 	</div>
@@ -264,6 +264,39 @@
 							<div class="mt-0.5 text-xs text-[color:var(--ink-muted)]">{selectedMetadata.audio_channels ? `${selectedMetadata.audio_channels} channels` : 'No channels'}</div>
 						</div>
 					</div>
+
+					<!-- Subtitle Summary -->
+					{#if selectedMetadata.subtitle_count > 0}
+						<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
+							<div class="section-label mb-1.5">Subtitles · {selectedMetadata.subtitle_count} track{selectedMetadata.subtitle_count !== 1 ? 's' : ''}</div>
+							<div class="space-y-1">
+								{#each selectedMetadata.probe.streams.filter(s => s.codec_type === 'subtitle') as sub (sub.index)}
+									<div class="flex items-center gap-2 text-xs">
+										<span class="font-mono text-[color:var(--ink-muted)]">#{sub.index}</span>
+										<span class="font-semibold text-[color:var(--ink-strong)]">{sub.language ?? 'und'}</span>
+										<span class="text-[color:var(--ink-muted)]">{sub.codec_name}</span>
+										{#if sub.disposition?.forced}
+											<span class="rounded-full bg-[color:rgba(164,79,45,0.12)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.12em] text-[color:var(--accent-deep)]">forced</span>
+										{/if}
+										{#if sub.disposition?.hearing_impaired}
+											<span class="rounded-full bg-[color:rgba(106,142,72,0.12)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.12em] text-[color:var(--olive)]">SDH</span>
+										{/if}
+										{#if sub.disposition?.default}
+											<span class="rounded-full bg-[color:rgba(214,180,111,0.2)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.12em] text-[color:var(--ink-muted)]">default</span>
+										{/if}
+										{#if sub.title}
+											<span class="truncate text-[color:var(--ink-muted)]">{sub.title}</span>
+										{/if}
+									</div>
+								{/each}
+							</div>
+							{#if selectedMetadata.subtitle_languages.length > 0}
+								<div class="mt-1.5 text-[11px] text-[color:var(--ink-muted)]">Languages: {selectedMetadata.subtitle_languages.join(', ')}</div>
+							{/if}
+						</div>
+					{:else}
+						<div class="rounded-lg border border-dashed border-[color:var(--line)] px-3 py-2.5 text-xs text-[color:var(--ink-muted)]">No subtitle streams</div>
+					{/if}
 					<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
 						<div class="mb-2 flex items-center justify-between">
 							<div class="section-label">Streams</div>
@@ -274,13 +307,19 @@
 								<div class="rounded-lg bg-[color:rgba(244,236,223,0.7)] px-3 py-2.5">
 									<div class="flex items-center justify-between">
 										<span class="font-semibold text-[color:var(--ink-strong)]">#{stream.index} · {stream.codec_type}</span>
-										<span class="font-mono text-[11px] text-[color:var(--ink-muted)]">{stream.codec_name}</span>
+										<div class="flex items-center gap-1.5">
+											{#if stream.language}<span class="rounded-full bg-[color:rgba(214,180,111,0.15)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-strong)]">{stream.language}</span>{/if}
+											<span class="font-mono text-[11px] text-[color:var(--ink-muted)]">{stream.codec_name}</span>
+										</div>
 									</div>
-									<div class="mt-1 text-xs text-[color:var(--ink-muted)]">
+									<div class="mt-1 flex items-center gap-1.5 text-xs text-[color:var(--ink-muted)]">
 										{#if stream.width && stream.height}{stream.width}×{stream.height}{/if}
 										{#if stream.channels} · {stream.channels}ch{/if}
 										{#if stream.sample_rate} · {stream.sample_rate} Hz{/if}
 										{#if stream.bit_rate} · {formatBytes(stream.bit_rate)}/s{/if}
+										{#if stream.disposition?.forced}<span class="rounded-full bg-[color:rgba(164,79,45,0.12)] px-1.5 py-0.5 text-[10px] font-bold text-[color:var(--accent-deep)]">forced</span>{/if}
+										{#if stream.disposition?.hearing_impaired}<span class="rounded-full bg-[color:rgba(106,142,72,0.12)] px-1.5 py-0.5 text-[10px] font-bold text-[color:var(--olive)]">SDH</span>{/if}
+										{#if stream.title}<span class="truncate">{stream.title}</span>{/if}
 									</div>
 								</div>
 							{/each}

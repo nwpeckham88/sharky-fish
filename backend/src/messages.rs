@@ -37,6 +37,24 @@ pub struct StreamInfo {
     pub channels: Option<u32>,
     pub sample_rate: Option<u32>,
     pub bit_rate: Option<u64>,
+    /// ISO 639-2/B language tag (e.g. "eng", "spa").
+    pub language: Option<String>,
+    /// Stream title/label (often describes subtitle track content).
+    pub title: Option<String>,
+    /// Disposition flags from the container.
+    #[serde(default)]
+    pub disposition: StreamDisposition,
+}
+
+/// Disposition flags reported by ffprobe for a stream.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StreamDisposition {
+    #[serde(default)]
+    pub default: bool,
+    #[serde(default)]
+    pub forced: bool,
+    #[serde(default)]
+    pub hearing_impaired: bool,
 }
 
 /// Decision produced by the Brain (LLM).

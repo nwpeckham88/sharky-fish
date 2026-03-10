@@ -1,15 +1,18 @@
+use crate::config::SubtitleStandards;
 use crate::db;
 use crate::messages::{
-    FfmpegProgress, LoudnormMeasurement, QueueMsg, QueuedJob, SseEvent,
+    FfmpegProgress, LoudnormMeasurement, MediaProbe, QueueMsg, QueuedJob, SseEvent,
 };
 use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{broadcast, mpsc, Semaphore};
+use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
 use tracing::{info, warn};
 use std::sync::Arc;
+
+use crate::config::AppConfig;
 
 /// The Forge actor pulls jobs from the Queue and executes FFmpeg transcoding,
 /// including two-pass EBU R128 loudnorm when required.  It owns the I/O
@@ -21,6 +24,7 @@ pub struct ForgeActor {
     sse_tx: broadcast::Sender<SseEvent>,
     io_semaphore: Arc<Semaphore>,
     data_path: PathBuf,
+    config: Arc<RwLock<AppConfig>>,
 }
 
 impl ForgeActor {
@@ -30,6 +34,7 @@ impl ForgeActor {
         sse_tx: broadcast::Sender<SseEvent>,
         io_semaphore: Arc<Semaphore>,
         data_path: PathBuf,
+        config: Arc<RwLock<AppConfig>>,
     ) -> Self {
         Self {
             queue_tx,
@@ -37,6 +42,7 @@ impl ForgeActor {
             sse_tx,
             io_semaphore,
             data_path,
+            config,
         }
     }
 
@@ -177,6 +183,9 @@ impl ForgeActor {
 
     /// Run the actual transcode pass.  When `loudnorm` data is provided, it
     /// injects the measured parameters into the `loudnorm` filter chain.
+    /// Subtitle streams are filtered deterministically according to the
+    /// configured SubtitleStandards, overriding any LLM-generated subtitle
+    /// mapping to guarantee correctness.
     async fn run_transcode(
         &self,
         job: &QueuedJob,
@@ -194,6 +203,46 @@ impl ForgeActor {
                 _ => args.push(arg.clone()),
             }
         }
+
+        // Strip any LLM-generated subtitle flags — we handle subtitles
+        // deterministically from config.
+        args.retain(|a| a != "-sn");
+        // Remove any existing -map 0:s or -c:s entries from LLM args
+        let mut i = 0;
+        while i < args.len() {
+            let is_sub_map = args[i] == "-map" && args.get(i + 1).map_or(false, |v| v.contains(":s"));
+            let is_sub_codec = args[i] == "-c:s";
+            if is_sub_map || is_sub_codec {
+                args.remove(i); // remove flag
+                if i < args.len() { args.remove(i); } // remove value
+            } else {
+                i += 1;
+            }
+        }
+
+        // Probe source to discover subtitle streams.
+        let probe = crate::metadata::probe_media(&job.source_path).await.ok();
+        let cfg = self.config.read().await;
+        let sub_standards = &cfg.golden_standards.subtitle;
+
+        // Determine output container from the output path extension.
+        let output_ext = output_path.extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("mp4")
+            .to_ascii_lowercase();
+
+        // Build subtitle mapping args.
+        if let Some(ref probe) = probe {
+            let sub_args = build_subtitle_args(probe, sub_standards, &output_ext);
+            if !sub_args.is_empty() {
+                // Insert subtitle args before the output path.
+                let output_pos = args.len().saturating_sub(1);
+                for (j, arg) in sub_args.into_iter().enumerate() {
+                    args.insert(output_pos + j, arg);
+                }
+            }
+        }
+        drop(cfg);
 
         // Inject loudnorm pass 2 filter if measurements are provided.
         if let Some(m) = loudnorm {
@@ -330,4 +379,111 @@ fn parse_progress_line(line: &str, job_id: i64, total_duration: f64) -> Option<F
     }
 
     Some(progress)
+}
+
+/// Build FFmpeg arguments for subtitle stream handling based on the configured
+/// `SubtitleStandards`.  Returns an empty vec when there are no subtitle
+/// streams to process.
+fn build_subtitle_args(
+    probe: &MediaProbe,
+    standards: &SubtitleStandards,
+    output_ext: &str,
+) -> Vec<String> {
+    let sub_streams: Vec<_> = probe
+        .streams
+        .iter()
+        .filter(|s| s.codec_type == "subtitle")
+        .collect();
+
+    if sub_streams.is_empty() {
+        return vec![];
+    }
+
+    match standards.mode.as_str() {
+        "remove_all" => vec!["-sn".into()],
+        "keep_all" => {
+            let mut args = Vec::new();
+            for s in &sub_streams {
+                args.push("-map".into());
+                args.push(format!("0:{}", s.index));
+            }
+            let codec = subtitle_codec_for_container(output_ext);
+            args.push("-c:s".into());
+            args.push(codec);
+            args
+        }
+        "keep_preferred" => {
+            let kept: Vec<_> = sub_streams
+                .iter()
+                .filter(|s| {
+                    let lang = s.language.as_deref().unwrap_or("und");
+                    let lang_match = standards.preferred_languages.is_empty()
+                        || standards.preferred_languages.iter().any(|pl| pl.eq_ignore_ascii_case(lang));
+                    let forced_keep = standards.keep_forced && s.disposition.forced
+                        && standards.preferred_languages.iter().any(|pl| pl.eq_ignore_ascii_case(lang));
+                    let sdh_ok = !s.disposition.hearing_impaired || standards.keep_sdh;
+                    (lang_match && sdh_ok) || forced_keep
+                })
+                .collect();
+
+            if kept.is_empty() {
+                return vec!["-sn".into()];
+            }
+
+            let mut args = Vec::new();
+            for s in &kept {
+                args.push("-map".into());
+                args.push(format!("0:{}", s.index));
+            }
+            let codec = subtitle_codec_for_container(output_ext);
+            args.push("-c:s".into());
+            args.push(codec);
+            args
+        }
+        "keep_forced_only" => {
+            let kept: Vec<_> = sub_streams
+                .iter()
+                .filter(|s| {
+                    let lang = s.language.as_deref().unwrap_or("und");
+                    let lang_match = standards.preferred_languages.is_empty()
+                        || standards.preferred_languages.iter().any(|pl| pl.eq_ignore_ascii_case(lang));
+                    s.disposition.forced && lang_match
+                })
+                .collect();
+
+            if kept.is_empty() {
+                return vec!["-sn".into()];
+            }
+
+            let mut args = Vec::new();
+            for s in &kept {
+                args.push("-map".into());
+                args.push(format!("0:{}", s.index));
+            }
+            let codec = subtitle_codec_for_container(output_ext);
+            args.push("-c:s".into());
+            args.push(codec);
+            args
+        }
+        _ => {
+            // Unknown mode — keep all as a safe default.
+            let mut args = Vec::new();
+            for s in &sub_streams {
+                args.push("-map".into());
+                args.push(format!("0:{}", s.index));
+            }
+            args.push("-c:s".into());
+            args.push("copy".into());
+            args
+        }
+    }
+}
+
+/// Determine the appropriate subtitle codec for the output container.
+/// MP4/M4V only support mov_text; MKV/WebM can carry most formats.
+fn subtitle_codec_for_container(ext: &str) -> String {
+    match ext {
+        "mp4" | "m4v" | "mov" => "mov_text".into(),
+        _ => "copy".into(),
+    }
 }

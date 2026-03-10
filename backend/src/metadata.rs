@@ -1,5 +1,5 @@
 use crate::db::{self, CachedMediaMetadata};
-use crate::messages::{MediaProbe, StreamInfo};
+use crate::messages::{MediaProbe, StreamDisposition, StreamInfo};
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
 use serde::Serialize;
@@ -23,6 +23,8 @@ pub struct LibraryMetadataResponse {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub audio_channels: Option<u32>,
+    pub subtitle_count: usize,
+    pub subtitle_languages: Vec<String>,
     pub probe: MediaProbe,
     pub cached: bool,
 }
@@ -65,19 +67,33 @@ pub async fn probe_media(path: &Path) -> Result<MediaProbe> {
         .as_array()
         .map(|arr| {
             arr.iter()
-                .map(|stream| StreamInfo {
-                    index: stream["index"].as_u64().unwrap_or(0) as u32,
-                    codec_type: stream["codec_type"].as_str().unwrap_or("").into(),
-                    codec_name: stream["codec_name"].as_str().unwrap_or("").into(),
-                    width: stream["width"].as_u64().map(|value| value as u32),
-                    height: stream["height"].as_u64().map(|value| value as u32),
-                    channels: stream["channels"].as_u64().map(|value| value as u32),
-                    sample_rate: stream["sample_rate"]
-                        .as_str()
-                        .and_then(|value| value.parse::<u32>().ok()),
-                    bit_rate: stream["bit_rate"]
-                        .as_str()
-                        .and_then(|value| value.parse::<u64>().ok()),
+                .map(|stream| {
+                    let disposition = &stream["disposition"];
+                    StreamInfo {
+                        index: stream["index"].as_u64().unwrap_or(0) as u32,
+                        codec_type: stream["codec_type"].as_str().unwrap_or("").into(),
+                        codec_name: stream["codec_name"].as_str().unwrap_or("").into(),
+                        width: stream["width"].as_u64().map(|value| value as u32),
+                        height: stream["height"].as_u64().map(|value| value as u32),
+                        channels: stream["channels"].as_u64().map(|value| value as u32),
+                        sample_rate: stream["sample_rate"]
+                            .as_str()
+                            .and_then(|value| value.parse::<u32>().ok()),
+                        bit_rate: stream["bit_rate"]
+                            .as_str()
+                            .and_then(|value| value.parse::<u64>().ok()),
+                        language: stream["tags"]["language"]
+                            .as_str()
+                            .map(|v| v.to_string()),
+                        title: stream["tags"]["title"]
+                            .as_str()
+                            .map(|v| v.to_string()),
+                        disposition: StreamDisposition {
+                            default: disposition["default"].as_i64() == Some(1),
+                            forced: disposition["forced"].as_i64() == Some(1),
+                            hearing_impaired: disposition["hearing_impaired"].as_i64() == Some(1),
+                        },
+                    }
                 })
                 .collect()
         })
@@ -245,6 +261,17 @@ fn from_probe(
 ) -> LibraryMetadataResponse {
     let video_stream = probe.streams.iter().find(|stream| stream.codec_type == "video");
     let audio_stream = probe.streams.iter().find(|stream| stream.codec_type == "audio");
+    let subtitle_streams: Vec<&StreamInfo> = probe
+        .streams
+        .iter()
+        .filter(|stream| stream.codec_type == "subtitle")
+        .collect();
+    let subtitle_languages: Vec<String> = subtitle_streams
+        .iter()
+        .filter_map(|s| s.language.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
 
     LibraryMetadataResponse {
         file_path,
@@ -259,6 +286,8 @@ fn from_probe(
         width: video_stream.and_then(|stream| stream.width),
         height: video_stream.and_then(|stream| stream.height),
         audio_channels: audio_stream.and_then(|stream| stream.channels),
+        subtitle_count: subtitle_streams.len(),
+        subtitle_languages,
         probe,
         cached,
     }

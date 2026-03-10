@@ -88,7 +88,10 @@ async fn main() -> Result<()> {
         }
     });
 
-    let brain = BrainActor::new(identified_rx, queue_tx.clone(), cfg.llm.clone());
+    // Shared config for actors and HTTP handlers.
+    let shared_config = Arc::new(RwLock::new(cfg.clone()));
+
+    let brain = BrainActor::new(identified_rx, queue_tx.clone(), cfg.llm.clone(), shared_config.clone());
     tokio::spawn(async move {
         if let Err(e) = brain.run().await {
             tracing::error!(err = %e, "brain actor crashed");
@@ -108,6 +111,7 @@ async fn main() -> Result<()> {
         sse_tx.clone(),
         io_semaphore,
         PathBuf::from(&cfg.data_path),
+        shared_config.clone(),
     );
     tokio::spawn(async move {
         if let Err(e) = forge.run().await {
@@ -119,7 +123,6 @@ async fn main() -> Result<()> {
     let port = cfg.port;
     let library_path = PathBuf::from(&cfg.data_path);
     let ingest_path = PathBuf::from(&cfg.ingest_path);
-    let shared_config = Arc::new(RwLock::new(cfg));
     let state = AppState {
         pool,
         sse_tx,

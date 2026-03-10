@@ -45,6 +45,12 @@ export interface LibraryResponse {
 	roots: LibraryRoots;
 }
 
+export interface StreamDisposition {
+	default: boolean;
+	forced: boolean;
+	hearing_impaired: boolean;
+}
+
 export interface MediaStreamInfo {
 	index: number;
 	codec_type: string;
@@ -54,6 +60,9 @@ export interface MediaStreamInfo {
 	channels?: number;
 	sample_rate?: number;
 	bit_rate?: number;
+	language?: string;
+	title?: string;
+	disposition: StreamDisposition;
 }
 
 export interface LibraryMetadata {
@@ -69,6 +78,8 @@ export interface LibraryMetadata {
 	width?: number;
 	height?: number;
 	audio_channels?: number;
+	subtitle_count: number;
+	subtitle_languages: string[];
 	probe: {
 		format: string;
 		duration_secs: number;
@@ -96,9 +107,17 @@ export interface AudioStandards {
 	max_channels: string;
 }
 
+export interface SubtitleStandards {
+	mode: string;
+	preferred_languages: string[];
+	keep_forced: boolean;
+	keep_sdh: boolean;
+}
+
 export interface GoldenStandards {
 	video: VideoStandards;
 	audio: AudioStandards;
+	subtitle: SubtitleStandards;
 }
 
 export interface LlmConfig {
