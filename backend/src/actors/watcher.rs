@@ -1,12 +1,14 @@
+use crate::config::AppConfig;
 use crate::db;
+use crate::library_index;
 use crate::messages::{IngestEvent, LibraryChange, SseEvent};
 use anyhow::Result;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use sqlx::SqlitePool;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{info, warn};
 
 /// The Watcher actor monitors the ingest directory for new media files via
@@ -18,6 +20,7 @@ pub struct WatcherActor {
     tx: mpsc::Sender<IngestEvent>,
     sse_tx: broadcast::Sender<SseEvent>,
     pool: SqlitePool,
+    config: Arc<RwLock<AppConfig>>,
 }
 
 impl WatcherActor {
@@ -27,6 +30,7 @@ impl WatcherActor {
         tx: mpsc::Sender<IngestEvent>,
         sse_tx: broadcast::Sender<SseEvent>,
         pool: SqlitePool,
+        config: Arc<RwLock<AppConfig>>,
     ) -> Self {
         Self {
             ingest_path,
@@ -34,6 +38,7 @@ impl WatcherActor {
             tx,
             sse_tx,
             pool,
+            config,
         }
     }
 
@@ -86,6 +91,24 @@ impl WatcherActor {
             }
 
             if is_media_file(&path) && path.starts_with(&self.library_path) {
+                let (libraries, exclude_patterns) = {
+                    let cfg = self.config.read().await;
+                    (cfg.libraries.clone(), cfg.scan_exclude_patterns.clone())
+                };
+
+                if let Err(error) = library_index::apply_library_path_change(
+                    &self.pool,
+                    &self.library_path,
+                    &libraries,
+                    &exclude_patterns,
+                    &path,
+                    change,
+                )
+                .await
+                {
+                    warn!(err = %error, path = %path.display(), "watcher: failed to apply library index update");
+                }
+
                 let relative_path = path
                     .strip_prefix(&self.library_path)
                     .unwrap_or(&path)
@@ -126,11 +149,5 @@ fn change_label(kind: &EventKind) -> Option<&'static str> {
 }
 
 fn is_media_file(path: &PathBuf) -> bool {
-    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
-        return false;
-    };
-    matches!(
-        ext.to_lowercase().as_str(),
-        "mkv" | "mp4" | "avi" | "mov" | "ts" | "flac" | "mp3" | "wav" | "m4a" | "webm"
-    )
+    library_index::detect_media_type(path.as_path()).is_some()
 }

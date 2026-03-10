@@ -37,6 +37,16 @@ export interface LibraryEntry {
 	library_id: string | null;
 }
 
+export interface LibraryScanStatus {
+	status: string;
+	scanned_items: number;
+	total_items: number;
+	started_at: number | null;
+	completed_at: number | null;
+	last_scan_at: number | null;
+	last_error: string | null;
+}
+
 export interface LibraryResponse {
 	items: LibraryEntry[];
 	total_items: number;
@@ -44,6 +54,7 @@ export interface LibraryResponse {
 	offset: number;
 	summary: LibrarySummary;
 	roots: LibraryRoots;
+	scan: LibraryScanStatus;
 }
 
 export interface StreamDisposition {
@@ -276,6 +287,11 @@ export async function fetchLibraryEvents(limit = 24): Promise<LibraryChangeEvent
 	const res = await fetch(`${BASE}/library/events?${params.toString()}`);
 	if (!res.ok) throw new Error(`Failed to fetch library events: ${res.status}`);
 	return res.json();
+}
+
+export async function triggerLibraryRescan(): Promise<void> {
+	const res = await fetch(`${BASE}/library/rescan`, { method: 'POST' });
+	if (!res.ok) throw new Error(`Failed to trigger library rescan: ${res.status}`);
 }
 
 export async function fetchConfig(): Promise<AppConfig> {

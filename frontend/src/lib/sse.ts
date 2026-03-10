@@ -9,6 +9,16 @@ export type SseLibraryChange = {
 	change: string;
 	occurred_at: number;
 };
+export type SseLibraryScanProgress = {
+	type: 'library_scan_progress';
+	status: string;
+	scanned_items: number;
+	total_items: number;
+	started_at?: number;
+	completed_at?: number;
+	last_scan_at?: number;
+	last_error?: string;
+};
 export type SseProgress = {
 	type: 'progress';
 	job_id: number;
@@ -19,7 +29,13 @@ export type SseProgress = {
 	percent?: number;
 };
 export type SseJobCompleted = { type: 'job_completed'; job_id: number; success: boolean };
-export type SseEvent = SseJobCreated | SseJobStatus | SseLibraryChange | SseProgress | SseJobCompleted;
+export type SseEvent =
+	| SseJobCreated
+	| SseJobStatus
+	| SseLibraryChange
+	| SseLibraryScanProgress
+	| SseProgress
+	| SseJobCompleted;
 
 export function createEventSource(
 	onEvent: (event: SseEvent) => void,

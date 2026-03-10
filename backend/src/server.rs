@@ -2,6 +2,7 @@ use crate::config::{AppConfig, LibraryFolder};
 use crate::db;
 use crate::internet_metadata;
 use crate::library;
+use crate::library_index;
 use crate::metadata;
 use crate::messages::{LibraryChange, SseEvent};
 use axum::{
@@ -23,7 +24,7 @@ use std::convert::Infallible;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, RwLock, Semaphore};
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -36,12 +37,14 @@ pub struct AppState {
     pub library_path: PathBuf,
     pub ingest_path: PathBuf,
     pub config: Arc<RwLock<AppConfig>>,
+    pub bulk_metadata_request_limiter: Arc<Semaphore>,
 }
 
 pub fn build_router(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/api/jobs", get(list_jobs))
         .route("/api/library", get(list_library))
+        .route("/api/library/rescan", axum::routing::post(trigger_library_rescan))
         .route("/api/library/events", get(list_library_events))
         .route("/api/library/metadata", get(get_library_metadata))
         .route(
@@ -148,15 +151,10 @@ async fn list_library(
     let limit = params.limit.unwrap_or(40).clamp(1, 200);
     let offset = params.offset.unwrap_or(0);
 
-    let libraries = {
-        let cfg = state.config.read().await;
-        cfg.libraries.clone()
-    };
-
-    match library::scan_library(
-        state.library_path.clone(),
-        state.ingest_path.clone(),
-        libraries,
+    match library::list_from_index(
+        &state.pool,
+        state.library_path.display().to_string(),
+        state.ingest_path.display().to_string(),
         params.q,
         params.library_id,
         limit,
@@ -167,6 +165,40 @@ async fn list_library(
         Ok(response) => Json(response).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
+}
+
+async fn trigger_library_rescan(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let (libraries, exclude_patterns, scan_concurrency, scan_queue_capacity) = {
+        let cfg = state.config.read().await;
+        (
+            cfg.libraries.clone(),
+            cfg.scan_exclude_patterns.clone(),
+            cfg.scan_concurrency,
+            cfg.scan_queue_capacity,
+        )
+    };
+
+    let pool = state.pool.clone();
+    let library_path = state.library_path.clone();
+    let sse_tx = state.sse_tx.clone();
+
+    tokio::spawn(async move {
+        if let Err(error) = library_index::run_full_rescan(
+            pool,
+            library_path,
+            libraries,
+            exclude_patterns,
+            scan_concurrency,
+            scan_queue_capacity,
+            sse_tx,
+        )
+        .await
+        {
+            tracing::error!(err = %error, "manual library rescan failed");
+        }
+    });
+
+    StatusCode::ACCEPTED.into_response()
 }
 
 async fn get_library_metadata(
@@ -231,10 +263,23 @@ async fn get_library_internet_metadata_bulk(
             .into_response();
     }
 
+    let _request_permit = match state.bulk_metadata_request_limiter.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent bulk metadata requests",
+            )
+                .into_response();
+        }
+    };
+
     let config = {
         let cfg = state.config.read().await;
         cfg.clone()
     };
+
+    let concurrency = config.bulk_metadata_concurrency.max(1);
 
     let items = futures::stream::iter(request.paths.into_iter())
         .map(|path| {
@@ -252,7 +297,7 @@ async fn get_library_internet_metadata_bulk(
                 internet_metadata::InternetMetadataBulkItem { path, result }
             }
         })
-        .buffer_unordered(6)
+        .buffer_unordered(concurrency)
         .collect::<Vec<_>>()
         .await;
 

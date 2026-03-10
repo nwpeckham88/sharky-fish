@@ -130,6 +130,59 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS library_index (
+            relative_path   TEXT PRIMARY KEY,
+            file_path       TEXT NOT NULL,
+            file_name       TEXT NOT NULL,
+            extension       TEXT NOT NULL,
+            media_type      TEXT NOT NULL,
+            size_bytes      INTEGER NOT NULL,
+            modified_at     INTEGER NOT NULL,
+            library_id      TEXT,
+            updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_library_index_modified
+         ON library_index (modified_at DESC, relative_path ASC)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_library_index_library_id
+         ON library_index (library_id, modified_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS library_scan_state (
+            id              INTEGER PRIMARY KEY CHECK (id = 1),
+            status          TEXT NOT NULL,
+            scanned_items   INTEGER NOT NULL DEFAULT 0,
+            total_items     INTEGER NOT NULL DEFAULT 0,
+            started_at      INTEGER,
+            completed_at    INTEGER,
+            last_scan_at    INTEGER,
+            last_error      TEXT
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO library_scan_state (id, status, scanned_items, total_items)
+         VALUES (1, 'idle', 0, 0)
+         ON CONFLICT(id) DO NOTHING",
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -196,6 +249,37 @@ pub struct SelectedInternetMetadataRow {
     pub poster_url: Option<String>,
     pub source_url: Option<String>,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
+pub struct LibraryIndexRow {
+    pub relative_path: String,
+    pub file_name: String,
+    pub extension: String,
+    pub media_type: String,
+    pub size_bytes: i64,
+    pub modified_at: i64,
+    pub library_id: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
+pub struct LibrarySummaryRow {
+    pub total_items: i64,
+    pub total_bytes: i64,
+    pub video_items: i64,
+    pub audio_items: i64,
+    pub other_items: i64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
+pub struct LibraryScanStateRow {
+    pub status: String,
+    pub scanned_items: i64,
+    pub total_items: i64,
+    pub started_at: Option<i64>,
+    pub completed_at: Option<i64>,
+    pub last_scan_at: Option<i64>,
+    pub last_error: Option<String>,
 }
 
 /// Insert a new job and return its id.
@@ -449,4 +533,205 @@ pub async fn fetch_selected_internet_metadata(
     .await?;
 
     Ok(row)
+}
+
+pub async fn upsert_library_index_entry(
+    pool: &SqlitePool,
+    relative_path: &str,
+    file_path: &str,
+    file_name: &str,
+    extension: &str,
+    media_type: &str,
+    size_bytes: u64,
+    modified_at: u64,
+    library_id: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO library_index (
+            relative_path, file_path, file_name, extension, media_type,
+            size_bytes, modified_at, library_id, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(relative_path) DO UPDATE SET
+            file_path = excluded.file_path,
+            file_name = excluded.file_name,
+            extension = excluded.extension,
+            media_type = excluded.media_type,
+            size_bytes = excluded.size_bytes,
+            modified_at = excluded.modified_at,
+            library_id = excluded.library_id,
+            updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(relative_path)
+    .bind(file_path)
+    .bind(file_name)
+    .bind(extension)
+    .bind(media_type)
+    .bind(size_bytes as i64)
+    .bind(modified_at as i64)
+    .bind(library_id)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn delete_library_index_entry(pool: &SqlitePool, relative_path: &str) -> Result<()> {
+    sqlx::query("DELETE FROM library_index WHERE relative_path = ?")
+        .bind(relative_path)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn clear_library_index(pool: &SqlitePool) -> Result<()> {
+    sqlx::query("DELETE FROM library_index").execute(pool).await?;
+    Ok(())
+}
+
+pub async fn list_library_index(
+    pool: &SqlitePool,
+    query_like: Option<&str>,
+    library_id: Option<&str>,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<LibraryIndexRow>> {
+    let rows = sqlx::query_as::<_, LibraryIndexRow>(
+        "SELECT relative_path, file_name, extension, media_type, size_bytes, modified_at, library_id
+         FROM library_index
+         WHERE (?1 IS NULL OR library_id = ?1)
+           AND (?2 IS NULL OR lower(relative_path) LIKE ?2)
+         ORDER BY modified_at DESC, relative_path ASC
+         LIMIT ?3 OFFSET ?4",
+    )
+    .bind(library_id)
+    .bind(query_like)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+pub async fn count_library_index(
+    pool: &SqlitePool,
+    query_like: Option<&str>,
+    library_id: Option<&str>,
+) -> Result<i64> {
+    let count = sqlx::query_scalar::<_, i64>(
+        "SELECT COUNT(*)
+         FROM library_index
+         WHERE (?1 IS NULL OR library_id = ?1)
+           AND (?2 IS NULL OR lower(relative_path) LIKE ?2)",
+    )
+    .bind(library_id)
+    .bind(query_like)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(count)
+}
+
+pub async fn summarize_library_index(
+    pool: &SqlitePool,
+    library_id: Option<&str>,
+) -> Result<LibrarySummaryRow> {
+    let row = sqlx::query_as::<_, LibrarySummaryRow>(
+        "SELECT
+            COUNT(*) AS total_items,
+            COALESCE(SUM(size_bytes), 0) AS total_bytes,
+            SUM(CASE WHEN media_type = 'video' THEN 1 ELSE 0 END) AS video_items,
+            SUM(CASE WHEN media_type = 'audio' THEN 1 ELSE 0 END) AS audio_items,
+            SUM(CASE WHEN media_type NOT IN ('video', 'audio') THEN 1 ELSE 0 END) AS other_items
+         FROM library_index
+         WHERE (?1 IS NULL OR library_id = ?1)",
+    )
+    .bind(library_id)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row)
+}
+
+pub async fn fetch_library_scan_state(pool: &SqlitePool) -> Result<LibraryScanStateRow> {
+    let row = sqlx::query_as::<_, LibraryScanStateRow>(
+        "SELECT status, scanned_items, total_items, started_at, completed_at, last_scan_at, last_error
+         FROM library_scan_state WHERE id = 1",
+    )
+    .fetch_one(pool)
+    .await?;
+
+    Ok(row)
+}
+
+pub async fn try_begin_library_scan(pool: &SqlitePool, started_at: u64) -> Result<bool> {
+    let result = sqlx::query(
+        "UPDATE library_scan_state
+         SET status = 'running', scanned_items = 0, total_items = 0,
+             started_at = ?, completed_at = NULL, last_error = NULL
+         WHERE id = 1 AND status != 'running'",
+    )
+    .bind(started_at as i64)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+pub async fn update_library_scan_progress(
+    pool: &SqlitePool,
+    scanned_items: usize,
+    total_items: usize,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE library_scan_state
+         SET scanned_items = ?, total_items = ?
+         WHERE id = 1",
+    )
+    .bind(scanned_items as i64)
+    .bind(total_items as i64)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn complete_library_scan(pool: &SqlitePool, completed_at: u64, scanned_items: usize) -> Result<()> {
+    sqlx::query(
+        "UPDATE library_scan_state
+         SET status = 'idle', scanned_items = ?, total_items = ?,
+             completed_at = ?, last_scan_at = ?, last_error = NULL
+         WHERE id = 1",
+    )
+    .bind(scanned_items as i64)
+    .bind(scanned_items as i64)
+    .bind(completed_at as i64)
+    .bind(completed_at as i64)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn fail_library_scan(
+    pool: &SqlitePool,
+    completed_at: u64,
+    scanned_items: usize,
+    total_items: usize,
+    error_message: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE library_scan_state
+         SET status = 'error', scanned_items = ?, total_items = ?,
+             completed_at = ?, last_error = ?
+         WHERE id = 1",
+    )
+    .bind(scanned_items as i64)
+    .bind(total_items as i64)
+    .bind(completed_at as i64)
+    .bind(error_message)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }

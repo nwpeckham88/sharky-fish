@@ -20,6 +20,21 @@ pub struct AppConfig {
     pub max_io_concurrency: usize,
     /// Number of recent library items to prewarm metadata for on startup.
     pub metadata_prewarm_limit: usize,
+    /// Relative path patterns to exclude from library index scans.
+    #[serde(default = "default_scan_exclude_patterns")]
+    pub scan_exclude_patterns: Vec<String>,
+    /// Concurrent workers used for full library reindex scans.
+    #[serde(default = "default_scan_concurrency")]
+    pub scan_concurrency: usize,
+    /// Backpressure capacity for queued scan items during full reindex.
+    #[serde(default = "default_scan_queue_capacity")]
+    pub scan_queue_capacity: usize,
+    /// Per-request concurrency for bulk metadata fetches.
+    #[serde(default = "default_bulk_metadata_concurrency")]
+    pub bulk_metadata_concurrency: usize,
+    /// Max simultaneous bulk metadata requests before returning backpressure.
+    #[serde(default = "default_bulk_metadata_max_inflight")]
+    pub bulk_metadata_max_inflight: usize,
     /// Golden Standards: encoding rules the LLM must respect.
     #[serde(default)]
     pub golden_standards: GoldenStandards,
@@ -109,6 +124,26 @@ pub struct SubtitleStandards {
 
 fn default_true() -> bool { true }
 
+fn default_scan_exclude_patterns() -> Vec<String> {
+    vec!["samples".into(), "trailers".into(), "extras".into()]
+}
+
+fn default_scan_concurrency() -> usize {
+    4
+}
+
+fn default_scan_queue_capacity() -> usize {
+    512
+}
+
+fn default_bulk_metadata_concurrency() -> usize {
+    6
+}
+
+fn default_bulk_metadata_max_inflight() -> usize {
+    2
+}
+
 /// A named library folder mapped to a subdirectory inside `data_path`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LibraryFolder {
@@ -166,6 +201,11 @@ impl Default for AppConfig {
             },
             max_io_concurrency: 4,
             metadata_prewarm_limit: 250,
+            scan_exclude_patterns: default_scan_exclude_patterns(),
+            scan_concurrency: default_scan_concurrency(),
+            scan_queue_capacity: default_scan_queue_capacity(),
+            bulk_metadata_concurrency: default_bulk_metadata_concurrency(),
+            bulk_metadata_max_inflight: default_bulk_metadata_max_inflight(),
             golden_standards: GoldenStandards::default(),
             system_prompt: String::new(),
             libraries: Vec::new(),

@@ -1,11 +1,7 @@
 use anyhow::Result;
 use serde::Serialize;
-use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
-use tokio::task;
-use walkdir::WalkDir;
 
-use crate::config::LibraryFolder;
+use crate::db;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LibraryRoots {
@@ -30,8 +26,18 @@ pub struct LibraryEntry {
     pub media_type: String,
     pub size_bytes: u64,
     pub modified_at: Option<u64>,
-    /// Which configured library folder this file belongs to (if any).
     pub library_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LibraryScanStatus {
+    pub status: String,
+    pub scanned_items: usize,
+    pub total_items: usize,
+    pub started_at: Option<u64>,
+    pub completed_at: Option<u64>,
+    pub last_scan_at: Option<u64>,
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,184 +48,71 @@ pub struct LibraryResponse {
     pub offset: usize,
     pub summary: LibrarySummary,
     pub roots: LibraryRoots,
+    pub scan: LibraryScanStatus,
 }
 
-pub async fn scan_library(
-    library_root: PathBuf,
-    ingest_root: PathBuf,
-    libraries: Vec<LibraryFolder>,
+pub async fn list_from_index(
+    pool: &sqlx::SqlitePool,
+    library_root: String,
+    ingest_root: String,
     query: Option<String>,
     library_id: Option<String>,
     limit: usize,
     offset: usize,
 ) -> Result<LibraryResponse> {
-    task::spawn_blocking(move || scan_library_blocking(&library_root, &ingest_root, &libraries, query, library_id, limit, offset))
-        .await?
-}
+    let query_like = query
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("%{}%", value));
 
-fn scan_library_blocking(
-    library_root: &Path,
-    ingest_root: &Path,
-    libraries: &[LibraryFolder],
-    query: Option<String>,
-    library_id: Option<String>,
-    limit: usize,
-    offset: usize,
-) -> Result<LibraryResponse> {
-    let query = query
-        .map(|value| value.trim().to_lowercase())
-        .filter(|value| !value.is_empty());
+    let rows = db::list_library_index(
+        pool,
+        query_like.as_deref(),
+        library_id.as_deref(),
+        limit as i64,
+        offset as i64,
+    )
+    .await?;
 
-    let roots = LibraryRoots {
-        library_path: library_root.display().to_string(),
-        ingest_path: ingest_root.display().to_string(),
-    };
-
-    // Determine which directory to scan based on library_id filter.
-    let scan_root = if let Some(ref lid) = library_id {
-        if let Some(folder) = libraries.iter().find(|l| l.id == *lid) {
-            library_root.join(&folder.path)
-        } else {
-            // Unknown library id — return empty.
-            return Ok(LibraryResponse {
-                items: Vec::new(),
-                total_items: 0,
-                limit,
-                offset,
-                summary: LibrarySummary::default(),
-                roots,
-            });
-        }
-    } else {
-        library_root.to_path_buf()
-    };
-
-    if !scan_root.exists() {
-        return Ok(LibraryResponse {
-            items: Vec::new(),
-            total_items: 0,
-            limit,
-            offset,
-            summary: LibrarySummary::default(),
-            roots,
-        });
-    }
-
-    let mut summary = LibrarySummary::default();
-    let mut items = Vec::new();
-
-    for entry in WalkDir::new(&scan_root)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_type().is_file())
-    {
-        let path = entry.path();
-        let Some(media_type) = detect_media_type(path) else {
-            continue;
-        };
-
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-
-        let size_bytes = metadata.len();
-        let modified_at = metadata
-            .modified()
-            .ok()
-            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-            .map(|value| value.as_secs());
-
-        summary.total_items += 1;
-        summary.total_bytes += size_bytes;
-        match media_type.as_str() {
-            "video" => summary.video_items += 1,
-            "audio" => summary.audio_items += 1,
-            _ => summary.other_items += 1,
-        }
-
-        let relative_path = path
-            .strip_prefix(library_root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-
-        if let Some(filter) = &query {
-            let haystack = relative_path.to_lowercase();
-            if !haystack.contains(filter) {
-                continue;
-            }
-        }
-
-        // Match file to a configured library folder.
-        let matched_library_id = match_library_id(&relative_path, libraries);
-
-        let file_name = path
-            .file_name()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_string();
-        let extension = path
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default()
-            .to_lowercase();
-
-        items.push(LibraryEntry {
-            relative_path,
-            file_name,
-            extension,
-            media_type,
-            size_bytes,
-            modified_at,
-            library_id: matched_library_id,
-        });
-    }
-
-    items.sort_by(|left, right| {
-        right
-            .modified_at
-            .cmp(&left.modified_at)
-            .then_with(|| left.relative_path.cmp(&right.relative_path))
-    });
-
-    let total_items = items.len();
-    let paged_items = items.into_iter().skip(offset).take(limit).collect();
+    let total_items = db::count_library_index(pool, query_like.as_deref(), library_id.as_deref()).await?;
+    let summary_row = db::summarize_library_index(pool, library_id.as_deref()).await?;
+    let scan_state = db::fetch_library_scan_state(pool).await?;
 
     Ok(LibraryResponse {
-        items: paged_items,
-        total_items,
+        items: rows
+            .into_iter()
+            .map(|row| LibraryEntry {
+                relative_path: row.relative_path,
+                file_name: row.file_name,
+                extension: row.extension,
+                media_type: row.media_type,
+                size_bytes: row.size_bytes.max(0) as u64,
+                modified_at: Some(row.modified_at.max(0) as u64),
+                library_id: row.library_id,
+            })
+            .collect(),
+        total_items: total_items.max(0) as usize,
         limit,
         offset,
-        summary,
-        roots,
+        summary: LibrarySummary {
+            total_items: summary_row.total_items.max(0) as usize,
+            total_bytes: summary_row.total_bytes.max(0) as u64,
+            video_items: summary_row.video_items.max(0) as usize,
+            audio_items: summary_row.audio_items.max(0) as usize,
+            other_items: summary_row.other_items.max(0) as usize,
+        },
+        roots: LibraryRoots {
+            library_path: library_root,
+            ingest_path: ingest_root,
+        },
+        scan: LibraryScanStatus {
+            status: scan_state.status,
+            scanned_items: scan_state.scanned_items.max(0) as usize,
+            total_items: scan_state.total_items.max(0) as usize,
+            started_at: scan_state.started_at.map(|v| v.max(0) as u64),
+            completed_at: scan_state.completed_at.map(|v| v.max(0) as u64),
+            last_scan_at: scan_state.last_scan_at.map(|v| v.max(0) as u64),
+            last_error: scan_state.last_error,
+        },
     })
-}
-
-/// Match a relative file path to one of the configured library folders.
-fn match_library_id(relative_path: &str, libraries: &[LibraryFolder]) -> Option<String> {
-    for lib in libraries {
-        let prefix = if lib.path.ends_with('/') {
-            lib.path.clone()
-        } else {
-            format!("{}/", lib.path)
-        };
-        if relative_path.starts_with(&prefix) || relative_path == lib.path {
-            return Some(lib.id.clone());
-        }
-    }
-    None
-}
-
-fn detect_media_type(path: &Path) -> Option<String> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    let media_type = match extension.as_str() {
-        "mkv" | "mp4" | "avi" | "mov" | "ts" | "webm" | "m4v" => "video",
-        "flac" | "mp3" | "wav" | "m4a" | "aac" | "ogg" => "audio",
-        "srt" | "ass" | "vtt" => "subtitle",
-        _ => return None,
-    };
-
-    Some(media_type.to_string())
 }

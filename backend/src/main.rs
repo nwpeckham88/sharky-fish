@@ -3,6 +3,7 @@ mod config;
 mod db;
 mod internet_metadata;
 mod library;
+mod library_index;
 mod metadata;
 mod messages;
 mod server;
@@ -68,6 +69,9 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Shared config for actors and HTTP handlers.
+    let shared_config = Arc::new(RwLock::new(cfg.clone()));
+
     // Start actors.
     let watcher = WatcherActor::new(
         PathBuf::from(&cfg.ingest_path),
@@ -75,6 +79,7 @@ async fn main() -> Result<()> {
         ingest_tx,
         sse_tx.clone(),
         pool.clone(),
+        shared_config.clone(),
     );
     tokio::spawn(async move {
         if let Err(e) = watcher.run().await {
@@ -88,9 +93,6 @@ async fn main() -> Result<()> {
             tracing::error!(err = %e, "identifier actor crashed");
         }
     });
-
-    // Shared config for actors and HTTP handlers.
-    let shared_config = Arc::new(RwLock::new(cfg.clone()));
 
     let brain = BrainActor::new(identified_rx, queue_tx.clone(), cfg.llm.clone(), shared_config.clone());
     tokio::spawn(async move {
@@ -120,6 +122,31 @@ async fn main() -> Result<()> {
         }
     });
 
+    {
+        let pool = pool.clone();
+        let library_root = PathBuf::from(&cfg.data_path);
+        let libraries = cfg.libraries.clone();
+        let exclude_patterns = cfg.scan_exclude_patterns.clone();
+        let scan_concurrency = cfg.scan_concurrency;
+        let scan_queue_capacity = cfg.scan_queue_capacity;
+        let sse_tx = sse_tx.clone();
+        tokio::spawn(async move {
+            let result = library_index::run_full_rescan(
+                pool,
+                library_root,
+                libraries,
+                exclude_patterns,
+                scan_concurrency,
+                scan_queue_capacity,
+                sse_tx,
+            )
+            .await;
+            if let Err(error) = result {
+                tracing::error!(err = %error, "library index rescan failed");
+            }
+        });
+    }
+
     // Start Axum HTTP server.
     let port = cfg.port;
     let library_path = PathBuf::from(&cfg.data_path);
@@ -130,6 +157,7 @@ async fn main() -> Result<()> {
         library_path,
         ingest_path,
         config: shared_config,
+        bulk_metadata_request_limiter: Arc::new(Semaphore::new(cfg.bulk_metadata_max_inflight.max(1))),
     };
     let app = build_router(state);
     let addr = format!("0.0.0.0:{}", port);

@@ -126,6 +126,17 @@ pub struct LibraryChange {
     pub occurred_at: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LibraryIndexScanProgress {
+    pub status: String,
+    pub scanned_items: usize,
+    pub total_items: usize,
+    pub started_at: Option<u64>,
+    pub completed_at: Option<u64>,
+    pub last_scan_at: Option<u64>,
+    pub last_error: Option<String>,
+}
+
 // ---------------------------------------------------------------------------
 // SSE broadcast event
 // ---------------------------------------------------------------------------
@@ -139,6 +150,8 @@ pub enum SseEvent {
     JobStatus { job_id: i64, status: String },
     #[serde(rename = "library_change")]
     LibraryChange(LibraryChange),
+    #[serde(rename = "library_scan_progress")]
+    LibraryIndexScanProgress(LibraryIndexScanProgress),
     #[serde(rename = "progress")]
     Progress(FfmpegProgress),
     #[serde(rename = "job_completed")]

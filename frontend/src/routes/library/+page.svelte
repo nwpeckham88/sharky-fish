@@ -3,6 +3,7 @@
 	import { page } from '$app/state';
 	import {
 		fetchLibrary,
+		triggerLibraryRescan,
 		fetchLibraryMetadata,
 		fetchLibraryInternetMetadata,
 		fetchLibraryInternetMetadataBulk,
@@ -18,6 +19,7 @@
 		type LibraryResponse,
 		type LibraryRoots,
 		type LibrarySummary,
+		type LibraryScanStatus,
 		type LibraryChangeEvent
 	} from '$lib/api';
 	import { libraryState } from '$lib/stores.svelte';
@@ -44,6 +46,17 @@
 	let offset = $state(0);
 	let totalLibrary = $state(0);
 	let recentChanges = $state<LibraryChangeEvent[]>([]);
+	let scanStatus = $state<LibraryScanStatus>({
+		status: 'idle',
+		scanned_items: 0,
+		total_items: 0,
+		started_at: null,
+		completed_at: null,
+		last_scan_at: null,
+		last_error: null
+	});
+	let rescanLoading = $state(false);
+	let rescanError = $state('');
 	const pageSize = 40;
 	let queryTimer: ReturnType<typeof setTimeout> | undefined;
 	let refreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -79,6 +92,8 @@
 	const _changeFlags = { skipFirst: true };
 	$effect(() => {
 		libraryState.changeCount;
+		libraryState.scan;
+		scanStatus = { ...libraryState.scan };
 		if (_changeFlags.skipFirst) {
 			_changeFlags.skipFirst = false;
 			return;
@@ -96,6 +111,8 @@
 			library = response.items;
 			librarySummary = response.summary;
 			roots = response.roots;
+			scanStatus = response.scan;
+			libraryState.scan = response.scan;
 			totalLibrary = response.total_items;
 			if (selectedItem) {
 				const updated = response.items.find((i) => i.relative_path === selectedItem?.relative_path) ?? null;
@@ -108,6 +125,23 @@
 		} finally {
 			libraryLoading = false;
 		}
+	}
+
+	async function runRescan() {
+		rescanLoading = true;
+		rescanError = '';
+		try {
+			await triggerLibraryRescan();
+		} catch (error) {
+			rescanError = error instanceof Error ? error.message : 'Failed to trigger rescan';
+		} finally {
+			rescanLoading = false;
+		}
+	}
+
+	function scanProgressPercent(): number {
+		if (!scanStatus.total_items) return 0;
+		return Math.min(100, Math.round((scanStatus.scanned_items / scanStatus.total_items) * 100));
 	}
 
 	async function loadLibraryEvents() {
@@ -329,6 +363,37 @@
 	<div class="stat-card"><div class="section-label">Video</div><div class="mt-1 text-2xl font-semibold text-[color:var(--ink-strong)]">{librarySummary.video_items}</div></div>
 	<div class="stat-card"><div class="section-label">Audio</div><div class="mt-1 text-2xl font-semibold text-[color:var(--ink-strong)]">{librarySummary.audio_items}</div></div>
 	<div class="stat-card"><div class="section-label">Other</div><div class="mt-1 text-2xl font-semibold text-[color:var(--ink-strong)]">{librarySummary.other_items}</div></div>
+</section>
+
+<section class="mb-5 rounded-[1rem] border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-4">
+	<div class="flex flex-wrap items-center justify-between gap-3">
+		<div>
+			<p class="section-label">Library Index</p>
+			<p class="mt-1 text-sm text-[color:var(--ink-muted)]">
+				Status: <span class="font-semibold text-[color:var(--ink-strong)]">{scanStatus.status}</span>
+				{#if scanStatus.status === 'running'}
+					· {scanStatus.scanned_items}/{scanStatus.total_items} ({scanProgressPercent()}%)
+				{/if}
+				{#if scanStatus.last_scan_at}
+					· Last scan {formatTimestamp(scanStatus.last_scan_at)}
+				{/if}
+			</p>
+			{#if scanStatus.last_error}
+				<p class="mt-1 text-xs text-[color:var(--danger)]">{scanStatus.last_error}</p>
+			{/if}
+		</div>
+		<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] text-[color:var(--ink-strong)] disabled:opacity-50" onclick={runRescan} disabled={rescanLoading || scanStatus.status === 'running'}>
+			{rescanLoading ? 'Starting…' : scanStatus.status === 'running' ? 'Rescan Running' : 'Rescan Now'}
+		</button>
+	</div>
+	{#if scanStatus.status === 'running'}
+		<div class="mt-3 h-2 overflow-hidden rounded-full bg-[color:rgba(123,105,81,0.16)]">
+			<div class="h-full bg-[color:var(--accent)] transition-[width] duration-300" style={`width: ${scanProgressPercent()}%`}></div>
+		</div>
+	{/if}
+	{#if rescanError}
+		<p class="mt-2 text-xs text-[color:var(--danger)]">{rescanError}</p>
+	{/if}
 </section>
 
 <!-- Controls Bar -->
