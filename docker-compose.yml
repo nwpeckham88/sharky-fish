@@ -1,0 +1,28 @@
+services:
+  sharky-fish:
+    build: .
+    image: sharky-fish:latest
+    container_name: sharky-fish
+    restart: unless-stopped
+    privileged: true
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=America/Chicago
+    # NVIDIA GPU Passthrough (Uncomment if using NVIDIA)
+    # runtime: nvidia
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu, video, compute]
+    # Intel QSV Passthrough (Uncomment if using Intel)
+    # devices:
+    #   - /dev/dri:/dev/dri
+    ports:
+      - "3000:3000"
+    volumes:
+      - /mnt/nas/servarr/data/media:/data:rw
+      - /opt/sharky/config:/config:rw

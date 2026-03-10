@@ -1,0 +1,25 @@
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Environment
+.env
+.env.*
+
+# Rust
+backend/target/
+**/*.rs.bk
+
+# Node/Svelte
+frontend/node_modules/
+frontend/build/
+frontend/.svelte-kit/
+frontend/.vite/
+
+# Logs
+*.log
+
+# Coverage and temp
+coverage/
+tmp/
