@@ -1,4 +1,5 @@
 use crate::internet_metadata::InternetMetadataMatch;
+use crate::library::{LibrarySortBy, LibrarySortDirection};
 use crate::messages::{MediaProbe, ProcessingDecision};
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -914,24 +915,44 @@ pub async fn list_library_index(
     pool: &SqlitePool,
     query_like: Option<&str>,
     library_id: Option<&str>,
+    media_type: Option<&str>,
+    managed_status: Option<&str>,
+    sort_by: LibrarySortBy,
+    sort_direction: LibrarySortDirection,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<LibraryIndexRow>> {
-    let rows = sqlx::query_as::<_, LibraryIndexRow>(
-                "SELECT l.relative_path, l.file_name, l.extension, l.media_type, l.size_bytes, l.modified_at, l.library_id,
-                                m.managed_status,
-                                CASE WHEN m.sidecar_path IS NULL THEN 0 ELSE 1 END AS has_sidecar,
-                                CASE WHEN m.selected_metadata_json IS NULL THEN 0 ELSE 1 END AS has_selected_metadata,
-                                m.selected_metadata_json
-                 FROM library_index l
-                 LEFT JOIN managed_items m ON m.relative_path = l.relative_path
-                 WHERE (?1 IS NULL OR l.library_id = ?1)
-                     AND (?2 IS NULL OR lower(l.relative_path) LIKE ?2)
-                 ORDER BY l.modified_at DESC, l.relative_path ASC
-                 LIMIT ?3 OFFSET ?4",
-    )
+    let order_clause = library_index_order_clause(sort_by, sort_direction);
+    let query = format!(
+        "SELECT l.relative_path, l.file_name, l.extension, l.media_type, l.size_bytes, l.modified_at, l.library_id,
+                        m.managed_status,
+                        CASE WHEN m.sidecar_path IS NULL THEN 0 ELSE 1 END AS has_sidecar,
+                        CASE WHEN m.selected_metadata_json IS NULL THEN 0 ELSE 1 END AS has_selected_metadata,
+                        m.selected_metadata_json
+         FROM library_index l
+         LEFT JOIN managed_items m ON m.relative_path = l.relative_path
+         WHERE (?1 IS NULL OR l.library_id = ?1)
+             AND (?2 IS NULL OR lower(l.relative_path) LIKE ?2)
+             AND (
+                 ?3 IS NULL
+                 OR (?3 = 'other' AND l.media_type NOT IN ('video', 'audio'))
+                 OR (?3 != 'other' AND l.media_type = ?3)
+             )
+             AND (
+                 ?4 IS NULL
+                 OR (?4 = 'NO_SIDECAR' AND m.sidecar_path IS NULL)
+                 OR (?4 = 'MISSING_METADATA' AND m.selected_metadata_json IS NULL AND COALESCE(m.managed_status, 'UNPROCESSED') NOT IN ('KEPT_ORIGINAL', 'PROCESSED'))
+                 OR (?4 NOT IN ('NO_SIDECAR', 'MISSING_METADATA') AND COALESCE(m.managed_status, 'UNPROCESSED') = ?4)
+             )
+         ORDER BY {order_clause}
+         LIMIT ?5 OFFSET ?6"
+    );
+
+    let rows = sqlx::query_as::<_, LibraryIndexRow>(&query)
     .bind(library_id)
     .bind(query_like)
+    .bind(media_type)
+    .bind(managed_status)
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
@@ -944,19 +965,91 @@ pub async fn count_library_index(
     pool: &SqlitePool,
     query_like: Option<&str>,
     library_id: Option<&str>,
+    media_type: Option<&str>,
+    managed_status: Option<&str>,
 ) -> Result<i64> {
     let count = sqlx::query_scalar::<_, i64>(
         "SELECT COUNT(*)
-         FROM library_index
-         WHERE (?1 IS NULL OR library_id = ?1)
-           AND (?2 IS NULL OR lower(relative_path) LIKE ?2)",
+         FROM library_index l
+         LEFT JOIN managed_items m ON m.relative_path = l.relative_path
+         WHERE (?1 IS NULL OR l.library_id = ?1)
+           AND (?2 IS NULL OR lower(l.relative_path) LIKE ?2)
+           AND (
+               ?3 IS NULL
+               OR (?3 = 'other' AND l.media_type NOT IN ('video', 'audio'))
+               OR (?3 != 'other' AND l.media_type = ?3)
+           )
+           AND (
+               ?4 IS NULL
+               OR (?4 = 'NO_SIDECAR' AND m.sidecar_path IS NULL)
+               OR (?4 = 'MISSING_METADATA' AND m.selected_metadata_json IS NULL AND COALESCE(m.managed_status, 'UNPROCESSED') NOT IN ('KEPT_ORIGINAL', 'PROCESSED'))
+               OR (?4 NOT IN ('NO_SIDECAR', 'MISSING_METADATA') AND COALESCE(m.managed_status, 'UNPROCESSED') = ?4)
+           )",
     )
     .bind(library_id)
     .bind(query_like)
+    .bind(media_type)
+    .bind(managed_status)
     .fetch_one(pool)
     .await?;
 
     Ok(count)
+}
+
+pub async fn list_library_index_candidates(
+    pool: &SqlitePool,
+    query_like: Option<&str>,
+    library_id: Option<&str>,
+    media_type: Option<&str>,
+    require_selected_metadata: bool,
+) -> Result<Vec<LibraryIndexRow>> {
+    let rows = sqlx::query_as::<_, LibraryIndexRow>(
+        "SELECT l.relative_path, l.file_name, l.extension, l.media_type, l.size_bytes, l.modified_at, l.library_id,
+                        m.managed_status,
+                        CASE WHEN m.sidecar_path IS NULL THEN 0 ELSE 1 END AS has_sidecar,
+                        CASE WHEN m.selected_metadata_json IS NULL THEN 0 ELSE 1 END AS has_selected_metadata,
+                        m.selected_metadata_json
+         FROM library_index l
+         LEFT JOIN managed_items m ON m.relative_path = l.relative_path
+         WHERE (?1 IS NULL OR l.library_id = ?1)
+             AND (?2 IS NULL OR lower(l.relative_path) LIKE ?2)
+             AND (
+                 ?3 IS NULL
+                 OR (?3 = 'other' AND l.media_type NOT IN ('video', 'audio'))
+                 OR (?3 != 'other' AND l.media_type = ?3)
+             )
+             AND (?4 = 0 OR m.selected_metadata_json IS NOT NULL)
+         ORDER BY l.modified_at DESC, l.relative_path ASC",
+    )
+    .bind(library_id)
+    .bind(query_like)
+    .bind(media_type)
+    .bind(require_selected_metadata)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+fn library_index_order_clause(sort_by: LibrarySortBy, sort_direction: LibrarySortDirection) -> &'static str {
+    match (sort_by, sort_direction) {
+        (LibrarySortBy::ModifiedAt, LibrarySortDirection::Asc) => "l.modified_at ASC, l.relative_path ASC",
+        (LibrarySortBy::ModifiedAt, LibrarySortDirection::Desc) => "l.modified_at DESC, l.relative_path ASC",
+        (LibrarySortBy::SizeBytes, LibrarySortDirection::Asc) => "l.size_bytes ASC, l.relative_path ASC",
+        (LibrarySortBy::SizeBytes, LibrarySortDirection::Desc) => "l.size_bytes DESC, l.relative_path ASC",
+        (LibrarySortBy::FileName, LibrarySortDirection::Asc) => "l.file_name ASC, l.relative_path ASC",
+        (LibrarySortBy::FileName, LibrarySortDirection::Desc) => "l.file_name DESC, l.relative_path ASC",
+        (LibrarySortBy::RelativePath, LibrarySortDirection::Asc) => "l.relative_path ASC",
+        (LibrarySortBy::RelativePath, LibrarySortDirection::Desc) => "l.relative_path DESC",
+        (LibrarySortBy::MediaType, LibrarySortDirection::Asc) => "l.media_type ASC, l.relative_path ASC",
+        (LibrarySortBy::MediaType, LibrarySortDirection::Desc) => "l.media_type DESC, l.relative_path ASC",
+        (LibrarySortBy::ManagedStatus, LibrarySortDirection::Asc) => {
+            "COALESCE(m.managed_status, 'UNPROCESSED') ASC, l.relative_path ASC"
+        }
+        (LibrarySortBy::ManagedStatus, LibrarySortDirection::Desc) => {
+            "COALESCE(m.managed_status, 'UNPROCESSED') DESC, l.relative_path ASC"
+        }
+    }
 }
 
 pub async fn summarize_library_index(

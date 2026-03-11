@@ -20,6 +20,8 @@
 		fetchLibraries,
 		updateBulkIntakeManagedStatus,
 		updateIntakeManagedStatus,
+		type LibrarySortBy,
+		type LibrarySortDirection,
 		type BacklogFilter,
 		type LibraryEntry,
 		type LibraryFolder,
@@ -30,24 +32,14 @@
 		type LibraryRoots,
 		type LibrarySummary,
 		type LibraryScanStatus,
-		type LibraryChangeEvent
+		type LibraryChangeEvent,
+		type LibraryMediaFilter,
+		type LibraryManagedStatusFilter
 	} from '$lib/api';
 	import { jobStore, libraryState, managedItemStore, refreshManagedItemStore } from '$lib/stores.svelte';
 	import { formatBytes, formatTimestamp, statusLabel, statusTone } from '$lib/status';
 
-	type LibraryMediaFilter = 'all' | 'video' | 'audio' | 'subtitle' | 'other';
-	type LibraryManagedFilter =
-		| 'all'
-		| 'UNPROCESSED'
-		| 'REVIEWED'
-		| 'AWAITING_APPROVAL'
-		| 'APPROVED'
-		| 'PROCESSED'
-		| 'FAILED'
-		| 'KEPT_ORIGINAL'
-		| 'MISSING_METADATA'
-		| 'ORGANIZE_NEEDED'
-		| 'NO_SIDECAR';
+	type LibraryManagedFilter = LibraryManagedStatusFilter;
 	type LibraryShapingView =
 		| 'all'
 		| 'unprocessed'
@@ -59,6 +51,15 @@
 		| 'processed';
 
 	const mediaFilters: LibraryMediaFilter[] = ['all', 'video', 'audio', 'subtitle', 'other'];
+	const pageSizeOptions = [40, 100, 200, 500];
+	const sortOptions: Array<{ value: LibrarySortBy; label: string }> = [
+		{ value: 'modified_at', label: 'Recently Modified' },
+		{ value: 'size_bytes', label: 'File Size' },
+		{ value: 'file_name', label: 'File Name' },
+		{ value: 'relative_path', label: 'Library Path' },
+		{ value: 'media_type', label: 'Media Type' },
+		{ value: 'managed_status', label: 'Managed Status' }
+	];
 	const managedFilters: LibraryManagedFilter[] = [
 		'all',
 		'UNPROCESSED',
@@ -119,6 +120,21 @@
 		return filter === 'needs_attention' ? '/' : `/?filter=${filter}`;
 	}
 
+	function parsePageSize(value: string | null): number {
+		const parsed = Number(value ?? '40');
+		return pageSizeOptions.includes(parsed) ? parsed : 40;
+	}
+
+	function parseSortBy(value: string | null): LibrarySortBy {
+		return sortOptions.some((option) => option.value === value)
+			? (value as LibrarySortBy)
+			: 'modified_at';
+	}
+
+	function parseSortDirection(value: string | null): LibrarySortDirection {
+		return value === 'asc' ? 'asc' : 'desc';
+	}
+
 	let library = $state<LibraryEntry[]>([]);
 	let librarySummary = $state<LibrarySummary>({
 		total_items: 0, total_bytes: 0, video_items: 0, audio_items: 0, other_items: 0
@@ -162,7 +178,10 @@
 	});
 	let rescanLoading = $state(false);
 	let rescanError = $state('');
-	const pageSize = 40;
+	let pageSize = $state(40);
+	let sortBy = $state<LibrarySortBy>('modified_at');
+	let sortDirection = $state<LibrarySortDirection>('desc');
+	let advancedMode = $state(false);
 	let queryTimer: ReturnType<typeof setTimeout> | undefined;
 	let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -248,6 +267,10 @@
 		const urlView = parseShapingView(page.url.searchParams.get('view'));
 		const urlType = parseMediaFilter(page.url.searchParams.get('type'));
 		const urlStatus = parseManagedFilter(page.url.searchParams.get('status'));
+		pageSize = parsePageSize(page.url.searchParams.get('page_size'));
+		sortBy = parseSortBy(page.url.searchParams.get('sort'));
+		sortDirection = parseSortDirection(page.url.searchParams.get('dir'));
+		advancedMode = page.url.searchParams.get('advanced') === '1';
 		if (urlView) {
 			typeFilter = shapingViewFilters[urlView].typeFilter;
 			managedStatusFilter = shapingViewFilters[urlView].managedStatusFilter;
@@ -288,7 +311,16 @@
 	async function loadLibrary() {
 		libraryLoading = true;
 		try {
-			const response: LibraryResponse = await fetchLibrary(query, pageSize, offset, activeLibraryId ?? undefined);
+			const response: LibraryResponse = await fetchLibrary({
+				query,
+				limit: pageSize,
+				offset,
+				libraryId: activeLibraryId ?? undefined,
+				mediaType: typeFilter,
+				managedStatus: managedStatusFilter,
+				sortBy,
+				sortDirection
+			});
 			library = response.items;
 			librarySummary = response.summary;
 			roots = response.roots;
@@ -631,25 +663,7 @@
 		void loadLibrary();
 	}
 
-	const filteredLibrary = $derived.by(() => {
-		let items = library;
-		if (typeFilter !== 'all') {
-			items = typeFilter === 'other'
-				? items.filter((i) => i.media_type !== 'video' && i.media_type !== 'audio')
-				: items.filter((i) => i.media_type === typeFilter);
-		}
-		if (managedStatusFilter === 'all') return items;
-		if (managedStatusFilter === 'NO_SIDECAR') return items.filter((i) => !i.has_sidecar);
-		if (managedStatusFilter === 'MISSING_METADATA') {
-			return items.filter(
-				(i) => !i.has_selected_metadata && !['KEPT_ORIGINAL', 'PROCESSED'].includes(i.managed_status ?? 'UNPROCESSED')
-			);
-		}
-		if (managedStatusFilter === 'ORGANIZE_NEEDED') {
-			return items.filter((i) => i.organize_needed);
-		}
-		return items.filter((i) => (i.managed_status ?? 'UNPROCESSED') === managedStatusFilter);
-	});
+	const filteredLibrary = $derived(library);
 
 	const activeLibraryFolder = $derived(
 		activeLibraryId ? libraryFolders.find((l) => l.id === activeLibraryId) ?? null : null
@@ -718,6 +732,13 @@
 		bulkInternetFailedPaths = [];
 	}
 
+	async function reloadLibrary(resetOffset = false) {
+		if (resetOffset) offset = 0;
+		selectedPaths = new Set();
+		await syncLibraryUrl();
+		await loadLibrary();
+	}
+
 	async function syncLibraryUrl(view: LibraryShapingView | null = activeShapingView) {
 		const params = new URLSearchParams(page.url.searchParams);
 		if (query.trim()) params.set('q', query.trim());
@@ -728,6 +749,18 @@
 
 		if (offset > 0) params.set('offset', String(offset));
 		else params.delete('offset');
+
+		if (pageSize !== 40) params.set('page_size', String(pageSize));
+		else params.delete('page_size');
+
+		if (sortBy !== 'modified_at') params.set('sort', sortBy);
+		else params.delete('sort');
+
+		if (sortDirection !== 'desc') params.set('dir', sortDirection);
+		else params.delete('dir');
+
+		if (advancedMode) params.set('advanced', '1');
+		else params.delete('advanced');
 
 		if (view && view !== 'all') {
 			params.set('view', view);
@@ -752,23 +785,38 @@
 	async function applyShapingView(view: LibraryShapingView) {
 		typeFilter = shapingViewFilters[view].typeFilter;
 		managedStatusFilter = shapingViewFilters[view].managedStatusFilter;
-		offset = 0;
-		selectedPaths = new Set();
+		await reloadLibrary(true);
 		await syncLibraryUrl(view);
 	}
 
 	function setTypeFilter(filter: LibraryMediaFilter) {
 		typeFilter = filter;
-		offset = 0;
-		selectedPaths = new Set();
-		void syncLibraryUrl(null);
+		void reloadLibrary(true);
 	}
 
 	function setManagedStatusFilter(filter: LibraryManagedFilter) {
 		managedStatusFilter = filter;
-		offset = 0;
-		selectedPaths = new Set();
-		void syncLibraryUrl(null);
+		void reloadLibrary(true);
+	}
+
+	function setPageSize(nextSize: number) {
+		pageSize = nextSize;
+		void reloadLibrary(true);
+	}
+
+	function setSortBy(nextSort: LibrarySortBy) {
+		sortBy = nextSort;
+		void reloadLibrary(true);
+	}
+
+	function toggleSortDirection() {
+		sortDirection = sortDirection === 'desc' ? 'asc' : 'desc';
+		void reloadLibrary(true);
+	}
+
+	function toggleAdvancedMode() {
+		advancedMode = !advancedMode;
+		void syncLibraryUrl();
 	}
 
 	function stripLibraryPrefix(relativePath: string, libraryPath: string): string {
@@ -896,10 +944,42 @@
 	<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {bulkMode ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => { bulkMode = !bulkMode; if (!bulkMode) clearSelection(); }}>
 		Select
 	</button>
+	<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {advancedMode ? 'bg-[color:var(--olive)] text-white border-[color:var(--olive)]' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={toggleAdvancedMode}>
+		{advancedMode ? 'Advanced On' : 'Advanced Mode'}
+	</button>
 	<div class="rounded-xl border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2.5 text-sm text-[color:var(--ink-muted)]">
 		{pageRangeLabel()} of {totalLibrary}
 	</div>
 </section>
+
+{#if advancedMode}
+	<section class="mb-5 grid gap-3 rounded-[1rem] border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+		<label class="flex flex-col gap-1 text-sm text-[color:var(--ink-muted)]">
+			<span class="section-label">Rows Per Page</span>
+			<select class="rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.75)] px-3 py-2 text-sm text-[color:var(--ink-strong)] outline-none" bind:value={pageSize} onchange={(event) => setPageSize(Number((event.currentTarget as HTMLSelectElement).value))}>
+				{#each pageSizeOptions as option (option)}
+					<option value={option}>{option}</option>
+				{/each}
+			</select>
+		</label>
+		<label class="flex flex-col gap-1 text-sm text-[color:var(--ink-muted)]">
+			<span class="section-label">Sort Order</span>
+			<select class="rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.75)] px-3 py-2 text-sm text-[color:var(--ink-strong)] outline-none" bind:value={sortBy} onchange={(event) => setSortBy((event.currentTarget as HTMLSelectElement).value as LibrarySortBy)}>
+				{#each sortOptions as option (option.value)}
+					<option value={option.value}>{option.label}</option>
+				{/each}
+			</select>
+		</label>
+		<div class="flex items-end gap-3">
+			<button class="rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.75)] px-4 py-2 text-sm font-semibold text-[color:var(--ink-strong)]" onclick={toggleSortDirection}>
+				{sortDirection === 'desc' ? 'Descending' : 'Ascending'}
+			</button>
+			<div class="text-xs text-[color:var(--ink-muted)]">
+				Server-backed sort and filters. Use larger pages when you need to sweep a library quickly.
+			</div>
+		</div>
+	</section>
+{/if}
 
 {#if rowActionError}
 	<section class="mb-4 rounded-xl border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-4 py-3 text-sm text-[color:var(--danger)]">
@@ -1036,9 +1116,6 @@
 										<span class="status-chip {statusTone(item.managed_status ?? 'UNPROCESSED')}">{statusLabel(item.managed_status ?? 'UNPROCESSED')}</span>
 										{#if !item.has_selected_metadata && (item.managed_status ?? 'UNPROCESSED') !== 'KEPT_ORIGINAL' && (item.managed_status ?? 'UNPROCESSED') !== 'PROCESSED'}
 											<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">needs metadata</span>
-										{/if}
-										{#if item.organize_needed}
-											<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">organize needed</span>
 										{/if}
 										{#if item.organize_needed}
 											<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">organize needed</span>

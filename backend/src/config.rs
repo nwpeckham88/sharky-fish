@@ -38,6 +38,9 @@ pub struct AppConfig {
     /// Golden Standards: encoding rules the LLM must respect.
     #[serde(default)]
     pub golden_standards: GoldenStandards,
+    /// Freeform notes about playback devices and compatibility constraints.
+    #[serde(default)]
+    pub playback_context: String,
     /// System prompt sent to the LLM for ffmpeg command generation.
     #[serde(default)]
     pub system_prompt: String,
@@ -88,6 +91,7 @@ pub struct GoldenStandards {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct VideoStandards {
     /// e.g. "h264", "h265", "av1", "vp9"
     pub codec: String,
@@ -98,13 +102,22 @@ pub struct VideoStandards {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AudioStandards {
+    /// e.g. "aac", "opus", "ac3", "eac3", "copy"
+    pub codec: String,
     /// Target integrated loudness in LUFS (e.g. -24.0).
     pub target_lufs: f64,
     /// Target true peak in dBTP (e.g. -2.0).
     pub target_true_peak: f64,
     /// e.g. "none", "7.1", "5.1", "stereo"
     pub max_channels: String,
+    /// Keep more than one retained audio track when useful.
+    #[serde(default = "default_true")]
+    pub keep_multiple_tracks: bool,
+    /// Ensure a stereo-compatible track exists by downmixing when needed.
+    #[serde(default = "default_true")]
+    pub create_stereo_downmix: bool,
 }
 
 /// Subtitle handling mode.
@@ -184,16 +197,42 @@ impl Default for GoldenStandards {
     fn default() -> Self {
         Self {
             video: VideoStandards {
-                codec: "h264".into(),
+                codec: "h265".into(),
                 max_bitrate_mbps: 15.0,
                 resolution_ceiling: "none".into(),
             },
             audio: AudioStandards {
+                codec: "opus".into(),
                 target_lufs: -24.0,
                 target_true_peak: -2.0,
-                max_channels: "none".into(),
+                max_channels: "5.1".into(),
+                keep_multiple_tracks: true,
+                create_stereo_downmix: true,
             },
             subtitle: SubtitleStandards::default(),
+        }
+    }
+}
+
+impl Default for VideoStandards {
+    fn default() -> Self {
+        Self {
+            codec: "h265".into(),
+            max_bitrate_mbps: 15.0,
+            resolution_ceiling: "none".into(),
+        }
+    }
+}
+
+impl Default for AudioStandards {
+    fn default() -> Self {
+        Self {
+            codec: "opus".into(),
+            target_lufs: -24.0,
+            target_true_peak: -2.0,
+            max_channels: "5.1".into(),
+            keep_multiple_tracks: true,
+            create_stereo_downmix: true,
         }
     }
 }
@@ -219,6 +258,7 @@ impl Default for AppConfig {
             bulk_metadata_concurrency: default_bulk_metadata_concurrency(),
             bulk_metadata_max_inflight: default_bulk_metadata_max_inflight(),
             golden_standards: GoldenStandards::default(),
+            playback_context: String::new(),
             system_prompt: SYSTEM_PROMPT_DEFAULT.into(),
             auto_approve_ai_jobs: true,
             libraries: Vec::new(),
@@ -275,8 +315,10 @@ The host environment utilizes a Debian Linux architecture and may expose \
 hardware acceleration depending on the configured host.\n\n\
 Constraints:\n\
 - Do not output the ffmpeg binary name; return only the exact argument array.\n\
+- When playback device notes are supplied, optimize for the stated client capabilities and compatibility limits.\n\
 - Ensure all audio streams are evaluated for EBU R128 compliance. If \
     normalization is required, flag it.\n\
+- Respect the audio policy provided in the request, including preferred codec, multitrack retention, and stereo downmix requirements.\n\
 - Handle subtitle streams according to the provided subtitle standards:\n\
     * mode=keep_all: copy all subtitle streams with -c:s copy.\n\
     * mode=remove_all: map out all subtitle streams entirely (-sn).\n\

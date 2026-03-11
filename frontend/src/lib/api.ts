@@ -148,6 +148,42 @@ export interface LibraryResponse {
 	scan: LibraryScanStatus;
 }
 
+export type LibraryMediaFilter = 'all' | 'video' | 'audio' | 'subtitle' | 'other';
+
+export type LibraryManagedStatusFilter =
+	| 'all'
+	| 'UNPROCESSED'
+	| 'REVIEWED'
+	| 'AWAITING_APPROVAL'
+	| 'APPROVED'
+	| 'PROCESSED'
+	| 'FAILED'
+	| 'KEPT_ORIGINAL'
+	| 'MISSING_METADATA'
+	| 'ORGANIZE_NEEDED'
+	| 'NO_SIDECAR';
+
+export type LibrarySortBy =
+	| 'modified_at'
+	| 'size_bytes'
+	| 'file_name'
+	| 'relative_path'
+	| 'media_type'
+	| 'managed_status';
+
+export type LibrarySortDirection = 'asc' | 'desc';
+
+export interface FetchLibraryOptions {
+	query?: string;
+	limit?: number;
+	offset?: number;
+	libraryId?: string;
+	mediaType?: LibraryMediaFilter;
+	managedStatus?: LibraryManagedStatusFilter;
+	sortBy?: LibrarySortBy;
+	sortDirection?: LibrarySortDirection;
+}
+
 export interface StreamDisposition {
 	default: boolean;
 	forced: boolean;
@@ -270,9 +306,12 @@ export interface VideoStandards {
 }
 
 export interface AudioStandards {
+	codec: string;
 	target_lufs: number;
 	target_true_peak: number;
 	max_channels: string;
+	keep_multiple_tracks: boolean;
+	create_stereo_downmix: boolean;
 }
 
 export interface SubtitleStandards {
@@ -317,10 +356,23 @@ export interface AppConfig {
 	bulk_metadata_concurrency: number;
 	bulk_metadata_max_inflight: number;
 	golden_standards: GoldenStandards;
+	playback_context: string;
 	system_prompt: string;
 	auto_approve_ai_jobs: boolean;
 	libraries: LibraryFolder[];
 	internet_metadata: InternetMetadataConfig;
+}
+
+export interface ImprovePromptRequest {
+	llm: LlmConfig;
+	concept: string;
+	current_prompt: string;
+	playback_context?: string;
+	golden_standards: GoldenStandards;
+}
+
+export interface ImprovePromptResponse {
+	prompt: string;
 }
 
 export interface LibraryFolder {
@@ -465,21 +517,37 @@ export async function rejectJobGroup(id: number): Promise<void> {
 }
 
 export async function fetchLibrary(
-	query = '',
+	queryOrOptions: string | FetchLibraryOptions = '',
 	limit = 40,
 	offset = 0,
 	libraryId?: string
 ): Promise<LibraryResponse> {
+	const options: FetchLibraryOptions = typeof queryOrOptions === 'string'
+		? { query: queryOrOptions, limit, offset, libraryId }
+		: queryOrOptions;
+
 	const params = new URLSearchParams({
-		limit: String(limit),
-		offset: String(offset)
+		limit: String(options.limit ?? 40),
+		offset: String(options.offset ?? 0)
 	});
 
-	if (query.trim()) {
-		params.set('q', query.trim());
+	if (options.query?.trim()) {
+		params.set('q', options.query.trim());
 	}
-	if (libraryId) {
-		params.set('library_id', libraryId);
+	if (options.libraryId) {
+		params.set('library_id', options.libraryId);
+	}
+	if (options.mediaType && options.mediaType !== 'all') {
+		params.set('media_type', options.mediaType);
+	}
+	if (options.managedStatus && options.managedStatus !== 'all') {
+		params.set('managed_status', options.managedStatus);
+	}
+	if (options.sortBy && options.sortBy !== 'modified_at') {
+		params.set('sort_by', options.sortBy);
+	}
+	if (options.sortDirection && options.sortDirection !== 'desc') {
+		params.set('sort_dir', options.sortDirection);
 	}
 
 	const res = await fetch(`${BASE}/library?${params.toString()}`);
@@ -615,6 +683,21 @@ export async function testLlmConnection(llm: LlmConfig): Promise<LlmTestResponse
 	const data = await res.json();
 	if (!res.ok) throw new Error(data?.message || `Failed to test LLM connection: ${res.status}`);
 	return data;
+}
+
+export async function improveSystemPrompt(input: ImprovePromptRequest): Promise<ImprovePromptResponse> {
+	const res = await fetch(`${BASE}/config/prompt/improve`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(input)
+	});
+
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to improve prompt: ${res.status}`);
+	}
+
+	return res.json();
 }
 
 export async function fetchHealth(): Promise<boolean> {

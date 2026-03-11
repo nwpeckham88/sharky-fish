@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, LlmConfig};
+use crate::config::{AppConfig, GoldenStandards, LlmConfig};
 use crate::messages::{IdentifiedMedia, ProcessingDecision, QueueMsg};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -106,21 +106,26 @@ pub async fn create_processing_decision(
          File: {}\n\n\
          Golden Standards:\n\
          - Video: codec={}, max_bitrate={}Mbps, resolution_ceiling={}\n\
-         - Audio: target_lufs={}, target_true_peak={}, max_channels={}\n\
+         - Audio: codec={}, target_lufs={}, target_true_peak={}, max_channels={}, keep_multiple_tracks={}, create_stereo_downmix={}\n\
          - Subtitles: mode={}, preferred_languages=[{}], keep_forced={}, keep_sdh={}\n\n\
+         Playback Context:\n{}\n\n\
          {}\n\n\
          Probe:\n```json\n{}\n```",
         media.path.display(),
         standards.video.codec,
         standards.video.max_bitrate_mbps,
         standards.video.resolution_ceiling,
+        standards.audio.codec,
         standards.audio.target_lufs,
         standards.audio.target_true_peak,
         standards.audio.max_channels,
+        standards.audio.keep_multiple_tracks,
+        standards.audio.create_stereo_downmix,
         standards.subtitle.mode,
         standards.subtitle.preferred_languages.join(", "),
         standards.subtitle.keep_forced,
         standards.subtitle.keep_sdh,
+        playback_context_block(&app_config.playback_context),
         subtitle_summary,
         probe_json
     );
@@ -145,6 +150,90 @@ pub async fn create_processing_decision(
     }
 
     anyhow::bail!("LLM failed after 3 attempts")
+}
+
+pub async fn improve_system_prompt(
+    llm_config: &LlmConfig,
+    concept: &str,
+    current_prompt: &str,
+    playback_context: &str,
+    standards: &GoldenStandards,
+) -> Result<String> {
+    let client = reqwest::Client::new();
+    let system_prompt = "You rewrite rough media-policy ideas into a precise system prompt for Sharky Fish. Return strict JSON exactly like {\"prompt\":\"...\"}. Do not use markdown fences, commentary, or extra keys.";
+    let user_prompt = format!(
+        "Expand the operator's rough concept into a stronger system prompt for the Sharky Fish FFmpeg planning assistant.\n\n\
+         Requirements:\n\
+         - Preserve the app's strict JSON-only output behavior for FFmpeg planning.\n\
+         - Make the prompt explicit about codec, compatibility, and media-quality priorities.\n\
+         - Treat playback device notes as compatibility guidance, not as a rigid inventory schema.\n\
+         - Keep the result concise enough to be practical as a saved system prompt.\n\
+         - Return only a single prompt string inside the JSON object.\n\n\
+         Current prompt:\n{}\n\n\
+         Operator concept:\n{}\n\n\
+         Playback context:\n{}\n\n\
+         Golden standards:\n\
+         - Video: codec={}, max_bitrate={}Mbps, resolution_ceiling={}\n\
+         - Audio: codec={}, target_lufs={}, target_true_peak={}, max_channels={}, keep_multiple_tracks={}, create_stereo_downmix={}\n\
+         - Subtitles: mode={}, preferred_languages=[{}], keep_forced={}, keep_sdh={}",
+        current_prompt.trim(),
+        concept.trim(),
+        playback_context_block(playback_context),
+        standards.video.codec,
+        standards.video.max_bitrate_mbps,
+        standards.video.resolution_ceiling,
+        standards.audio.codec,
+        standards.audio.target_lufs,
+        standards.audio.target_true_peak,
+        standards.audio.max_channels,
+        standards.audio.keep_multiple_tracks,
+        standards.audio.create_stereo_downmix,
+        standards.subtitle.mode,
+        standards.subtitle.preferred_languages.join(", "),
+        standards.subtitle.keep_forced,
+        standards.subtitle.keep_sdh,
+    );
+
+    let (url, body) = match llm_config.provider.as_str() {
+        "google" => build_google_request(llm_config, system_prompt, &user_prompt, 0.3),
+        "openai" => build_openai_request(llm_config, system_prompt, &user_prompt, 0.3),
+        "ollama" => build_ollama_request(llm_config, system_prompt, &user_prompt, 0.3),
+        other => anyhow::bail!("unsupported LLM provider: {other}"),
+    };
+
+    let mut req = client.post(&url).json(&body);
+    if llm_config.provider == "google" {
+        let Some(key) = llm_config
+            .api_key
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            anyhow::bail!("Google AI API key is required");
+        };
+        req = req.header("x-goog-api-key", key);
+    } else if llm_config.provider == "openai" {
+        let Some(key) = llm_config
+            .api_key
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            anyhow::bail!("OpenAI API key is required");
+        };
+        req = req.bearer_auth(key);
+    }
+
+    let resp = req.send().await.context("LLM HTTP request failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("LLM API returned {status}: {text}");
+    }
+
+    let json: serde_json::Value = resp.json().await?;
+    let content = extract_llm_content(&json)?;
+    let parsed: PromptImprovementOutput = serde_json::from_str(content)
+        .context("failed to parse improved prompt JSON output")?;
+    Ok(parsed.prompt.trim().to_string())
 }
 
 /// The Brain actor receives identified media from the Identifier, consults the
@@ -378,6 +467,20 @@ struct LlmOutput {
     rationale: String,
 }
 
+#[derive(Deserialize)]
+struct PromptImprovementOutput {
+    prompt: String,
+}
+
+fn playback_context_block(playback_context: &str) -> &str {
+    let trimmed = playback_context.trim();
+    if trimmed.is_empty() {
+        "No playback device notes were provided."
+    } else {
+        trimmed
+    }
+}
+
 const SYSTEM_PROMPT: &str = "\
 You are an expert systems architect and media processing engine. \
 Your sole function is to generate highly optimized, syntactically valid FFmpeg \
@@ -386,8 +489,10 @@ The host environment utilizes a Debian Linux architecture and natively supports 
 NVIDIA NVENC hardware acceleration.\n\n\
 Constraints:\n\
 - Do not output the ffmpeg binary name; return only the exact argument array.\n\
+- When playback device notes are supplied, optimize for the stated client capabilities and compatibility limits.\n\
 - Ensure all audio streams are evaluated for EBU R128 compliance. If \
   normalization is required, flag it.\n\
+- Respect the audio policy provided in the request, including preferred codec, multitrack retention, and stereo downmix requirements.\n\
 - Handle subtitle streams according to the provided subtitle standards:\n\
   * mode=keep_all: copy all subtitle streams with -c:s copy.\n\
   * mode=remove_all: map out all subtitle streams entirely (-sn).\n\

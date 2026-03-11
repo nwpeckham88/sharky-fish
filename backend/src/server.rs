@@ -9,6 +9,7 @@ use crate::managed_items;
 use crate::messages::{IdentifiedMedia, LibraryChange, SseEvent};
 use crate::metadata;
 use crate::organizer;
+use crate::library::{LibraryListOptions, LibraryManagedStatusFilter, LibrarySortBy, LibrarySortDirection};
 use axum::{
     Router,
     extract::{Query, State},
@@ -176,6 +177,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/config/llm/test",
             axum::routing::post(test_llm_connection),
         )
+        .route(
+            "/api/config/prompt/improve",
+            axum::routing::post(improve_system_prompt),
+        )
         .route("/api/config", get(get_config).put(update_config))
         .layer(CorsLayer::permissive())
         .with_state(Arc::new(state));
@@ -213,6 +218,10 @@ struct LibraryQuery {
     limit: Option<usize>,
     offset: Option<usize>,
     library_id: Option<String>,
+    media_type: Option<String>,
+    managed_status: Option<String>,
+    sort_by: Option<String>,
+    sort_dir: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -259,6 +268,20 @@ struct DuplicateGroupResponse {
 #[derive(Deserialize)]
 struct LibraryInternetMetadataBulkRequest {
     paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct ImproveSystemPromptRequest {
+    llm: LlmConfig,
+    concept: String,
+    current_prompt: String,
+    playback_context: Option<String>,
+    golden_standards: crate::config::GoldenStandards,
+}
+
+#[derive(Serialize)]
+struct ImproveSystemPromptResponse {
+    prompt: String,
 }
 
 #[derive(Deserialize)]
@@ -778,7 +801,7 @@ async fn list_library(
     State(state): State<Arc<AppState>>,
     Query(params): Query<LibraryQuery>,
 ) -> impl IntoResponse {
-    let limit = params.limit.unwrap_or(40).clamp(1, 200);
+    let limit = params.limit.unwrap_or(40).clamp(1, 500);
     let offset = params.offset.unwrap_or(0);
     let config = { state.config.read().await.clone() };
 
@@ -787,10 +810,16 @@ async fn list_library(
         &config,
         state.library_path.display().to_string(),
         state.ingest_path.display().to_string(),
-        params.q,
-        params.library_id,
-        limit,
-        offset,
+        LibraryListOptions {
+            query: params.q,
+            library_id: params.library_id,
+            media_type: params.media_type,
+            managed_status: LibraryManagedStatusFilter::parse(params.managed_status.as_deref()),
+            sort_by: LibrarySortBy::parse(params.sort_by.as_deref()),
+            sort_direction: LibrarySortDirection::parse(params.sort_dir.as_deref()),
+            limit,
+            offset,
+        },
     )
     .await
     {
@@ -1405,6 +1434,23 @@ async fn test_llm_connection(Json(llm): Json<LlmConfig>) -> impl IntoResponse {
             }),
         )
             .into_response(),
+    }
+}
+
+async fn improve_system_prompt(
+    Json(request): Json<ImproveSystemPromptRequest>,
+) -> impl IntoResponse {
+    match brain::improve_system_prompt(
+        &request.llm,
+        &request.concept,
+        &request.current_prompt,
+        request.playback_context.as_deref().unwrap_or_default(),
+        &request.golden_standards,
+    )
+    .await
+    {
+        Ok(prompt) => Json(ImproveSystemPromptResponse { prompt }).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
 }
 
