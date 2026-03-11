@@ -46,7 +46,10 @@ pub fn sidecar_absolute_path(library_root: &Path, relative_path: &str) -> Option
     Some(library_root.join(sidecar_relative_path(relative_path)?))
 }
 
-pub async fn read_sidecar(library_root: &Path, relative_path: &str) -> Result<Option<ManagedItemSidecar>> {
+pub async fn read_sidecar(
+    library_root: &Path,
+    relative_path: &str,
+) -> Result<Option<ManagedItemSidecar>> {
     let Some(sidecar_path) = sidecar_absolute_path(library_root, relative_path) else {
         return Ok(None);
     };

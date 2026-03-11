@@ -3,12 +3,13 @@ use crate::messages::{IdentifiedMedia, ProcessingDecision, QueueMsg};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{RwLock, mpsc};
 use tracing::{info, warn};
 
 pub async fn test_llm_connection(llm_config: &LlmConfig) -> Result<String> {
     let system_prompt = "You validate API connectivity and must return strict JSON.";
-    let user_prompt = "Return JSON exactly like {\"status\":\"ok\",\"message\":\"connection verified\"}.";
+    let user_prompt =
+        "Return JSON exactly like {\"status\":\"ok\",\"message\":\"connection verified\"}.";
     let client = reqwest::Client::new();
 
     let (url, body) = match llm_config.provider.as_str() {
@@ -20,12 +21,20 @@ pub async fn test_llm_connection(llm_config: &LlmConfig) -> Result<String> {
 
     let mut req = client.post(&url).json(&body);
     if llm_config.provider == "google" {
-        let Some(key) = llm_config.api_key.as_deref().filter(|value| !value.trim().is_empty()) else {
+        let Some(key) = llm_config
+            .api_key
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
             anyhow::bail!("Google AI API key is required");
         };
         req = req.header("x-goog-api-key", key);
     } else if llm_config.provider == "openai" {
-        let Some(key) = llm_config.api_key.as_deref().filter(|value| !value.trim().is_empty()) else {
+        let Some(key) = llm_config
+            .api_key
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        else {
             anyhow::bail!("OpenAI API key is required");
         };
         req = req.bearer_auth(key);
@@ -192,77 +201,87 @@ impl BrainActor {
         create_processing_decision(&cfg, media).await
     }
 
-        /// Hard-coded CPU-based libx264 fallback when LLM is unavailable.
-        fn fallback_decision(media: &IdentifiedMedia) -> ProcessingDecision {
-            let has_video = media.probe.streams.iter().any(|s| s.codec_type == "video");
-            let args = if has_video {
-                vec![
-                    "-i".into(), "input.mkv".into(),
-                    "-c:v".into(), "libx264".into(),
-                    "-preset".into(), "medium".into(),
-                    "-crf".into(), "20".into(),
-                    "-c:a".into(), "aac".into(),
-                    "-b:a".into(), "192k".into(),
-                    "-movflags".into(), "+faststart".into(),
-                    "output.mp4".into(),
-                ]
-            } else {
-                vec![
-                    "-i".into(), "input.mkv".into(),
-                    "-c:a".into(), "aac".into(),
-                    "-b:a".into(), "192k".into(),
-                    "output.m4a".into(),
-                ]
-            };
-
-            ProcessingDecision {
-                job_id: 0,
-                arguments: args,
-                requires_two_pass: true,
-                rationale: "Fallback: CPU-based libx264/aac transcoding".into(),
-            }
-        }
-    }
-
-    async fn call_llm(
-            client: &reqwest::Client,
-            llm_config: &LlmConfig,
-            system_prompt: &str,
-            user_prompt: &str,
-            temperature: f64,
-        ) -> Result<ProcessingDecision> {
-            let (url, body) = match llm_config.provider.as_str() {
-                "google" => build_google_request(llm_config, system_prompt, user_prompt, temperature),
-                "openai" => build_openai_request(llm_config, system_prompt, user_prompt, temperature),
-                "ollama" => build_ollama_request(llm_config, system_prompt, user_prompt, temperature),
-            other => anyhow::bail!("unsupported LLM provider: {other}"),
+    /// Hard-coded CPU-based libx264 fallback when LLM is unavailable.
+    fn fallback_decision(media: &IdentifiedMedia) -> ProcessingDecision {
+        let has_video = media.probe.streams.iter().any(|s| s.codec_type == "video");
+        let args = if has_video {
+            vec![
+                "-i".into(),
+                "input.mkv".into(),
+                "-c:v".into(),
+                "libx264".into(),
+                "-preset".into(),
+                "medium".into(),
+                "-crf".into(),
+                "20".into(),
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                "192k".into(),
+                "-movflags".into(),
+                "+faststart".into(),
+                "output.mp4".into(),
+            ]
+        } else {
+            vec![
+                "-i".into(),
+                "input.mkv".into(),
+                "-c:a".into(),
+                "aac".into(),
+                "-b:a".into(),
+                "192k".into(),
+                "output.m4a".into(),
+            ]
         };
 
-            let mut req = client.post(&url).json(&body);
-            if llm_config.provider == "google" {
-                if let Some(key) = &llm_config.api_key {
-                req = req.header("x-goog-api-key", key);
-            }
-            } else if let Some(key) = &llm_config.api_key {
-            req = req.bearer_auth(key);
+        ProcessingDecision {
+            job_id: 0,
+            arguments: args,
+            requires_two_pass: true,
+            rationale: "Fallback: CPU-based libx264/aac transcoding".into(),
         }
-
-        let resp = req.send().await.context("LLM HTTP request failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            anyhow::bail!("LLM API returned {status}: {text}");
-        }
-
-        let json: serde_json::Value = resp.json().await?;
-        parse_llm_response(&json)
     }
+}
+
+async fn call_llm(
+    client: &reqwest::Client,
+    llm_config: &LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+) -> Result<ProcessingDecision> {
+    let (url, body) = match llm_config.provider.as_str() {
+        "google" => build_google_request(llm_config, system_prompt, user_prompt, temperature),
+        "openai" => build_openai_request(llm_config, system_prompt, user_prompt, temperature),
+        "ollama" => build_ollama_request(llm_config, system_prompt, user_prompt, temperature),
+        other => anyhow::bail!("unsupported LLM provider: {other}"),
+    };
+
+    let mut req = client.post(&url).json(&body);
+    if llm_config.provider == "google" {
+        if let Some(key) = &llm_config.api_key {
+            req = req.header("x-goog-api-key", key);
+        }
+    } else if let Some(key) = &llm_config.api_key {
+        req = req.bearer_auth(key);
+    }
+
+    let resp = req.send().await.context("LLM HTTP request failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("LLM API returned {status}: {text}");
+    }
+
+    let json: serde_json::Value = resp.json().await?;
+    parse_llm_response(&json)
+}
 
 fn parse_llm_response(json: &serde_json::Value) -> Result<ProcessingDecision> {
     let content = extract_llm_content(json)?;
 
-    let parsed: LlmOutput = serde_json::from_str(content)
-        .context("failed to parse LLM JSON output")?;
+    let parsed: LlmOutput =
+        serde_json::from_str(content).context("failed to parse LLM JSON output")?;
 
     Ok(ProcessingDecision {
         job_id: 0,
@@ -279,15 +298,15 @@ fn build_openai_request(
     temperature: f64,
 ) -> (String, serde_json::Value) {
     let url = format!("{}/chat/completions", llm_config.base_url);
-        let body = serde_json::json!({
-            "model": llm_config.model,
-            "temperature": temperature,
-            "response_format": { "type": "json_object" },
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": user_prompt }
-            ]
-        });
+    let body = serde_json::json!({
+        "model": llm_config.model,
+        "temperature": temperature,
+        "response_format": { "type": "json_object" },
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_prompt }
+        ]
+    });
     (url, body)
 }
 
@@ -297,30 +316,30 @@ fn build_google_request(
     user_prompt: &str,
     temperature: f64,
 ) -> (String, serde_json::Value) {
-        let url = format!(
-            "{}/models/{}:generateContent",
-            llm_config.base_url.trim_end_matches('/'),
-            llm_config.model
-        );
-        let body = serde_json::json!({
-            "systemInstruction": {
+    let url = format!(
+        "{}/models/{}:generateContent",
+        llm_config.base_url.trim_end_matches('/'),
+        llm_config.model
+    );
+    let body = serde_json::json!({
+        "systemInstruction": {
+            "parts": [
+                { "text": system_prompt }
+            ]
+        },
+        "contents": [
+            {
+                "role": "user",
                 "parts": [
-                    { "text": system_prompt }
+                    { "text": user_prompt }
                 ]
-            },
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        { "text": user_prompt }
-                    ]
-                }
-            ],
-            "generationConfig": {
-                "temperature": temperature,
-                "responseMimeType": "application/json"
             }
-        });
+        ],
+        "generationConfig": {
+            "temperature": temperature,
+            "responseMimeType": "application/json"
+        }
+    });
     (url, body)
 }
 
@@ -331,22 +350,21 @@ fn build_ollama_request(
     temperature: f64,
 ) -> (String, serde_json::Value) {
     let url = format!("{}/api/chat", llm_config.base_url);
-        let body = serde_json::json!({
-            "model": llm_config.model,
-            "stream": false,
-            "format": "json",
-            "options": { "temperature": temperature },
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": user_prompt }
-            ]
-        });
+    let body = serde_json::json!({
+        "model": llm_config.model,
+        "stream": false,
+        "format": "json",
+        "options": { "temperature": temperature },
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_prompt }
+        ]
+    });
     (url, body)
 }
 
 fn extract_llm_content<'a>(json: &'a serde_json::Value) -> Result<&'a str> {
-    json
-        .pointer("/candidates/0/content/parts/0/text")
+    json.pointer("/candidates/0/content/parts/0/text")
         .or_else(|| json.pointer("/choices/0/message/content"))
         .or_else(|| json.pointer("/message/content"))
         .and_then(|value| value.as_str())

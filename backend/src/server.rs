@@ -6,27 +6,27 @@ use crate::internet_metadata;
 use crate::library;
 use crate::library_index;
 use crate::managed_items;
-use crate::metadata;
 use crate::messages::{IdentifiedMedia, LibraryChange, SseEvent};
+use crate::metadata;
 use crate::organizer;
 use axum::{
+    Router,
     extract::{Query, State},
     http::StatusCode,
     response::{
-        sse::{Event, KeepAlive, Sse},
         IntoResponse, Json,
+        sse::{Event, KeepAlive, Sse},
     },
     routing::get,
-    Router,
 };
-use futures::stream::Stream;
 use futures::StreamExt;
+use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
@@ -43,9 +43,9 @@ struct BulkPathsRequest {
 
 #[derive(Serialize)]
 struct BulkInternetAutoSelectResponse {
-	success_count: usize,
-	failure_count: usize,
-	failures: Vec<BulkFailure>,
+    success_count: usize,
+    failure_count: usize,
+    failures: Vec<BulkFailure>,
 }
 
 #[derive(Deserialize)]
@@ -103,29 +103,67 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/backlog/items", get(list_backlog_items))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{id}/approve", axum::routing::post(approve_job))
+        .route(
+            "/api/jobs/{id}/approve-group",
+            axum::routing::post(approve_job_group),
+        )
         .route("/api/jobs/{id}/reject", axum::routing::post(reject_job))
-        .route("/api/intake/unprocessed", get(list_unprocessed_intake_items))
-        .route("/api/intake/review", axum::routing::post(create_intake_review_job))
-        .route("/api/intake/review/bulk", axum::routing::post(create_bulk_intake_review_jobs))
-        .route("/api/intake/status", axum::routing::post(update_intake_managed_status))
-        .route("/api/intake/status/bulk", axum::routing::post(update_bulk_intake_managed_status))
+        .route(
+            "/api/jobs/{id}/reject-group",
+            axum::routing::post(reject_job_group),
+        )
+        .route(
+            "/api/intake/unprocessed",
+            get(list_unprocessed_intake_items),
+        )
+        .route(
+            "/api/intake/review",
+            axum::routing::post(create_intake_review_job),
+        )
+        .route(
+            "/api/intake/review/bulk",
+            axum::routing::post(create_bulk_intake_review_jobs),
+        )
+        .route(
+            "/api/intake/status",
+            axum::routing::post(update_intake_managed_status),
+        )
+        .route(
+            "/api/intake/status/bulk",
+            axum::routing::post(update_bulk_intake_managed_status),
+        )
         .route("/api/library", get(list_library))
-        .route("/api/library/rescan", axum::routing::post(trigger_library_rescan))
+        .route(
+            "/api/library/rescan",
+            axum::routing::post(trigger_library_rescan),
+        )
         .route("/api/library/events", get(list_library_events))
         .route("/api/library/metadata", get(get_library_metadata))
         .route(
             "/api/library/internet",
             get(get_library_internet_metadata).post(save_selected_library_internet_metadata),
         )
-        .route("/api/library/internet/bulk", axum::routing::post(get_library_internet_metadata_bulk))
+        .route(
+            "/api/library/internet/bulk",
+            axum::routing::post(get_library_internet_metadata_bulk),
+        )
         .route(
             "/api/library/internet/bulk/select",
             axum::routing::post(auto_select_library_internet_metadata_bulk),
         )
-        .route("/api/library/internet/related", get(get_related_library_internet_metadata_paths))
-        .route("/api/library/internet/selected", get(get_selected_library_internet_metadata))
+        .route(
+            "/api/library/internet/related",
+            get(get_related_library_internet_metadata_paths),
+        )
+        .route(
+            "/api/library/internet/selected",
+            get(get_selected_library_internet_metadata),
+        )
         .route("/api/library/duplicates", get(list_library_duplicates))
-        .route("/api/library/organize", axum::routing::post(organize_library_file))
+        .route(
+            "/api/library/organize",
+            axum::routing::post(organize_library_file),
+        )
         .route("/api/libraries", get(list_libraries).post(add_library))
         .route(
             "/api/libraries/{id}",
@@ -134,7 +172,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/jobs/{id}", get(get_job))
         .route("/api/events", get(sse_handler))
         .route("/api/health", get(health))
-        .route("/api/config/llm/test", axum::routing::post(test_llm_connection))
+        .route(
+            "/api/config/llm/test",
+            axum::routing::post(test_llm_connection),
+        )
         .route("/api/config", get(get_config).put(update_config))
         .layer(CorsLayer::permissive())
         .with_state(Arc::new(state));
@@ -256,6 +297,18 @@ async fn list_jobs(
     }
 }
 
+async fn list_unprocessed_intake_items(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<Pagination>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    let offset = params.offset.unwrap_or(0).max(0);
+    match managed_items::list_unprocessed(&state.pool, limit, offset).await {
+        Ok(items) => Json(items).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
 async fn get_backlog_summary(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let config = { state.config.read().await.clone() };
     match managed_items::summarize(&state.pool, &config).await {
@@ -273,8 +326,14 @@ async fn list_backlog_items(
     let filter = params.filter.unwrap_or_else(|| "needs_attention".into());
     let config = { state.config.read().await.clone() };
 
-    let (managed_status, missing_metadata_only, missing_sidecar_only, needs_attention_only, organize_needed_only) = match filter.as_str() {
-		"all" => (None, false, false, false, false),
+    let (
+        managed_status,
+        missing_metadata_only,
+        missing_sidecar_only,
+        needs_attention_only,
+        organize_needed_only,
+    ) = match filter.as_str() {
+        "all" => (None, false, false, false, false),
         "unprocessed" => (Some("UNPROCESSED"), false, false, false, false),
         "failed" => (Some("FAILED"), false, false, false, false),
         "awaiting_approval" => (Some("AWAITING_APPROVAL"), false, false, false, false),
@@ -322,6 +381,13 @@ async fn approve_job(
     transition_job_status(state, id, "APPROVED").await
 }
 
+async fn approve_job_group(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    transition_job_group_status(state, id, "APPROVED").await
+}
+
 async fn reject_job(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<i64>,
@@ -329,10 +395,23 @@ async fn reject_job(
     transition_job_status(state, id, "REJECTED").await
 }
 
-async fn transition_job_status(state: Arc<AppState>, id: i64, next_status: &str) -> axum::response::Response {
+async fn reject_job_group(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    transition_job_group_status(state, id, "REJECTED").await
+}
+
+async fn transition_job_status(
+    state: Arc<AppState>,
+    id: i64,
+    next_status: &str,
+) -> axum::response::Response {
     let Some(job) = (match db::fetch_job(&state.pool, id).await {
         Ok(job) => job,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
     }) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -345,47 +424,124 @@ async fn transition_job_status(state: Arc<AppState>, id: i64, next_status: &str)
             .into_response();
     }
 
-    match db::update_job_status(&state.pool, id, next_status).await {
-        Ok(()) => {
-            if let Ok(relative_path) = Path::new(&job.file_path).strip_prefix(&state.library_path) {
-                if let Ok(Some(job_with_analysis)) = db::fetch_job_with_analysis(&state.pool, id).await {
-                    if let Some(decision) = job_with_analysis.decision {
-                        let relative_path = relative_path.to_string_lossy().replace('\\', "/");
-                        if let Err(error) = managed_items::persist_processing_decision(
-                            &state.pool,
-                            &state.library_path,
-                            &relative_path,
-                            next_status,
-                            &decision,
-                        )
-                        .await
-                        {
-                            tracing::warn!(err = %error, job_id = id, "failed to persist managed item decision sidecar");
-                        }
-                    }
-                }
-            }
-
-            let _ = state.sse_tx.send(SseEvent::JobStatus {
-                job_id: id,
-                status: next_status.to_string(),
-            });
-            StatusCode::NO_CONTENT.into_response()
-        }
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    match transition_jobs(&state, vec![job], next_status).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err((status, message)) => (status, message).into_response(),
     }
 }
 
-async fn list_unprocessed_intake_items(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<Pagination>,
-) -> impl IntoResponse {
-    let limit = params.limit.unwrap_or(50).clamp(1, 500);
-    let offset = params.offset.unwrap_or(0).max(0);
-    match managed_items::list_unprocessed(&state.pool, limit, offset).await {
-        Ok(items) => Json(items).into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+async fn transition_job_group_status(
+    state: Arc<AppState>,
+    id: i64,
+    next_status: &str,
+) -> axum::response::Response {
+    let Some(job) = (match db::fetch_job(&state.pool, id).await {
+        Ok(job) => job,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    }) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    if job.group_kind != "tv_show" {
+        return (
+            StatusCode::BAD_REQUEST,
+            "job is not part of a TV show group",
+        )
+            .into_response();
     }
+
+    let Some(group_key) = job.group_key.as_deref() else {
+        return (StatusCode::BAD_REQUEST, "job group is missing a key").into_response();
+    };
+
+    let jobs = match db::fetch_jobs_for_group(&state.pool, group_key).await {
+        Ok(jobs) => jobs,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+
+    let pending_jobs = jobs
+        .into_iter()
+        .filter(|candidate| candidate.status == "AWAITING_APPROVAL")
+        .collect::<Vec<_>>();
+
+    if pending_jobs.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            "no awaiting-approval jobs remain in this TV show group",
+        )
+            .into_response();
+    }
+
+    match transition_jobs(&state, pending_jobs, next_status).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err((status, message)) => (status, message).into_response(),
+    }
+}
+
+async fn transition_jobs(
+    state: &Arc<AppState>,
+    jobs: Vec<db::Job>,
+    next_status: &str,
+) -> Result<(), (StatusCode, String)> {
+    for job in &jobs {
+        if matches!(job.status.as_str(), "PROCESSING" | "COMPLETED") {
+            return Err((
+                StatusCode::CONFLICT,
+                format!(
+                    "job {} can no longer be changed from {}",
+                    job.id, job.status
+                ),
+            ));
+        }
+    }
+
+    for job in jobs {
+        db::update_job_status(&state.pool, job.id, next_status)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+        persist_job_transition(state, &job, next_status).await;
+
+        let _ = state.sse_tx.send(SseEvent::JobStatus {
+            job_id: job.id,
+            status: next_status.into(),
+        });
+    }
+
+    Ok(())
+}
+
+async fn persist_job_transition(state: &Arc<AppState>, job: &db::Job, next_status: &str) {
+    let Some(relative_path) = job_relative_path(&state.library_path, &job.file_path) else {
+        return;
+    };
+
+    if let Ok(Some(job_with_analysis)) = db::fetch_job_with_analysis(&state.pool, job.id).await {
+        if let Some(decision) = job_with_analysis.decision {
+            if let Err(error) = managed_items::persist_processing_decision(
+                &state.pool,
+                &state.library_path,
+                &relative_path,
+                next_status,
+                &decision,
+            )
+            .await
+            {
+                tracing::warn!(err = %error, path = relative_path, "failed to persist managed status change");
+            }
+        }
+    }
+}
+
+fn job_relative_path(library_path: &Path, file_path: &str) -> Option<String> {
+    Path::new(file_path)
+        .strip_prefix(library_path)
+        .ok()
+        .map(|value| value.to_string_lossy().replace('\\', "/"))
 }
 
 async fn create_intake_review_job(
@@ -486,12 +642,13 @@ async fn create_intake_review_job_for_path(
         });
     }
 
-    let metadata = metadata::get_or_probe_library_metadata(&state.pool, &state.library_path, relative_path)
-        .await
-        .map_err(|error| HandlerError {
-            status: StatusCode::BAD_REQUEST,
-            message: error.to_string(),
-        })?;
+    let metadata =
+        metadata::get_or_probe_library_metadata(&state.pool, &state.library_path, relative_path)
+            .await
+            .map_err(|error| HandlerError {
+                status: StatusCode::BAD_REQUEST,
+                message: error.to_string(),
+            })?;
 
     match db::fetch_active_job_for_path(&state.pool, &metadata.file_path).await {
         Ok(Some(job)) => {
@@ -510,6 +667,12 @@ async fn create_intake_review_job_for_path(
     }
 
     let config = { state.config.read().await.clone() };
+    let group = managed_items::resolve_job_group(&state.pool, &config, relative_path)
+        .await
+        .map_err(|error| HandlerError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: error.to_string(),
+        })?;
 
     let mut decision = brain::create_processing_decision(
         &config,
@@ -536,6 +699,9 @@ async fn create_intake_review_job_for_path(
         &media,
         &mut decision,
         Some("AWAITING_APPROVAL"),
+        Some(group.key.as_str()),
+        Some(group.label.as_str()),
+        group.kind.as_str(),
     )
     .await
     .map_err(|error| HandlerError {
@@ -574,6 +740,9 @@ async fn create_intake_review_job_for_path(
         id: fallback.id,
         file_path: fallback.file_path,
         status: fallback.status,
+        group_key: fallback.group_key,
+        group_label: fallback.group_label,
+        group_kind: fallback.group_kind,
         created_at: fallback.created_at,
         probe: None,
         decision: None,
@@ -635,7 +804,9 @@ async fn trigger_library_rescan(State(state): State<Arc<AppState>>) -> impl Into
             return (StatusCode::CONFLICT, "library rescan already running").into_response();
         }
         Ok(_) => {}
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
     }
 
     let (libraries, exclude_patterns, scan_concurrency, scan_queue_capacity) = {
@@ -675,7 +846,9 @@ async fn get_library_metadata(
     State(state): State<Arc<AppState>>,
     Query(params): Query<LibraryMetadataQuery>,
 ) -> impl IntoResponse {
-    match metadata::get_or_probe_library_metadata(&state.pool, &state.library_path, &params.path).await {
+    match metadata::get_or_probe_library_metadata(&state.pool, &state.library_path, &params.path)
+        .await
+    {
         Ok(response) => Json(response).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
@@ -711,7 +884,13 @@ async fn get_library_internet_metadata(
         cfg.clone()
     };
 
-    match internet_metadata::lookup_for_library_path_with_query(&config, &params.path, params.query.as_deref()).await {
+    match internet_metadata::lookup_for_library_path_with_query(
+        &config,
+        &params.path,
+        params.query.as_deref(),
+    )
+    .await
+    {
         Ok(response) => Json(response).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
@@ -721,10 +900,14 @@ async fn get_related_library_internet_metadata_paths(
     State(state): State<Arc<AppState>>,
     Query(params): Query<LibraryInternetMetadataQuery>,
 ) -> impl IntoResponse {
-    let Some(selected) = (match db::fetch_selected_internet_metadata(&state.pool, &params.path).await {
-        Ok(value) => value,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
-    }) else {
+    let Some(selected) =
+        (match db::fetch_selected_internet_metadata(&state.pool, &params.path).await {
+            Ok(value) => value,
+            Err(error) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+            }
+        })
+    else {
         return Json(RelatedInternetMetadataPathsResponse { paths: Vec::new() }).into_response();
     };
 
@@ -745,9 +928,12 @@ async fn list_library_duplicates(
     State(state): State<Arc<AppState>>,
     Query(params): Query<LibraryQuery>,
 ) -> impl IntoResponse {
-    let rows = match db::list_duplicate_candidates(&state.pool, params.library_id.as_deref()).await {
+    let rows = match db::list_duplicate_candidates(&state.pool, params.library_id.as_deref()).await
+    {
         Ok(value) => value,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
     };
 
     let config = {
@@ -793,7 +979,12 @@ async fn list_library_duplicates(
             let canonical_path = first
                 .library_id
                 .as_deref()
-                .and_then(|library_id| config.libraries.iter().find(|library| library.id == library_id))
+                .and_then(|library_id| {
+                    config
+                        .libraries
+                        .iter()
+                        .find(|library| library.id == library_id)
+                })
                 .map(|library| organizer::movie_target_container(&library.path, &selected))
                 .and_then(|target_dir| {
                     let prefix = format!("{target_dir}/");
@@ -832,18 +1023,19 @@ async fn get_library_internet_metadata_bulk(
     Json(request): Json<LibraryInternetMetadataBulkRequest>,
 ) -> impl IntoResponse {
     if request.paths.is_empty() {
-        return Json(internet_metadata::InternetMetadataBulkResponse { items: Vec::new() }).into_response();
-    }
-
-    if request.paths.len() > 500 {
-        return (
-            StatusCode::BAD_REQUEST,
-            "paths length must be <= 500",
-        )
+        return Json(internet_metadata::InternetMetadataBulkResponse { items: Vec::new() })
             .into_response();
     }
 
-    let _request_permit = match state.bulk_metadata_request_limiter.clone().try_acquire_owned() {
+    if request.paths.len() > 500 {
+        return (StatusCode::BAD_REQUEST, "paths length must be <= 500").into_response();
+    }
+
+    let _request_permit = match state
+        .bulk_metadata_request_limiter
+        .clone()
+        .try_acquire_owned()
+    {
         Ok(permit) => permit,
         Err(_) => {
             return (
@@ -891,7 +1083,13 @@ async fn save_selected_library_internet_metadata(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SaveSelectedInternetMetadataRequest>,
 ) -> impl IntoResponse {
-    match save_selected_library_internet_metadata_for_path(&state, request.path.trim(), &request.selected).await {
+    match save_selected_library_internet_metadata_for_path(
+        &state,
+        request.path.trim(),
+        &request.selected,
+    )
+    .await
+    {
         Ok(response) => Json(response).into_response(),
         Err(error) => (error.status, error.message).into_response(),
     }
@@ -914,7 +1112,11 @@ async fn auto_select_library_internet_metadata_bulk(
         return (StatusCode::BAD_REQUEST, "paths length must be <= 500").into_response();
     }
 
-    let _request_permit = match state.bulk_metadata_request_limiter.clone().try_acquire_owned() {
+    let _request_permit = match state
+        .bulk_metadata_request_limiter
+        .clone()
+        .try_acquire_owned()
+    {
         Ok(permit) => permit,
         Err(_) => {
             return (
@@ -958,7 +1160,8 @@ async fn auto_select_library_internet_metadata_bulk(
             continue;
         };
 
-        match save_selected_library_internet_metadata_for_path(&state, &trimmed, first_match).await {
+        match save_selected_library_internet_metadata_for_path(&state, &trimmed, first_match).await
+        {
             Ok(_) => success_count += 1,
             Err(error) => failures.push(BulkFailure {
                 path: trimmed,
@@ -1017,7 +1220,9 @@ async fn get_selected_library_internet_metadata(
 ) -> impl IntoResponse {
     let row = match db::fetch_selected_internet_metadata(&state.pool, &params.path).await {
         Ok(value) => value,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
     };
 
     let Some(row) = row else {
@@ -1058,11 +1263,19 @@ async fn organize_library_file(
     let selected = if let Some(selected) = request.selected {
         selected
     } else {
-        let Some(row) = (match db::fetch_selected_internet_metadata(&state.pool, relative_path).await {
-            Ok(value) => value,
-            Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
-        }) else {
-            return (StatusCode::BAD_REQUEST, "selected metadata missing; run metadata lookup first").into_response();
+        let Some(row) =
+            (match db::fetch_selected_internet_metadata(&state.pool, relative_path).await {
+                Ok(value) => value,
+                Err(error) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+                }
+            })
+        else {
+            return (
+                StatusCode::BAD_REQUEST,
+                "selected metadata missing; run metadata lookup first",
+            )
+                .into_response();
         };
 
         let genres = serde_json::from_str::<Vec<String>>(&row.genres_json).unwrap_or_default();
@@ -1212,7 +1425,11 @@ async fn add_library(
         return (StatusCode::BAD_REQUEST, "id, name, and path are required").into_response();
     }
     if !matches!(folder.media_type.as_str(), "movie" | "tv") {
-        return (StatusCode::BAD_REQUEST, "media_type must be \"movie\" or \"tv\"").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "media_type must be \"movie\" or \"tv\"",
+        )
+            .into_response();
     }
 
     // Validate path doesn't escape data_path (no ".." traversal).
@@ -1224,13 +1441,21 @@ async fn add_library(
 
     // Check for duplicate id.
     if cfg.libraries.iter().any(|l| l.id == folder.id) {
-        return (StatusCode::CONFLICT, "A library with this id already exists").into_response();
+        return (
+            StatusCode::CONFLICT,
+            "A library with this id already exists",
+        )
+            .into_response();
     }
 
     // Verify the target directory exists on disk.
     let full_path = PathBuf::from(&cfg.data_path).join(&folder.path);
     if !full_path.is_dir() {
-        return (StatusCode::BAD_REQUEST, "Path does not exist or is not a directory").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "Path does not exist or is not a directory",
+        )
+            .into_response();
     }
 
     cfg.libraries.push(folder.clone());
@@ -1265,20 +1490,36 @@ async fn update_library(
         return (StatusCode::BAD_REQUEST, "id, name, and path are required").into_response();
     }
     if !matches!(folder.media_type.as_str(), "movie" | "tv") {
-        return (StatusCode::BAD_REQUEST, "media_type must be \"movie\" or \"tv\"").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "media_type must be \"movie\" or \"tv\"",
+        )
+            .into_response();
     }
     if folder.path.contains("..") {
         return (StatusCode::BAD_REQUEST, "path must not contain '..'").into_response();
     }
 
     let mut cfg = state.config.write().await;
-    if cfg.libraries.iter().any(|library| library.id == folder.id && library.id != id) {
-        return (StatusCode::CONFLICT, "A library with this id already exists").into_response();
+    if cfg
+        .libraries
+        .iter()
+        .any(|library| library.id == folder.id && library.id != id)
+    {
+        return (
+            StatusCode::CONFLICT,
+            "A library with this id already exists",
+        )
+            .into_response();
     }
 
     let full_path = PathBuf::from(&cfg.data_path).join(&folder.path);
     if !full_path.is_dir() {
-        return (StatusCode::BAD_REQUEST, "Path does not exist or is not a directory").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "Path does not exist or is not a directory",
+        )
+            .into_response();
     }
 
     let Some(existing) = cfg.libraries.iter_mut().find(|library| library.id == id) else {

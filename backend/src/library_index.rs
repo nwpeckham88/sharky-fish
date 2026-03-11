@@ -7,8 +7,8 @@ use anyhow::Result;
 use futures::stream::StreamExt;
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task;
@@ -42,15 +42,17 @@ pub async fn run_full_rescan(
 
     let run_result = async {
         db::update_library_scan_progress(&pool, 0, 0).await?;
-        let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(LibraryIndexScanProgress {
-            status: "running".into(),
-            scanned_items: 0,
-            total_items: 0,
-            started_at: Some(started_at),
-            completed_at: None,
-            last_scan_at: None,
-            last_error: None,
-        }));
+        let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(
+            LibraryIndexScanProgress {
+                status: "running".into(),
+                scanned_items: 0,
+                total_items: 0,
+                started_at: Some(started_at),
+                completed_at: None,
+                last_scan_at: None,
+                last_error: None,
+            },
+        ));
 
         db::clear_library_index(&pool).await?;
 
@@ -175,15 +177,17 @@ pub async fn run_full_rescan(
 
             if scanned_items % 200 == 0 {
                 db::update_library_scan_progress(&pool, scanned_items, total).await?;
-                let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(LibraryIndexScanProgress {
-                    status: "running".into(),
-                    scanned_items,
-                    total_items: total,
-                    started_at: Some(started_at),
-                    completed_at: None,
-                    last_scan_at: None,
-                    last_error: None,
-                }));
+                let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(
+                    LibraryIndexScanProgress {
+                        status: "running".into(),
+                        scanned_items,
+                        total_items: total,
+                        started_at: Some(started_at),
+                        completed_at: None,
+                        last_scan_at: None,
+                        last_error: None,
+                    },
+                ));
             }
         }
 
@@ -191,19 +195,21 @@ pub async fn run_full_rescan(
 
         let total = discovered_total.load(Ordering::Relaxed).max(scanned_items);
         db::update_library_scan_progress(&pool, scanned_items, total).await?;
-    db::delete_stale_managed_items(&pool).await?;
+        db::delete_stale_managed_items(&pool).await?;
 
         let completed_at = unix_now();
         db::complete_library_scan(&pool, completed_at, scanned_items).await?;
-        let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(LibraryIndexScanProgress {
-            status: "idle".into(),
-            scanned_items,
-            total_items: total,
-            started_at: Some(started_at),
-            completed_at: Some(completed_at),
-            last_scan_at: Some(completed_at),
-            last_error: None,
-        }));
+        let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(
+            LibraryIndexScanProgress {
+                status: "idle".into(),
+                scanned_items,
+                total_items: total,
+                started_at: Some(started_at),
+                completed_at: Some(completed_at),
+                last_scan_at: Some(completed_at),
+                last_error: None,
+            },
+        ));
 
         Ok::<(), anyhow::Error>(())
     }
@@ -220,15 +226,17 @@ pub async fn run_full_rescan(
             &error.to_string(),
         )
         .await?;
-        let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(LibraryIndexScanProgress {
-            status: "error".into(),
-            scanned_items: scan_state.scanned_items.max(0) as usize,
-            total_items: scan_state.total_items.max(0) as usize,
-            started_at: scan_state.started_at.map(|v| v.max(0) as u64),
-            completed_at: Some(completed_at),
-            last_scan_at: scan_state.last_scan_at.map(|v| v.max(0) as u64),
-            last_error: Some(error.to_string()),
-        }));
+        let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(
+            LibraryIndexScanProgress {
+                status: "error".into(),
+                scanned_items: scan_state.scanned_items.max(0) as usize,
+                total_items: scan_state.total_items.max(0) as usize,
+                started_at: scan_state.started_at.map(|v| v.max(0) as u64),
+                completed_at: Some(completed_at),
+                last_scan_at: scan_state.last_scan_at.map(|v| v.max(0) as u64),
+                last_error: Some(error.to_string()),
+            },
+        ));
         return Err(error);
     }
 

@@ -52,9 +52,24 @@ export const managedItemStore = $state<{
 
 export function getReviewState() {
 	const awaitingApproval = jobStore.jobs.filter((job) => job.status === 'AWAITING_APPROVAL');
+	const showGroups = new Map<string, Job[]>();
+
+	for (const job of awaitingApproval) {
+		if (job.group_kind !== 'tv_show' || !job.group_key) continue;
+		const existing = showGroups.get(job.group_key) ?? [];
+		existing.push(job);
+		showGroups.set(job.group_key, existing);
+	}
 
 	return {
 		awaitingApproval,
+		showGroups: Array.from(showGroups.values())
+			.map((jobs) => jobs.sort((left, right) => left.file_path.localeCompare(right.file_path)))
+			.sort((left, right) => {
+				const leftLabel = left[0]?.group_label ?? left[0]?.file_path ?? '';
+				const rightLabel = right[0]?.group_label ?? right[0]?.file_path ?? '';
+				return leftLabel.localeCompare(rightLabel);
+			}),
 		counts: {
 			awaitingApproval: awaitingApproval.length
 		}
@@ -114,6 +129,9 @@ export function handleSseEvent(event: SseEvent) {
 				id: event.job_id,
 				file_path: event.file_path,
 				status: event.status,
+				group_key: event.group_key,
+				group_label: event.group_label,
+				group_kind: event.group_kind,
 				created_at: new Date().toISOString(),
 				probe: null,
 				decision: null

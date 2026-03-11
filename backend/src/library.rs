@@ -83,7 +83,8 @@ pub async fn list_from_index(
     )
     .await?;
 
-    let total_items = db::count_library_index(pool, query_like.as_deref(), library_id.as_deref()).await?;
+    let total_items =
+        db::count_library_index(pool, query_like.as_deref(), library_id.as_deref()).await?;
     let summary_row = db::summarize_library_index(pool, library_id.as_deref()).await?;
     let scan_state = db::fetch_library_scan_state(pool).await?;
 

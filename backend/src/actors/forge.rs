@@ -6,11 +6,11 @@ use crate::messages::{
 use anyhow::{Context, Result};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
-use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 use tracing::{info, warn};
-use std::sync::Arc;
 
 use crate::config::AppConfig;
 
@@ -120,8 +120,7 @@ impl ForgeActor {
         }
 
         // Atomic finalization: rename .partial → final.
-        self.finalize_output(&output_partial, &output_final)
-            .await?;
+        self.finalize_output(&output_partial, &output_final).await?;
 
         info!(job_id = job.job_id, output = %output_final.display(), "forge: job complete");
         Ok(())
@@ -137,7 +136,8 @@ impl ForgeActor {
             .args([
                 "-af",
                 "loudnorm=I=-14:TP=-1.5:LRA=11:print_format=json",
-                "-f", "null",
+                "-f",
+                "null",
                 "-",
             ])
             .stdout(std::process::Stdio::null())
@@ -170,10 +170,14 @@ impl ForgeActor {
             anyhow::bail!("ffmpeg pass 1 exited with {status}");
         }
 
-        let measurement: LoudnormMeasurement = serde_json::from_str(&json_block)
-            .context("failed to parse loudnorm JSON output")?;
+        let measurement: LoudnormMeasurement =
+            serde_json::from_str(&json_block).context("failed to parse loudnorm JSON output")?;
 
-        info!(job_id = job.job_id, input_i = measurement.input_i, "forge: pass 1 complete");
+        info!(
+            job_id = job.job_id,
+            input_i = measurement.input_i,
+            "forge: pass 1 complete"
+        );
         Ok(measurement)
     }
 
@@ -206,11 +210,14 @@ impl ForgeActor {
         // Remove any existing -map 0:s or -c:s entries from LLM args
         let mut i = 0;
         while i < args.len() {
-            let is_sub_map = args[i] == "-map" && args.get(i + 1).map_or(false, |v| v.contains(":s"));
+            let is_sub_map =
+                args[i] == "-map" && args.get(i + 1).map_or(false, |v| v.contains(":s"));
             let is_sub_codec = args[i] == "-c:s";
             if is_sub_map || is_sub_codec {
                 args.remove(i); // remove flag
-                if i < args.len() { args.remove(i); } // remove value
+                if i < args.len() {
+                    args.remove(i);
+                } // remove value
             } else {
                 i += 1;
             }
@@ -222,7 +229,8 @@ impl ForgeActor {
         let sub_standards = &cfg.golden_standards.subtitle;
 
         // Determine output container from the output path extension.
-        let output_ext = output_path.extension()
+        let output_ext = output_path
+            .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("mp4")
             .to_ascii_lowercase();
@@ -259,7 +267,15 @@ impl ForgeActor {
         }
 
         // Add progress pipe and override confirmation.
-        let full_args = [&["-y".to_string(), "-progress".to_string(), "pipe:1".to_string()], args.as_slice()].concat();
+        let full_args = [
+            &[
+                "-y".to_string(),
+                "-progress".to_string(),
+                "pipe:1".to_string(),
+            ],
+            args.as_slice(),
+        ]
+        .concat();
 
         let mut cmd = Command::new("ffmpeg");
         cmd.args(&full_args)
@@ -302,7 +318,8 @@ impl ForgeActor {
     async fn finalize_output(&self, partial: &Path, final_path: &Path) -> Result<()> {
         match tokio::fs::rename(partial, final_path).await {
             Ok(()) => Ok(()),
-            Err(e) if e.raw_os_error() == Some(18) => { // EXDEV
+            Err(e) if e.raw_os_error() == Some(18) => {
+                // EXDEV
                 // Cross-device: copy → fsync → rename → unlink.
                 let tmp_dest = final_path.with_extension("mp4.partial");
                 tokio::fs::copy(partial, &tmp_dest).await?;
@@ -327,7 +344,14 @@ impl ForgeActor {
     async fn get_duration(&self, job: &QueuedJob) -> f64 {
         // Quick ffprobe to get duration; best-effort.
         let output = Command::new("ffprobe")
-            .args(["-v", "quiet", "-show_entries", "format=duration", "-of", "csv=p=0"])
+            .args([
+                "-v",
+                "quiet",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "csv=p=0",
+            ])
             .arg(&job.source_path)
             .output()
             .await
@@ -414,9 +438,16 @@ fn build_subtitle_args(
                 .filter(|s| {
                     let lang = s.language.as_deref().unwrap_or("und");
                     let lang_match = standards.preferred_languages.is_empty()
-                        || standards.preferred_languages.iter().any(|pl| pl.eq_ignore_ascii_case(lang));
-                    let forced_keep = standards.keep_forced && s.disposition.forced
-                        && standards.preferred_languages.iter().any(|pl| pl.eq_ignore_ascii_case(lang));
+                        || standards
+                            .preferred_languages
+                            .iter()
+                            .any(|pl| pl.eq_ignore_ascii_case(lang));
+                    let forced_keep = standards.keep_forced
+                        && s.disposition.forced
+                        && standards
+                            .preferred_languages
+                            .iter()
+                            .any(|pl| pl.eq_ignore_ascii_case(lang));
                     let sdh_ok = !s.disposition.hearing_impaired || standards.keep_sdh;
                     (lang_match && sdh_ok) || forced_keep
                 })
@@ -442,7 +473,10 @@ fn build_subtitle_args(
                 .filter(|s| {
                     let lang = s.language.as_deref().unwrap_or("und");
                     let lang_match = standards.preferred_languages.is_empty()
-                        || standards.preferred_languages.iter().any(|pl| pl.eq_ignore_ascii_case(lang));
+                        || standards
+                            .preferred_languages
+                            .iter()
+                            .any(|pl| pl.eq_ignore_ascii_case(lang));
                     s.disposition.forced && lang_match
                 })
                 .collect();

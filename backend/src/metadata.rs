@@ -6,8 +6,8 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
-use tokio::task;
 use tokio::process::Command;
+use tokio::task;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LibraryMetadataResponse {
@@ -32,8 +32,10 @@ pub struct LibraryMetadataResponse {
 pub async fn probe_media(path: &Path) -> Result<MediaProbe> {
     let output = Command::new("ffprobe")
         .args([
-            "-v", "quiet",
-            "-print_format", "json",
+            "-v",
+            "quiet",
+            "-print_format",
+            "json",
             "-show_format",
             "-show_streams",
         ])
@@ -82,12 +84,8 @@ pub async fn probe_media(path: &Path) -> Result<MediaProbe> {
                         bit_rate: stream["bit_rate"]
                             .as_str()
                             .and_then(|value| value.parse::<u64>().ok()),
-                        language: stream["tags"]["language"]
-                            .as_str()
-                            .map(|v| v.to_string()),
-                        title: stream["tags"]["title"]
-                            .as_str()
-                            .map(|v| v.to_string()),
+                        language: stream["tags"]["language"].as_str().map(|v| v.to_string()),
+                        title: stream["tags"]["title"].as_str().map(|v| v.to_string()),
                         disposition: StreamDisposition {
                             default: disposition["default"].as_i64() == Some(1),
                             forced: disposition["forced"].as_i64() == Some(1),
@@ -259,8 +257,14 @@ fn from_probe(
     probe: MediaProbe,
     cached: bool,
 ) -> LibraryMetadataResponse {
-    let video_stream = probe.streams.iter().find(|stream| stream.codec_type == "video");
-    let audio_stream = probe.streams.iter().find(|stream| stream.codec_type == "audio");
+    let video_stream = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type == "video");
+    let audio_stream = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type == "audio");
     let subtitle_streams: Vec<&StreamInfo> = probe
         .streams
         .iter()
@@ -300,6 +304,21 @@ fn is_media_file(path: &Path) -> bool {
 
     matches!(
         extension.to_ascii_lowercase().as_str(),
-        "mkv" | "mp4" | "avi" | "mov" | "ts" | "webm" | "m4v" | "flac" | "mp3" | "wav" | "m4a" | "aac" | "ogg" | "srt" | "ass" | "vtt"
+        "mkv"
+            | "mp4"
+            | "avi"
+            | "mov"
+            | "ts"
+            | "webm"
+            | "m4v"
+            | "flac"
+            | "mp3"
+            | "wav"
+            | "m4a"
+            | "aac"
+            | "ogg"
+            | "srt"
+            | "ass"
+            | "vtt"
     )
 }

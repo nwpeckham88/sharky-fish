@@ -128,7 +128,9 @@ pub struct SubtitleStandards {
     pub keep_sdh: bool,
 }
 
-fn default_true() -> bool { true }
+fn default_true() -> bool {
+    true
+}
 
 fn default_scan_exclude_patterns() -> Vec<String> {
     vec!["samples".into(), "trailers".into(), "extras".into()]

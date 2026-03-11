@@ -13,6 +13,13 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Serialize)]
+pub struct JobGroup {
+    pub key: String,
+    pub label: String,
+    pub kind: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct IntakeManagedItem {
     pub relative_path: String,
     pub file_path: String,
@@ -70,16 +77,22 @@ pub async fn sync_library_file(
             .as_ref()
             .map(serde_json::to_string)
             .transpose()?,
-        None => existing.as_ref().and_then(|value| value.selected_metadata_json.clone()),
+        None => existing
+            .as_ref()
+            .and_then(|value| value.selected_metadata_json.clone()),
     };
 
     let last_decision_json = match sidecar_doc.as_ref() {
         Some(value) => value
             .last_decision
             .as_ref()
-            .map(|decision| serde_json::to_string(&sidecar::processing_decision_from_sidecar(decision)))
+            .map(|decision| {
+                serde_json::to_string(&sidecar::processing_decision_from_sidecar(decision))
+            })
             .transpose()?,
-        None => existing.as_ref().and_then(|value| value.last_decision_json.clone()),
+        None => existing
+            .as_ref()
+            .and_then(|value| value.last_decision_json.clone()),
     };
 
     let first_seen_at = existing
@@ -194,7 +207,11 @@ pub async fn persist_processing_decision(
     write_sidecar_from_row(library_root, &updated_row).await
 }
 
-pub async fn list_unprocessed(pool: &SqlitePool, limit: i64, offset: i64) -> Result<Vec<IntakeManagedItem>> {
+pub async fn list_unprocessed(
+    pool: &SqlitePool,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<IntakeManagedItem>> {
     let rows = db::list_unprocessed_managed_items(pool, limit, offset).await?;
     rows.into_iter().map(intake_item_from_row).collect()
 }
@@ -211,16 +228,8 @@ pub async fn list_filtered(
     offset: i64,
 ) -> Result<Vec<IntakeManagedItem>> {
     let rows = if needs_attention_only || organize_needed_only {
-        let all_rows = db::list_managed_items_filtered(
-            pool,
-            None,
-            false,
-            false,
-            false,
-            i64::MAX,
-            0,
-        )
-        .await?;
+        let all_rows =
+            db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
 
         all_rows
             .into_iter()
@@ -249,10 +258,10 @@ pub async fn list_filtered(
     rows.into_iter().map(intake_item_from_row).collect()
 }
 
-
 pub async fn summarize(pool: &SqlitePool, config: &AppConfig) -> Result<BacklogSummary> {
     let row = db::summarize_managed_items(pool).await?;
-    let all_rows = db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
+    let all_rows =
+        db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
     let organize_needed_count = all_rows
         .iter()
         .filter(|item| managed_item_needs_organize(config, item))
@@ -282,7 +291,9 @@ fn base_needs_attention(row: &db::ManagedItemRow) -> bool {
     row.managed_status == "UNPROCESSED"
         || row.managed_status == "FAILED"
         || row.managed_status == "AWAITING_APPROVAL"
-        || (row.selected_metadata_json.is_none() && row.managed_status != "KEPT_ORIGINAL" && row.managed_status != "PROCESSED")
+        || (row.selected_metadata_json.is_none()
+            && row.managed_status != "KEPT_ORIGINAL"
+            && row.managed_status != "PROCESSED")
         || row.sidecar_path.is_none()
 }
 
@@ -333,13 +344,129 @@ pub async fn update_managed_status(
     write_sidecar_from_row(library_root, &updated_row).await
 }
 
+pub async fn resolve_job_group(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    relative_path: &str,
+) -> Result<JobGroup> {
+    let normalized_path = relative_path.replace('\\', "/");
+    let row = db::fetch_managed_item(pool, &normalized_path).await?;
+
+    if let Some(group) = row
+        .as_ref()
+        .and_then(|item| item.selected_metadata_json.as_deref())
+        .and_then(|json| serde_json::from_str::<InternetMetadataMatch>(json).ok())
+        .and_then(job_group_from_selected_metadata)
+    {
+        return Ok(group);
+    }
+
+    if let Some(group) = row.as_ref().and_then(|item| {
+        derive_tv_group_from_library(config, &normalized_path, item.library_id.as_deref())
+    }) {
+        return Ok(group);
+    }
+
+    let label = Path::new(&normalized_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(&normalized_path)
+        .to_string();
+
+    Ok(JobGroup {
+        key: format!("file:{}", normalized_path.to_ascii_lowercase()),
+        label,
+        kind: "file".into(),
+    })
+}
+
+fn job_group_from_selected_metadata(selected: InternetMetadataMatch) -> Option<JobGroup> {
+    let media_kind = selected.media_kind.trim().to_ascii_lowercase();
+    if media_kind != "series" {
+        return None;
+    }
+
+    let title = selected.title.trim();
+    if title.is_empty() {
+        return None;
+    }
+
+    let key = selected
+        .tvdb_id
+        .map(|value| format!("tvdb:{value}"))
+        .or_else(|| {
+            selected
+                .imdb_id
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| format!("imdb:{value}"))
+        })
+        .unwrap_or_else(|| format!("series:{}", title.to_ascii_lowercase()));
+
+    Some(JobGroup {
+        key,
+        label: title.to_string(),
+        kind: "tv_show".into(),
+    })
+}
+
+fn derive_tv_group_from_library(
+    config: &AppConfig,
+    relative_path: &str,
+    library_id: Option<&str>,
+) -> Option<JobGroup> {
+    let library = if let Some(id) = library_id {
+        config.libraries.iter().find(|candidate| candidate.id == id)
+    } else {
+        config
+            .libraries
+            .iter()
+            .filter(|candidate| candidate.media_type == "tv")
+            .find(|candidate| {
+                let prefix = normalize_library_prefix(&candidate.path);
+                relative_path == prefix || relative_path.starts_with(&format!("{prefix}/"))
+            })
+    };
+
+    let library = library.filter(|candidate| candidate.media_type == "tv")?;
+    let stripped = strip_library_prefix(relative_path, &library.path)?;
+    let show = stripped
+        .split('/')
+        .find(|segment| !segment.trim().is_empty())?
+        .trim();
+    if show.is_empty() {
+        return None;
+    }
+
+    Some(JobGroup {
+        key: format!("tv-path:{}:{}", library.id, show.to_ascii_lowercase()),
+        label: show.to_string(),
+        kind: "tv_show".into(),
+    })
+}
+
+fn strip_library_prefix<'a>(relative_path: &'a str, library_path: &str) -> Option<&'a str> {
+    let normalized_library = normalize_library_prefix(library_path);
+    if relative_path == normalized_library {
+        return Some("");
+    }
+
+    relative_path
+        .strip_prefix(&format!("{normalized_library}/"))
+        .or(Some(relative_path))
+}
+
+fn normalize_library_prefix(value: &str) -> String {
+    value.trim_matches('/').replace('\\', "/")
+}
+
 pub async fn reconcile_after_organize(
     pool: &SqlitePool,
     library_root: &Path,
     current_relative_path: &str,
     target_relative_path: &str,
 ) -> Result<()> {
-    db::rename_selected_internet_metadata(pool, current_relative_path, target_relative_path).await?;
+    db::rename_selected_internet_metadata(pool, current_relative_path, target_relative_path)
+        .await?;
 
     let target_abs = library_root.join(target_relative_path);
     let file_name = target_abs

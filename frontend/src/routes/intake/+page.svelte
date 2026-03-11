@@ -1,9 +1,11 @@
 <script lang="ts">
-	import { approveJob, rejectJob, type Job, type MediaProbe } from '$lib/api';
+	import { approveJob, approveJobGroup, rejectJob, rejectJobGroup, type Job, type MediaProbe } from '$lib/api';
 	import { getExecutionState, jobStore, getReviewState } from '$lib/stores.svelte';
 	import { fileName } from '$lib/status';
 
-	let actionBusy = $state<Record<number, 'approve' | 'reject' | null>>({});
+	type ReviewAction = 'approve' | 'reject' | 'approve_group' | 'reject_group' | null;
+
+	let actionBusy = $state<Record<number, ReviewAction>>({});
 	let actionErrors = $state<Record<number, string>>({});
 
 	function formatDuration(seconds?: number): string {
@@ -66,10 +68,58 @@
 		}
 	}
 
+	async function runGroupAction(group: Job[], action: 'approve_group' | 'reject_group') {
+		if (group.length === 0) return;
+		const lead = group[0];
+		const nextBusy = { ...actionBusy };
+		const nextErrors = { ...actionErrors };
+		for (const job of group) {
+			nextBusy[job.id] = action;
+			nextErrors[job.id] = '';
+		}
+		actionBusy = nextBusy;
+		actionErrors = nextErrors;
+
+		try {
+			if (action === 'approve_group') {
+				await approveJobGroup(lead.id);
+			} else {
+				await rejectJobGroup(lead.id);
+			}
+		} catch (error) {
+			const message = error instanceof Error ? error.message : 'Group action failed';
+			actionErrors = Object.fromEntries(group.map((job) => [job.id, message]));
+		} finally {
+			actionBusy = {
+				...actionBusy,
+				...Object.fromEntries(group.map((job) => [job.id, null]))
+			};
+		}
+	}
+
+	function leadJob(group: Job[]): Job {
+		return group[0];
+	}
+
+	function groupBusy(group: Job[]): boolean {
+		return group.some((job) => actionBusy[job.id] !== null && actionBusy[job.id] !== undefined);
+	}
+
+	function groupError(group: Job[]): string {
+		for (const job of group) {
+			if (actionErrors[job.id]) return actionErrors[job.id];
+		}
+		return '';
+	}
+
 	const jobs = $derived(jobStore.jobs);
 	const loading = $derived(jobStore.loading);
 
-	const reviewJobs = $derived(getReviewState().awaitingApproval);
+	const reviewState = $derived(getReviewState());
+	const reviewJobs = $derived(reviewState.awaitingApproval);
+	const showGroups = $derived(reviewState.showGroups);
+	const groupedJobIds = $derived(new Set(showGroups.flatMap((group) => group.map((job) => job.id))));
+	const standaloneReviewJobs = $derived(reviewJobs.filter((job) => !groupedJobIds.has(job.id)));
 	const executionCounts = $derived(getExecutionState().counts);
 </script>
 
@@ -88,7 +138,11 @@
 
 	<div class="surface-card p-6">
 		<p class="section-label">Queue Split</p>
-		<div class="mt-4 grid gap-3 sm:grid-cols-3 lg:grid-cols-1 xl:grid-cols-3">
+		<div class="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-1 xl:grid-cols-4">
+			<div class="rounded-[1rem] border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-4">
+				<div class="text-xs uppercase tracking-[0.16em] text-[color:var(--ink-muted)]">TV Shows Awaiting Approval</div>
+				<div class="mt-2 text-2xl font-semibold text-[color:var(--ink-strong)]">{showGroups.length}</div>
+			</div>
 			<div class="rounded-[1rem] border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-4">
 				<div class="text-xs uppercase tracking-[0.16em] text-[color:var(--ink-muted)]">Awaiting Approval</div>
 				<div class="mt-2 text-2xl font-semibold text-[color:var(--ink-strong)]">{reviewJobs.length}</div>
@@ -120,54 +174,133 @@
 				<p class="mt-2 text-sm text-[color:var(--ink-muted)]">Use the backlog page to create AI reviews for unprocessed files, then approve them here.</p>
 			</div>
 		{:else}
-			<div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
-				{#each reviewJobs as job (job.id)}
-					<div class="triage-card">
-						<div class="mb-3 flex items-center justify-between gap-2">
-							<span class="rounded-full bg-[color:rgba(164,79,45,0.1)] px-2.5 py-1 text-[11px] font-bold uppercase tracking-[0.16em] text-[color:var(--accent-deep)]">AI Plan</span>
-							<span class="text-xs text-[color:var(--ink-muted)]">#{job.id}</span>
-						</div>
-						<h3 class="mb-1 truncate text-sm font-semibold text-[color:var(--ink-strong)]">{fileName(job.file_path)}</h3>
-						<p class="mb-4 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{job.file_path}</p>
-
-						<div class="mb-3 rounded-lg border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.5)] p-3">
-							<div class="section-label mb-2">Source Analysis</div>
-							{#if job.probe}
-								<div class="flex flex-wrap gap-2">
-									{#each summarizeProbe(job.probe) as detail (detail)}
-										<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]">{detail}</span>
-									{/each}
-								</div>
-							{:else}
-								<p class="text-xs text-[color:var(--ink-muted)]">Probe data is not available yet.</p>
-							{/if}
-						</div>
-
-						<div class="mb-4 rounded-lg border-l-[3px] border-[color:var(--accent-soft)] bg-[color:rgba(214,180,111,0.08)] px-3 py-2">
-							<p class="mb-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-[color:var(--accent-deep)]">AI rationale</p>
-							<p class="text-xs text-[color:var(--ink-muted)]">{job.decision?.rationale ?? 'No AI rationale available.'}</p>
-						</div>
-
-						<details class="mb-4 rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.5)] px-3 py-2">
-							<summary class="cursor-pointer text-xs font-semibold uppercase tracking-[0.14em] text-[color:var(--ink-muted)]">Generated FFmpeg plan</summary>
-							<pre class="mt-2 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-[color:var(--ink-strong)]">{formatCommand(job)}</pre>
-						</details>
-
-						{#if actionErrors[job.id]}
-							<p class="mb-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{actionErrors[job.id]}</p>
-						{/if}
-
-						<div class="flex gap-2">
-							<button class="flex-1 rounded-lg bg-[color:var(--accent)] px-3 py-2 text-xs font-semibold text-white disabled:opacity-60" onclick={() => runAction(job.id, 'approve')} disabled={actionBusy[job.id] !== null && actionBusy[job.id] !== undefined}>
-								{actionBusy[job.id] === 'approve' ? 'Approving…' : 'Approve'}
-							</button>
-							<button class="rounded-lg border border-[color:var(--line)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-muted)] disabled:opacity-60" onclick={() => runAction(job.id, 'reject')} disabled={actionBusy[job.id] !== null && actionBusy[job.id] !== undefined}>
-								{actionBusy[job.id] === 'reject' ? 'Rejecting…' : 'Reject'}
-							</button>
-						</div>
+			{#if showGroups.length > 0}
+				<div class="mb-6">
+					<div class="mb-3 flex items-center gap-3">
+						<h3 class="text-base text-[color:var(--ink-strong)]">TV Show Bundles</h3>
+						<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-[color:var(--accent-deep)]">{showGroups.length}</span>
 					</div>
-				{/each}
-			</div>
+					<div class="grid gap-4 xl:grid-cols-2">
+						{#each showGroups as group (leadJob(group).group_key ?? leadJob(group).id)}
+							{@const lead = leadJob(group)}
+							<div class="triage-card">
+								<div class="mb-3 flex items-center justify-between gap-2">
+									<div>
+										<span class="rounded-full bg-[color:rgba(164,79,45,0.1)] px-2.5 py-1 text-[11px] font-bold uppercase tracking-[0.16em] text-[color:var(--accent-deep)]">TV Show</span>
+										<h3 class="mt-3 text-lg font-semibold text-[color:var(--ink-strong)]">{lead.group_label ?? fileName(lead.file_path)}</h3>
+									</div>
+									<span class="text-xs text-[color:var(--ink-muted)]">{group.length} episode plan{group.length === 1 ? '' : 's'}</span>
+								</div>
+								<p class="mb-4 text-sm text-[color:var(--ink-muted)]">Approve or reject the pending AI plans for this entire show in one step.</p>
+
+								<div class="mb-3 rounded-lg border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.5)] p-3">
+									<div class="section-label mb-2">Episodes in Bundle</div>
+									<div class="space-y-2">
+										{#each group.slice(0, 6) as job (job.id)}
+											<div class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2">
+												<div class="flex items-center justify-between gap-3">
+													<div class="min-w-0">
+														<div class="truncate text-sm font-semibold text-[color:var(--ink-strong)]">{fileName(job.file_path)}</div>
+														<div class="mt-1 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{job.file_path}</div>
+													</div>
+													<div class="flex flex-wrap justify-end gap-1.5">
+														{#each summarizeProbe(job.probe) as detail (detail)}
+															<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel)] px-2 py-0.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]">{detail}</span>
+														{/each}
+													</div>
+												</div>
+											</div>
+										{/each}
+										{#if group.length > 6}
+											<p class="text-xs text-[color:var(--ink-muted)]">+{group.length - 6} more episode plan{group.length - 6 === 1 ? '' : 's'} in this show.</p>
+										{/if}
+									</div>
+								</div>
+
+								<div class="mb-4 rounded-lg border-l-[3px] border-[color:var(--accent-soft)] bg-[color:rgba(214,180,111,0.08)] px-3 py-2">
+									<p class="mb-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-[color:var(--accent-deep)]">Representative AI rationale</p>
+									<p class="text-xs text-[color:var(--ink-muted)]">{lead.decision?.rationale ?? 'No AI rationale available.'}</p>
+								</div>
+
+								<details class="mb-4 rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.5)] px-3 py-2">
+									<summary class="cursor-pointer text-xs font-semibold uppercase tracking-[0.14em] text-[color:var(--ink-muted)]">Representative FFmpeg plan</summary>
+									<pre class="mt-2 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-[color:var(--ink-strong)]">{formatCommand(lead)}</pre>
+								</details>
+
+								{#if groupError(group)}
+									<p class="mb-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{groupError(group)}</p>
+								{/if}
+
+								<div class="flex gap-2">
+									<button class="flex-1 rounded-lg bg-[color:var(--accent)] px-3 py-2 text-xs font-semibold text-white disabled:opacity-60" onclick={() => runGroupAction(group, 'approve_group')} disabled={groupBusy(group)}>
+										{actionBusy[lead.id] === 'approve_group' ? 'Approving Show…' : 'Approve Show'}
+									</button>
+									<button class="rounded-lg border border-[color:var(--line)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-muted)] disabled:opacity-60" onclick={() => runGroupAction(group, 'reject_group')} disabled={groupBusy(group)}>
+										{actionBusy[lead.id] === 'reject_group' ? 'Rejecting Show…' : 'Reject Show'}
+									</button>
+								</div>
+							</div>
+						{/each}
+					</div>
+				</div>
+			{/if}
+
+			{#if standaloneReviewJobs.length > 0}
+				<div>
+					<div class="mb-3 flex items-center gap-3">
+						<h3 class="text-base text-[color:var(--ink-strong)]">Individual File Plans</h3>
+						<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-[color:var(--accent-deep)]">{standaloneReviewJobs.length}</span>
+					</div>
+					<div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+						{#each standaloneReviewJobs as job (job.id)}
+							<div class="triage-card">
+								<div class="mb-3 flex items-center justify-between gap-2">
+									<span class="rounded-full bg-[color:rgba(164,79,45,0.1)] px-2.5 py-1 text-[11px] font-bold uppercase tracking-[0.16em] text-[color:var(--accent-deep)]">AI Plan</span>
+									<span class="text-xs text-[color:var(--ink-muted)]">#{job.id}</span>
+								</div>
+								<h3 class="mb-1 truncate text-sm font-semibold text-[color:var(--ink-strong)]">{fileName(job.file_path)}</h3>
+								<p class="mb-4 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{job.file_path}</p>
+
+								<div class="mb-3 rounded-lg border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.5)] p-3">
+									<div class="section-label mb-2">Source Analysis</div>
+									{#if job.probe}
+										<div class="flex flex-wrap gap-2">
+											{#each summarizeProbe(job.probe) as detail (detail)}
+												<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]">{detail}</span>
+											{/each}
+										</div>
+									{:else}
+										<p class="text-xs text-[color:var(--ink-muted)]">Probe data is not available yet.</p>
+									{/if}
+								</div>
+
+								<div class="mb-4 rounded-lg border-l-[3px] border-[color:var(--accent-soft)] bg-[color:rgba(214,180,111,0.08)] px-3 py-2">
+									<p class="mb-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-[color:var(--accent-deep)]">AI rationale</p>
+									<p class="text-xs text-[color:var(--ink-muted)]">{job.decision?.rationale ?? 'No AI rationale available.'}</p>
+								</div>
+
+								<details class="mb-4 rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.5)] px-3 py-2">
+									<summary class="cursor-pointer text-xs font-semibold uppercase tracking-[0.14em] text-[color:var(--ink-muted)]">Generated FFmpeg plan</summary>
+									<pre class="mt-2 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-[color:var(--ink-strong)]">{formatCommand(job)}</pre>
+								</details>
+
+								{#if actionErrors[job.id]}
+									<p class="mb-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{actionErrors[job.id]}</p>
+								{/if}
+
+								<div class="flex gap-2">
+									<button class="flex-1 rounded-lg bg-[color:var(--accent)] px-3 py-2 text-xs font-semibold text-white disabled:opacity-60" onclick={() => runAction(job.id, 'approve')} disabled={actionBusy[job.id] !== null && actionBusy[job.id] !== undefined}>
+										{actionBusy[job.id] === 'approve' ? 'Approving…' : 'Approve'}
+									</button>
+									<button class="rounded-lg border border-[color:var(--line)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-muted)] disabled:opacity-60" onclick={() => runAction(job.id, 'reject')} disabled={actionBusy[job.id] !== null && actionBusy[job.id] !== undefined}>
+										{actionBusy[job.id] === 'reject' ? 'Rejecting…' : 'Reject'}
+									</button>
+								</div>
+							</div>
+						{/each}
+					</div>
+				</div>
+			{/if}
 		{/if}
 	</section>
 

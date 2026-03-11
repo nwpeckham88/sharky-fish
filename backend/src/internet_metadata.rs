@@ -57,7 +57,10 @@ struct SearchCandidate {
     parsed_year: Option<u16>,
 }
 
-pub async fn lookup_for_library_path(config: &AppConfig, relative_path: &str) -> Result<InternetMetadataResponse> {
+pub async fn lookup_for_library_path(
+    config: &AppConfig,
+    relative_path: &str,
+) -> Result<InternetMetadataResponse> {
     lookup_for_library_path_with_query(config, relative_path, None).await
 }
 
@@ -66,7 +69,10 @@ pub async fn lookup_for_library_path_with_query(
     relative_path: &str,
     query_override: Option<&str>,
 ) -> Result<InternetMetadataResponse> {
-    let search_candidates = if let Some(query) = query_override.map(str::trim).filter(|value| !value.is_empty()) {
+    let search_candidates = if let Some(query) = query_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         vec![build_search_candidate(query)]
     } else {
         extract_search_candidates(relative_path)
@@ -123,7 +129,15 @@ pub async fn lookup_for_library_path_with_query(
                     let mut provider_matches = Vec::new();
                     let mut provider_warning = None;
                     for candidate in &search_candidates {
-                        match lookup_omdb(&client, key, &candidate.query, candidate.parsed_year, media_hint.as_deref()).await {
+                        match lookup_omdb(
+                            &client,
+                            key,
+                            &candidate.query,
+                            candidate.parsed_year,
+                            media_hint.as_deref(),
+                        )
+                        .await
+                        {
                             Ok(found) if !found.is_empty() => {
                                 provider_matches = found;
                                 break;
@@ -189,7 +203,10 @@ pub async fn lookup_for_library_path_with_query(
         parsed_year,
         media_hint,
         provider_used: provider_order.first().cloned(),
-        search_candidates: search_candidates.into_iter().map(|candidate| candidate.query).collect(),
+        search_candidates: search_candidates
+            .into_iter()
+            .map(|candidate| candidate.query)
+            .collect(),
         providers,
         matches,
         warnings,
@@ -219,7 +236,11 @@ fn extract_search_candidates(relative_path: &str) -> Vec<SearchCandidate> {
     if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
         raw_candidates.push(stem.to_string());
     }
-    if let Some(parent) = path.parent().and_then(|value| value.file_name()).and_then(|value| value.to_str()) {
+    if let Some(parent) = path
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())
+    {
         raw_candidates.push(parent.to_string());
     }
     if let Some(grandparent) = path
@@ -237,7 +258,13 @@ fn extract_search_candidates(relative_path: &str) -> Vec<SearchCandidate> {
         let Some((query, parsed_year)) = normalize_title_and_year(&raw) else {
             continue;
         };
-        let key = format!("{}|{}", query.to_ascii_lowercase(), parsed_year.map(|value| value.to_string()).unwrap_or_default());
+        let key = format!(
+            "{}|{}",
+            query.to_ascii_lowercase(),
+            parsed_year
+                .map(|value| value.to_string())
+                .unwrap_or_default()
+        );
         if seen.insert(key) {
             candidates.push(SearchCandidate { query, parsed_year });
         }
@@ -258,7 +285,10 @@ fn build_search_candidate(value: &str) -> SearchCandidate {
 }
 
 fn normalize_title_and_year(input: &str) -> Option<(String, Option<u16>)> {
-    let stem = input.rsplit_once('.').map(|(left, _)| left).unwrap_or(input);
+    let stem = input
+        .rsplit_once('.')
+        .map(|(left, _)| left)
+        .unwrap_or(input);
 
     let cleaned = stem
         .replace('.', " ")
@@ -399,7 +429,9 @@ fn dedupe_matches(matches: &mut Vec<InternetMetadataMatch>) {
             "{}|{}|{}|{}|{}",
             item.provider,
             item.imdb_id.clone().unwrap_or_default(),
-            item.tvdb_id.map(|value| value.to_string()).unwrap_or_default(),
+            item.tvdb_id
+                .map(|value| value.to_string())
+                .unwrap_or_default(),
             item.title.to_ascii_lowercase(),
             item.year.map(|value| value.to_string()).unwrap_or_default(),
         );
@@ -523,7 +555,9 @@ async fn lookup_omdb(
         .map(|item| InternetMetadataMatch {
             provider: "omdb".into(),
             title: item.title.unwrap_or_else(|| query.to_string()),
-            year: item.year.and_then(|value| value.split(' ').next().and_then(|v| v.parse::<u16>().ok())),
+            year: item
+                .year
+                .and_then(|value| value.split(' ').next().and_then(|v| v.parse::<u16>().ok())),
             media_kind: item.media_type.unwrap_or_else(|| "unknown".into()),
             imdb_id: item.imdb_id.clone(),
             tvdb_id: None,
@@ -531,7 +565,9 @@ async fn lookup_omdb(
             rating: None,
             genres: Vec::new(),
             poster_url: item.poster.filter(|value| value != "N/A"),
-            source_url: item.imdb_id.map(|id| format!("https://www.imdb.com/title/{}/", id)),
+            source_url: item
+                .imdb_id
+                .map(|id| format!("https://www.imdb.com/title/{}/", id)),
         })
         .collect())
 }
@@ -636,7 +672,10 @@ async fn lookup_tvdb(
                 .slug
                 .as_ref()
                 .map(|slug| format!("https://thetvdb.com/{}", slug.trim_start_matches('/')))
-                .or_else(|| item.tvdb_id.map(|id| format!("https://thetvdb.com/dereferrer/series/{}", id)));
+                .or_else(|| {
+                    item.tvdb_id
+                        .map(|id| format!("https://thetvdb.com/dereferrer/series/{}", id))
+                });
 
             matches.push(InternetMetadataMatch {
                 provider: "tvdb".into(),

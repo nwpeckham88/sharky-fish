@@ -2,6 +2,9 @@ export interface Job {
 	id: number;
 	file_path: string;
 	status: string;
+	group_key: string | null;
+	group_label: string | null;
+	group_kind: string;
 	created_at: string;
 	probe: MediaProbe | null;
 	decision: JobDecision | null;
@@ -428,11 +431,27 @@ export async function approveJob(id: number): Promise<void> {
 	}
 }
 
+export async function approveJobGroup(id: number): Promise<void> {
+	const res = await fetch(`${BASE}/jobs/${id}/approve-group`, { method: 'POST' });
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to approve TV show group for job ${id}: ${res.status}`);
+	}
+}
+
 export async function rejectJob(id: number): Promise<void> {
 	const res = await fetch(`${BASE}/jobs/${id}/reject`, { method: 'POST' });
 	if (!res.ok) {
 		const text = await res.text();
 		throw new Error(text || `Failed to reject job ${id}: ${res.status}`);
+	}
+}
+
+export async function rejectJobGroup(id: number): Promise<void> {
+	const res = await fetch(`${BASE}/jobs/${id}/reject-group`, { method: 'POST' });
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to reject TV show group for job ${id}: ${res.status}`);
 	}
 }
 

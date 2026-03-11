@@ -1,6 +1,6 @@
-use anyhow::Result;
-use crate::messages::{MediaProbe, ProcessingDecision};
 use crate::internet_metadata::InternetMetadataMatch;
+use crate::messages::{MediaProbe, ProcessingDecision};
+use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{FromRow, Row, SqlitePool};
 use std::path::Path;
@@ -35,6 +35,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+
+    ensure_column(pool, "jobs", "group_key", "TEXT").await?;
+    ensure_column(pool, "jobs", "group_label", "TEXT").await?;
+    ensure_column(pool, "jobs", "group_kind", "TEXT NOT NULL DEFAULT 'file'").await?;
 
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS tasks (
@@ -225,6 +229,26 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+async fn ensure_column(
+    pool: &SqlitePool,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<()> {
+    let pragma = format!("PRAGMA table_info({table})");
+    let rows = sqlx::query(&pragma).fetch_all(pool).await?;
+    let exists = rows
+        .iter()
+        .any(|row| row.try_get::<String, _>("name").ok().as_deref() == Some(column));
+    if exists {
+        return Ok(());
+    }
+
+    let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {definition}");
+    sqlx::query(&alter).execute(pool).await?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Data access helpers
 // ---------------------------------------------------------------------------
@@ -234,6 +258,9 @@ pub struct Job {
     pub id: i64,
     pub file_path: String,
     pub status: String,
+    pub group_key: Option<String>,
+    pub group_label: Option<String>,
+    pub group_kind: String,
     pub created_at: String,
 }
 
@@ -242,6 +269,9 @@ pub struct JobWithAnalysis {
     pub id: i64,
     pub file_path: String,
     pub status: String,
+    pub group_key: Option<String>,
+    pub group_label: Option<String>,
+    pub group_kind: String,
     pub created_at: String,
     pub probe: Option<MediaProbe>,
     pub decision: Option<ProcessingDecision>,
@@ -382,10 +412,22 @@ pub struct ManagedItemRow {
 }
 
 /// Insert a new job and return its id.
-pub async fn insert_job(pool: &SqlitePool, file_path: &str, status: &str) -> Result<i64> {
-    let id = sqlx::query("INSERT INTO jobs (file_path, status) VALUES (?, ?)")
+pub async fn insert_job(
+    pool: &SqlitePool,
+    file_path: &str,
+    status: &str,
+    group_key: Option<&str>,
+    group_label: Option<&str>,
+    group_kind: &str,
+) -> Result<i64> {
+    let id = sqlx::query(
+		"INSERT INTO jobs (file_path, status, group_key, group_label, group_kind) VALUES (?, ?, ?, ?, ?)",
+	)
         .bind(file_path)
         .bind(status)
+        .bind(group_key)
+        .bind(group_label)
+        .bind(group_kind)
         .execute(pool)
         .await?
         .last_insert_rowid();
@@ -451,7 +493,7 @@ pub async fn update_job_status(pool: &SqlitePool, job_id: i64, status: &str) -> 
 
 pub async fn fetch_job(pool: &SqlitePool, job_id: i64) -> Result<Option<Job>> {
     let row = sqlx::query_as::<_, Job>(
-        "SELECT id, file_path, status, created_at FROM jobs WHERE id = ?",
+		"SELECT id, file_path, status, group_key, group_label, COALESCE(group_kind, 'file') AS group_kind, created_at FROM jobs WHERE id = ?",
     )
     .bind(job_id)
     .fetch_optional(pool)
@@ -462,7 +504,7 @@ pub async fn fetch_job(pool: &SqlitePool, job_id: i64) -> Result<Option<Job>> {
 
 pub async fn fetch_active_job_for_path(pool: &SqlitePool, file_path: &str) -> Result<Option<Job>> {
     let row = sqlx::query_as::<_, Job>(
-        "SELECT id, file_path, status, created_at
+                "SELECT id, file_path, status, group_key, group_label, COALESCE(group_kind, 'file') AS group_kind, created_at
          FROM jobs
          WHERE file_path = ?
            AND status IN ('AWAITING_APPROVAL', 'APPROVED', 'PROCESSING')
@@ -476,9 +518,26 @@ pub async fn fetch_active_job_for_path(pool: &SqlitePool, file_path: &str) -> Re
     Ok(row)
 }
 
-pub async fn fetch_job_with_analysis(pool: &SqlitePool, job_id: i64) -> Result<Option<JobWithAnalysis>> {
+pub async fn fetch_jobs_for_group(pool: &SqlitePool, group_key: &str) -> Result<Vec<Job>> {
+    let rows = sqlx::query_as::<_, Job>(
+        "SELECT id, file_path, status, group_key, group_label, COALESCE(group_kind, 'file') AS group_kind, created_at
+         FROM jobs
+         WHERE group_key = ?
+         ORDER BY created_at DESC, id DESC",
+    )
+    .bind(group_key)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+pub async fn fetch_job_with_analysis(
+    pool: &SqlitePool,
+    job_id: i64,
+) -> Result<Option<JobWithAnalysis>> {
     let row = sqlx::query(
-        "SELECT j.id, j.file_path, j.status, j.created_at, a.probe_json, a.decision_json
+        "SELECT j.id, j.file_path, j.status, j.group_key, j.group_label, COALESCE(j.group_kind, 'file') AS group_kind, j.created_at, a.probe_json, a.decision_json
          FROM jobs j
          LEFT JOIN job_analysis a ON a.job_id = j.id
          WHERE j.id = ?",
@@ -504,6 +563,9 @@ pub async fn fetch_job_with_analysis(pool: &SqlitePool, job_id: i64) -> Result<O
         id: row.try_get("id")?,
         file_path: row.try_get("file_path")?,
         status: row.try_get("status")?,
+        group_key: row.try_get("group_key")?,
+        group_label: row.try_get("group_label")?,
+        group_kind: row.try_get("group_kind")?,
         created_at: row.try_get("created_at")?,
         probe,
         decision,
@@ -529,7 +591,7 @@ pub async fn update_task(
 /// Fetch approved jobs ordered by creation time.
 pub async fn fetch_ready_jobs(pool: &SqlitePool, limit: i64) -> Result<Vec<Job>> {
     let rows = sqlx::query_as::<_, Job>(
-        "SELECT id, file_path, status, created_at FROM jobs WHERE status = 'APPROVED' ORDER BY created_at ASC LIMIT ?"
+		"SELECT id, file_path, status, group_key, group_label, COALESCE(group_kind, 'file') AS group_kind, created_at FROM jobs WHERE status = 'APPROVED' ORDER BY created_at ASC LIMIT ?"
     )
     .bind(limit)
     .fetch_all(pool)
@@ -551,7 +613,7 @@ pub async fn fetch_tasks_for_job(pool: &SqlitePool, job_id: i64) -> Result<Vec<T
 /// Fetch jobs that were interrupted mid-processing (for resumption on startup).
 pub async fn fetch_resumable_jobs(pool: &SqlitePool) -> Result<Vec<Job>> {
     let rows = sqlx::query_as::<_, Job>(
-        "SELECT id, file_path, status, created_at FROM jobs WHERE status = 'PROCESSING' ORDER BY created_at ASC"
+		"SELECT id, file_path, status, group_key, group_label, COALESCE(group_kind, 'file') AS group_kind, created_at FROM jobs WHERE status = 'PROCESSING' ORDER BY created_at ASC"
     )
     .fetch_all(pool)
     .await?;
@@ -561,7 +623,7 @@ pub async fn fetch_resumable_jobs(pool: &SqlitePool) -> Result<Vec<Job>> {
 /// List jobs with pagination.
 pub async fn list_jobs(pool: &SqlitePool, limit: i64, offset: i64) -> Result<Vec<JobWithAnalysis>> {
     let rows = sqlx::query(
-        "SELECT j.id, j.file_path, j.status, j.created_at, a.probe_json, a.decision_json
+        "SELECT j.id, j.file_path, j.status, j.group_key, j.group_label, COALESCE(j.group_kind, 'file') AS group_kind, j.created_at, a.probe_json, a.decision_json
          FROM jobs j
          LEFT JOIN job_analysis a ON a.job_id = j.id
          ORDER BY j.created_at DESC
@@ -587,6 +649,9 @@ pub async fn list_jobs(pool: &SqlitePool, limit: i64, offset: i64) -> Result<Vec
             id: row.try_get("id")?,
             file_path: row.try_get("file_path")?,
             status: row.try_get("status")?,
+            group_key: row.try_get("group_key")?,
+            group_label: row.try_get("group_label")?,
+            group_kind: row.try_get("group_kind")?,
             created_at: row.try_get("created_at")?,
             probe,
             decision,
@@ -596,7 +661,10 @@ pub async fn list_jobs(pool: &SqlitePool, limit: i64, offset: i64) -> Result<Vec
     Ok(jobs)
 }
 
-pub async fn fetch_media_metadata(pool: &SqlitePool, file_path: &str) -> Result<Option<CachedMediaMetadata>> {
+pub async fn fetch_media_metadata(
+    pool: &SqlitePool,
+    file_path: &str,
+) -> Result<Option<CachedMediaMetadata>> {
     let row = sqlx::query_as::<_, CachedMediaMetadata>(
         "SELECT file_path, size_bytes, modified_at, format, duration_secs, video_codec, audio_codec, width, height, audio_channels, stream_count, probe_json, updated_at
          FROM media_metadata WHERE file_path = ?",
@@ -615,8 +683,14 @@ pub async fn upsert_media_metadata(
     modified_at: u64,
     probe: &MediaProbe,
 ) -> Result<()> {
-    let video_stream = probe.streams.iter().find(|stream| stream.codec_type == "video");
-    let audio_stream = probe.streams.iter().find(|stream| stream.codec_type == "audio");
+    let video_stream = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type == "video");
+    let audio_stream = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type == "audio");
     let probe_json = serde_json::to_string(probe)?;
 
     sqlx::query(
@@ -647,7 +721,11 @@ pub async fn upsert_media_metadata(
     .bind(audio_stream.map(|stream| stream.codec_name.clone()))
     .bind(video_stream.and_then(|stream| stream.width).map(i64::from))
     .bind(video_stream.and_then(|stream| stream.height).map(i64::from))
-    .bind(audio_stream.and_then(|stream| stream.channels).map(i64::from))
+    .bind(
+        audio_stream
+            .and_then(|stream| stream.channels)
+            .map(i64::from),
+    )
     .bind(probe.streams.len() as i64)
     .bind(probe_json)
     .execute(pool)
@@ -841,7 +919,9 @@ pub async fn delete_library_index_entry(pool: &SqlitePool, relative_path: &str) 
 }
 
 pub async fn clear_library_index(pool: &SqlitePool) -> Result<()> {
-    sqlx::query("DELETE FROM library_index").execute(pool).await?;
+    sqlx::query("DELETE FROM library_index")
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -979,7 +1059,11 @@ pub async fn update_library_scan_progress(
     Ok(())
 }
 
-pub async fn complete_library_scan(pool: &SqlitePool, completed_at: u64, scanned_items: usize) -> Result<()> {
+pub async fn complete_library_scan(
+    pool: &SqlitePool,
+    completed_at: u64,
+    scanned_items: usize,
+) -> Result<()> {
     sqlx::query(
         "UPDATE library_scan_state
          SET status = 'idle', scanned_items = ?, total_items = ?,
@@ -1019,7 +1103,10 @@ pub async fn fail_library_scan(
     Ok(())
 }
 
-pub async fn fetch_managed_item(pool: &SqlitePool, relative_path: &str) -> Result<Option<ManagedItemRow>> {
+pub async fn fetch_managed_item(
+    pool: &SqlitePool,
+    relative_path: &str,
+) -> Result<Option<ManagedItemRow>> {
     let row = sqlx::query_as::<_, ManagedItemRow>(
         "SELECT relative_path, file_path, file_name, media_type, size_bytes, modified_at,
                 library_id, managed_status, selected_metadata_json, last_decision_json,

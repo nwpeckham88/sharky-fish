@@ -8,7 +8,7 @@ use sqlx::SqlitePool;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{info, warn};
 
 /// The Watcher actor monitors the ingest directory for new media files via
@@ -52,10 +52,9 @@ impl WatcherActor {
         let _watcher = tokio::task::spawn_blocking(move || -> Result<RecommendedWatcher> {
             let _ = std::fs::create_dir_all(&ingest_path);
             let _ = std::fs::create_dir_all(&library_path);
-            let mut watcher =
-                notify::recommended_watcher(move |res: notify::Result<Event>| {
-                    let _ = notify_tx.blocking_send(res);
-                })?;
+            let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
+                let _ = notify_tx.blocking_send(res);
+            })?;
             watcher.watch(&ingest_path, RecursiveMode::Recursive)?;
             if library_path != ingest_path {
                 watcher.watch(&library_path, RecursiveMode::Recursive)?;

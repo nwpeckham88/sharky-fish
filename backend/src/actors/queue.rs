@@ -1,5 +1,5 @@
-use crate::db;
 use crate::config::AppConfig;
+use crate::db;
 use crate::managed_items;
 use crate::messages::IdentifiedMedia;
 use crate::messages::{QueueMsg, QueuedJob};
@@ -7,7 +7,7 @@ use anyhow::Result;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{info, warn};
 
 use crate::messages::SseEvent;
@@ -19,6 +19,9 @@ pub async fn enqueue_job(
     media: &IdentifiedMedia,
     decision: &mut crate::messages::ProcessingDecision,
     initial_status_override: Option<&str>,
+    group_key: Option<&str>,
+    group_label: Option<&str>,
+    group_kind: &str,
 ) -> Result<i64> {
     let file_path = media.path.to_string_lossy().to_string();
     let initial_status = initial_status_override.unwrap_or(if auto_approve {
@@ -27,7 +30,15 @@ pub async fn enqueue_job(
         "AWAITING_APPROVAL"
     });
 
-    let job_id = db::insert_job(pool, &file_path, initial_status).await?;
+    let job_id = db::insert_job(
+        pool,
+        &file_path,
+        initial_status,
+        group_key,
+        group_label,
+        group_kind,
+    )
+    .await?;
     decision.job_id = job_id;
     db::upsert_job_analysis(pool, job_id, &media.probe, decision).await?;
 
@@ -56,6 +67,9 @@ pub async fn enqueue_job(
         job_id,
         file_path: file_path.clone(),
         status: initial_status.into(),
+        group_key: group_key.map(str::to_string),
+        group_label: group_label.map(str::to_string),
+        group_kind: group_kind.into(),
     });
 
     info!(job_id, file = %file_path, "queue: job enqueued");
@@ -95,7 +109,10 @@ impl QueueActor {
 
         while let Some(msg) = self.rx.recv().await {
             match msg {
-                QueueMsg::Enqueue { media, mut decision } => {
+                QueueMsg::Enqueue {
+                    media,
+                    mut decision,
+                } => {
                     if let Err(e) = self.handle_enqueue(&media, &mut decision).await {
                         warn!(err = %e, "queue: enqueue failed");
                     }
@@ -123,11 +140,46 @@ impl QueueActor {
         media: &crate::messages::IdentifiedMedia,
         decision: &mut crate::messages::ProcessingDecision,
     ) -> Result<()> {
-        let auto_approve = {
+        let (auto_approve, data_path, config) = {
             let cfg = self.config.read().await;
-            cfg.auto_approve_ai_jobs
+            (
+                cfg.auto_approve_ai_jobs,
+                PathBuf::from(&cfg.data_path),
+                cfg.clone(),
+            )
         };
-        enqueue_job(&self.pool, &self.sse_tx, auto_approve, media, decision, None).await?;
+
+        let group = if let Ok(relative_path) = media.path.strip_prefix(&data_path) {
+            if let Some(relative_path) = relative_path.to_str() {
+                managed_items::resolve_job_group(
+                    &self.pool,
+                    &config,
+                    &relative_path.replace('\\', "/"),
+                )
+                .await
+                .ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        enqueue_job(
+            &self.pool,
+            &self.sse_tx,
+            auto_approve,
+            media,
+            decision,
+            None,
+            group.as_ref().map(|value| value.key.as_str()),
+            group.as_ref().map(|value| value.label.as_str()),
+            group
+                .as_ref()
+                .map(|value| value.kind.as_str())
+                .unwrap_or("file"),
+        )
+        .await?;
         Ok(())
     }
 
@@ -144,7 +196,10 @@ impl QueueActor {
             return;
         };
 
-        let Ok(relative_path) = PathBuf::from(&job.file_path).strip_prefix(&data_path).map(|v| v.to_path_buf()) else {
+        let Ok(relative_path) = PathBuf::from(&job.file_path)
+            .strip_prefix(&data_path)
+            .map(|v| v.to_path_buf())
+        else {
             return;
         };
 

@@ -38,8 +38,9 @@ pub async fn preview_or_apply(
     let current_relative_str = current_relative.to_string_lossy().replace('\\', "/");
     let scope = request.scope.as_deref().unwrap_or("file");
 
-    let library_folder = resolve_library_folder(config, &current_relative_str, request.library_id.as_deref())
-        .context("unable to resolve library folder for path")?;
+    let library_folder =
+        resolve_library_folder(config, &current_relative_str, request.library_id.as_deref())
+            .context("unable to resolve library folder for path")?;
 
     let extension = current_relative
         .extension()
@@ -53,7 +54,13 @@ pub async fn preview_or_apply(
             request.season,
             request.episode,
         )?;
-        build_tv_target(&library_folder.path, &request.selected, season, episode, &extension)
+        build_tv_target(
+            &library_folder.path,
+            &request.selected,
+            season,
+            episode,
+            &extension,
+        )
     } else {
         build_movie_target(&library_folder.path, &request.selected, &extension)
     };
@@ -61,25 +68,34 @@ pub async fn preview_or_apply(
     let target_relative = sanitize_relative_path(&target_relative)?;
     let target_relative_str = target_relative.to_string_lossy().replace('\\', "/");
 
-    let (changed, target_exists, conflict_path) = if scope == "movie_folder" && library_folder.media_type == "movie" {
-        let source_container = current_relative
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(PathBuf::new);
-        let source_container_str = source_container.to_string_lossy().replace('\\', "/");
-        let target_container = movie_target_container(&library_folder.path, &request.selected);
-        let target_container = sanitize_relative_path(&target_container)?;
-        let target_container_str = target_container.to_string_lossy().replace('\\', "/");
-        let target_container_abs = library_root.join(&target_container);
-        let changed = source_container_str != target_container_str;
-        let target_exists = changed && target_container_abs.exists();
-        (changed, target_exists, target_exists.then_some(target_container_str))
-    } else {
-        let changed = current_relative_str != target_relative_str;
-        let target_abs = library_root.join(&target_relative);
-        let target_exists = changed && target_abs.exists();
-        (changed, target_exists, target_exists.then_some(target_relative_str.clone()))
-    };
+    let (changed, target_exists, conflict_path) =
+        if scope == "movie_folder" && library_folder.media_type == "movie" {
+            let source_container = current_relative
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(PathBuf::new);
+            let source_container_str = source_container.to_string_lossy().replace('\\', "/");
+            let target_container = movie_target_container(&library_folder.path, &request.selected);
+            let target_container = sanitize_relative_path(&target_container)?;
+            let target_container_str = target_container.to_string_lossy().replace('\\', "/");
+            let target_container_abs = library_root.join(&target_container);
+            let changed = source_container_str != target_container_str;
+            let target_exists = changed && target_container_abs.exists();
+            (
+                changed,
+                target_exists,
+                target_exists.then_some(target_container_str),
+            )
+        } else {
+            let changed = current_relative_str != target_relative_str;
+            let target_abs = library_root.join(&target_relative);
+            let target_exists = changed && target_abs.exists();
+            (
+                changed,
+                target_exists,
+                target_exists.then_some(target_relative_str.clone()),
+            )
+        };
 
     if apply && changed {
         let source_abs = library_root.join(&current_relative);
@@ -135,7 +151,10 @@ pub async fn preview_or_apply(
 
 pub fn movie_target_container(library_prefix: &str, selected: &InternetMetadataMatch) -> String {
     let title = sanitize_segment(&selected.title);
-    let year = selected.year.map(|value| value.to_string()).unwrap_or_else(|| "0000".into());
+    let year = selected
+        .year
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "0000".into());
     format!("{}/{} ({})", trim_slashes(library_prefix), title, year)
 }
 
@@ -157,7 +176,8 @@ pub fn preview_target_relative_path(
         .unwrap_or_default();
 
     let target_relative = if library_folder.media_type == "tv" {
-        let (season, episode) = infer_or_validate_episode_numbers(&current_relative_str, None, None)?;
+        let (season, episode) =
+            infer_or_validate_episode_numbers(&current_relative_str, None, None)?;
         build_tv_target(&library_folder.path, selected, season, episode, &extension)
     } else {
         build_movie_target(&library_folder.path, selected, &extension)
@@ -208,26 +228,42 @@ async fn apply_movie_folder_organization(
         }
         tokio::fs::rename(&source_dir_abs, &target_dir_abs)
             .await
-            .with_context(|| format!("failed to rename '{}' to '{}'", source_dir_abs.display(), target_dir_abs.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to rename '{}' to '{}'",
+                    source_dir_abs.display(),
+                    target_dir_abs.display()
+                )
+            })?;
         rename_matching_sidecars_in_dir(&target_dir_abs, &source_stem, &target_stem).await?;
         return Ok(());
     }
 
     if !merge_existing {
-        anyhow::bail!("target folder already exists: {}", target_dir_relative.display());
+        anyhow::bail!(
+            "target folder already exists: {}",
+            target_dir_relative.display()
+        );
     }
 
-    merge_movie_folder_contents(&source_dir_abs, &target_dir_abs, &source_stem, &target_stem).await?;
+    merge_movie_folder_contents(&source_dir_abs, &target_dir_abs, &source_stem, &target_stem)
+        .await?;
     Ok(())
 }
 
-async fn rename_sidecar_for_file(library_root: &Path, current_relative: &Path, target_relative: &Path) -> Result<()> {
+async fn rename_sidecar_for_file(
+    library_root: &Path,
+    current_relative: &Path,
+    target_relative: &Path,
+) -> Result<()> {
     let current_relative = current_relative.to_string_lossy().replace('\\', "/");
     let target_relative = target_relative.to_string_lossy().replace('\\', "/");
-    let Some(current_sidecar) = sidecar::sidecar_absolute_path(library_root, &current_relative) else {
+    let Some(current_sidecar) = sidecar::sidecar_absolute_path(library_root, &current_relative)
+    else {
         return Ok(());
     };
-    let Some(target_sidecar) = sidecar::sidecar_absolute_path(library_root, &target_relative) else {
+    let Some(target_sidecar) = sidecar::sidecar_absolute_path(library_root, &target_relative)
+    else {
         return Ok(());
     };
 
@@ -244,12 +280,22 @@ async fn rename_sidecar_for_file(library_root: &Path, current_relative: &Path, t
 
     tokio::fs::rename(&current_sidecar, &target_sidecar)
         .await
-        .with_context(|| format!("failed to rename '{}' to '{}'", current_sidecar.display(), target_sidecar.display()))?;
+        .with_context(|| {
+            format!(
+                "failed to rename '{}' to '{}'",
+                current_sidecar.display(),
+                target_sidecar.display()
+            )
+        })?;
 
     Ok(())
 }
 
-async fn rename_matching_sidecars_in_dir(dir_abs: &Path, source_stem: &str, target_stem: &str) -> Result<()> {
+async fn rename_matching_sidecars_in_dir(
+    dir_abs: &Path,
+    source_stem: &str,
+    target_stem: &str,
+) -> Result<()> {
     let mut entries = tokio::fs::read_dir(dir_abs).await?;
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
@@ -270,7 +316,13 @@ async fn rename_matching_sidecars_in_dir(dir_abs: &Path, source_stem: &str, targ
         }
         tokio::fs::rename(&path, &dest_path)
             .await
-            .with_context(|| format!("failed to rename '{}' to '{}'", path.display(), dest_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to rename '{}' to '{}'",
+                    path.display(),
+                    dest_path.display()
+                )
+            })?;
     }
     Ok(())
 }
@@ -294,10 +346,21 @@ async fn merge_movie_folder_contents(
         }
         tokio::fs::rename(&path, &dest_path)
             .await
-            .with_context(|| format!("failed to merge '{}' into '{}'", path.display(), dest_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "failed to merge '{}' into '{}'",
+                    path.display(),
+                    dest_path.display()
+                )
+            })?;
     }
 
-    if tokio::fs::read_dir(source_dir_abs).await?.next_entry().await?.is_none() {
+    if tokio::fs::read_dir(source_dir_abs)
+        .await?
+        .next_entry()
+        .await?
+        .is_none()
+    {
         let _ = tokio::fs::remove_dir(source_dir_abs).await;
     }
     Ok(())
@@ -333,14 +396,26 @@ fn resolve_library_folder<'a>(
     })
 }
 
-fn build_movie_target(library_prefix: &str, selected: &InternetMetadataMatch, extension: &str) -> String {
+fn build_movie_target(
+    library_prefix: &str,
+    selected: &InternetMetadataMatch,
+    extension: &str,
+) -> String {
     let title = sanitize_segment(&selected.title);
-    let year = selected.year.map(|v| v.to_string()).unwrap_or_else(|| "0000".into());
+    let year = selected
+        .year
+        .map(|v| v.to_string())
+        .unwrap_or_else(|| "0000".into());
     let movie_dir = format!("{} ({})", title, year);
     let file_name = format!("{} ({})", title, year);
 
     if extension.is_empty() {
-        format!("{}/{}/{}", trim_slashes(library_prefix), movie_dir, file_name)
+        format!(
+            "{}/{}/{}",
+            trim_slashes(library_prefix),
+            movie_dir,
+            file_name
+        )
     } else {
         format!(
             "{}/{}/{}.{}",
@@ -364,7 +439,13 @@ fn build_tv_target(
     let episode_name = format!("{} - S{:02}E{:02}", show, season, episode);
 
     if extension.is_empty() {
-        format!("{}/{}/{}/{}", trim_slashes(library_prefix), show, season_dir, episode_name)
+        format!(
+            "{}/{}/{}/{}",
+            trim_slashes(library_prefix),
+            show,
+            season_dir,
+            episode_name
+        )
     } else {
         format!(
             "{}/{}/{}/{}.{}",
@@ -411,8 +492,14 @@ fn parse_sxxexx(input: &str) -> Option<(u32, u32)> {
             continue;
         }
 
-        let season = std::str::from_utf8(&bytes[i + 1..=i + 2]).ok()?.parse().ok()?;
-        let episode = std::str::from_utf8(&bytes[i + 4..=i + 5]).ok()?.parse().ok()?;
+        let season = std::str::from_utf8(&bytes[i + 1..=i + 2])
+            .ok()?
+            .parse()
+            .ok()?;
+        let episode = std::str::from_utf8(&bytes[i + 4..=i + 5])
+            .ok()?
+            .parse()
+            .ok()?;
         return Some((season, episode));
     }
 

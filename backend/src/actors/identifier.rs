@@ -1,9 +1,9 @@
-use crate::metadata::probe_media;
 use crate::messages::{IdentifiedMedia, IngestEvent};
+use crate::metadata::probe_media;
 use anyhow::Result;
-use tokio::sync::{mpsc, Semaphore};
-use tracing::{info, warn};
 use std::sync::Arc;
+use tokio::sync::{Semaphore, mpsc};
+use tracing::{info, warn};
 
 /// The Identifier actor receives raw ingest events from the Watcher, runs
 /// `ffprobe` to extract media metadata, and forwards the result to the Brain.
@@ -19,7 +19,11 @@ impl IdentifierActor {
         tx: mpsc::Sender<IdentifiedMedia>,
         io_semaphore: Arc<Semaphore>,
     ) -> Self {
-        Self { rx, tx, io_semaphore }
+        Self {
+            rx,
+            tx,
+            io_semaphore,
+        }
     }
 
     pub async fn run(mut self) -> Result<()> {

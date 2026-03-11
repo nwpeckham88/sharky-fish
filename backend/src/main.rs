@@ -5,8 +5,8 @@ mod internet_metadata;
 mod library;
 mod library_index;
 mod managed_items;
-mod metadata;
 mod messages;
+mod metadata;
 mod organizer;
 mod server;
 mod sidecar;
@@ -16,14 +16,14 @@ use crate::actors::{
     watcher::WatcherActor,
 };
 use crate::config::AppConfig;
-use crate::metadata::prewarm_recent_library_metadata;
 use crate::messages::{IdentifiedMedia, IngestEvent, QueueMsg, SseEvent};
-use crate::server::{build_router, AppState};
+use crate::metadata::prewarm_recent_library_metadata;
+use crate::server::{AppState, build_router};
 
 use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::{broadcast, mpsc, RwLock, Semaphore};
+use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 use tracing::info;
 
 #[tokio::main]
@@ -36,8 +36,7 @@ async fn main() -> Result<()> {
         .init();
 
     // Load configuration.
-    let config_path =
-        std::env::var("SHARKY_CONFIG_PATH").unwrap_or_else(|_| "/config".into());
+    let config_path = std::env::var("SHARKY_CONFIG_PATH").unwrap_or_else(|_| "/config".into());
     let cfg = AppConfig::load(&config_path);
     info!(port = cfg.port, "sharky-fish starting");
 
@@ -104,7 +103,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    let queue = QueueActor::new(queue_rx, pool.clone(), sse_tx.clone(), shared_config.clone());
+    let queue = QueueActor::new(
+        queue_rx,
+        pool.clone(),
+        sse_tx.clone(),
+        shared_config.clone(),
+    );
     tokio::spawn(async move {
         if let Err(e) = queue.run().await {
             tracing::error!(err = %e, "queue actor crashed");
@@ -160,7 +164,9 @@ async fn main() -> Result<()> {
         library_path,
         ingest_path,
         config: shared_config,
-        bulk_metadata_request_limiter: Arc::new(Semaphore::new(cfg.bulk_metadata_max_inflight.max(1))),
+        bulk_metadata_request_limiter: Arc::new(Semaphore::new(
+            cfg.bulk_metadata_max_inflight.max(1),
+        )),
     };
     let app = build_router(state);
     let addr = format!("0.0.0.0:{}", port);

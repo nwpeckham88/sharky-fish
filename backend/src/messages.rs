@@ -79,10 +79,7 @@ pub enum QueueMsg {
         reply: oneshot::Sender<Option<QueuedJob>>,
     },
     /// A job has finished (success or failure).
-    Complete {
-        job_id: i64,
-        success: bool,
-    },
+    Complete { job_id: i64, success: bool },
 }
 
 /// A fully-resolved job ready for the Forge.
@@ -145,7 +142,14 @@ pub struct LibraryIndexScanProgress {
 #[serde(tag = "type")]
 pub enum SseEvent {
     #[serde(rename = "job_created")]
-    JobCreated { job_id: i64, file_path: String, status: String },
+    JobCreated {
+        job_id: i64,
+        file_path: String,
+        status: String,
+        group_key: Option<String>,
+        group_label: Option<String>,
+        group_kind: String,
+    },
     #[serde(rename = "job_status")]
     JobStatus { job_id: i64, status: String },
     #[serde(rename = "library_change")]
