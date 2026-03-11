@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let queue = QueueActor::new(queue_rx, pool.clone());
+    let queue = QueueActor::new(queue_rx, pool.clone(), sse_tx.clone(), shared_config.clone());
     tokio::spawn(async move {
         if let Err(e) = queue.run().await {
             tracing::error!(err = %e, "queue actor crashed");

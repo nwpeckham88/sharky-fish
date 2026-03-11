@@ -23,8 +23,10 @@
 
 	function statusTone(status: string): string {
 		switch (status) {
+			case 'APPROVED': return 'processing';
 			case 'COMPLETED': return 'completed';
 			case 'FAILED': return 'failed';
+			case 'REJECTED': return 'failed';
 			case 'PROCESSING': return 'processing';
 			default: return '';
 		}
@@ -43,7 +45,8 @@
 		statusFilter === 'all' ? jobs : jobs.filter((j) => j.status === statusFilter)
 	);
 	const jobCounts = $derived({
-		pending: jobs.filter((j) => j.status === 'PENDING').length,
+		review: jobs.filter((j) => j.status === 'AWAITING_APPROVAL').length,
+		ready: jobs.filter((j) => j.status === 'APPROVED').length,
 		processing: jobs.filter((j) => j.status === 'PROCESSING').length,
 		completed: jobs.filter((j) => j.status === 'COMPLETED').length,
 		failed: jobs.filter((j) => j.status === 'FAILED').length,
@@ -57,8 +60,9 @@
 </div>
 
 <!-- Stats -->
-<section class="mb-5 grid gap-3 grid-cols-4">
-	<div class="stat-card"><div class="section-label">Pending</div><div class="mt-1 text-2xl font-semibold text-[color:var(--accent-deep)]">{jobCounts.pending}</div></div>
+<section class="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+	<div class="stat-card"><div class="section-label">AI Review</div><div class="mt-1 text-2xl font-semibold text-[color:var(--accent-deep)]">{jobCounts.review}</div></div>
+	<div class="stat-card"><div class="section-label">Ready</div><div class="mt-1 text-2xl font-semibold text-[color:var(--accent)]">{jobCounts.ready}</div></div>
 	<div class="stat-card"><div class="section-label">Processing</div><div class="mt-1 text-2xl font-semibold text-[color:var(--accent)]">{jobCounts.processing}</div></div>
 	<div class="stat-card"><div class="section-label">Completed</div><div class="mt-1 text-2xl font-semibold text-[color:var(--olive)]">{jobCounts.completed}</div></div>
 	<div class="stat-card"><div class="section-label">Failed</div><div class="mt-1 text-2xl font-semibold text-[color:var(--danger)]">{jobCounts.failed}</div></div>
@@ -104,7 +108,7 @@
 		<div class="mb-3 flex items-center justify-between gap-3">
 			<h2 class="text-lg text-[color:var(--ink-strong)]">Job Queue</h2>
 			<div class="flex gap-1.5 rounded-xl border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-1">
-				{#each ['all', 'PENDING', 'PROCESSING', 'COMPLETED', 'FAILED'] as s (s)}
+				{#each ['all', 'AWAITING_APPROVAL', 'APPROVED', 'PROCESSING', 'COMPLETED', 'FAILED', 'REJECTED'] as s (s)}
 					<button class="rounded-lg px-3 py-1.5 text-[11px] font-semibold uppercase tracking-[0.1em] transition-colors {statusFilter === s ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => { statusFilter = s; }}>{s === 'all' ? 'All' : s.slice(0, 4)}</button>
 				{/each}
 			</div>

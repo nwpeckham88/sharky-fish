@@ -88,8 +88,10 @@
 
 	function statusTone(status: string): string {
 		switch (status) {
+			case 'APPROVED': return 'processing';
 			case 'COMPLETED': return 'completed';
 			case 'FAILED': return 'failed';
+			case 'REJECTED': return 'failed';
 			case 'PROCESSING': return 'processing';
 			default: return '';
 		}
@@ -99,7 +101,8 @@
 	const progress = progressStore;
 	const loading = $derived(jobStore.loading || localLoading);
 
-	const pending = $derived(jobs.filter((job) => job.status === 'PENDING').length);
+	const awaitingApproval = $derived(jobs.filter((job) => job.status === 'AWAITING_APPROVAL').length);
+	const ready = $derived(jobs.filter((job) => job.status === 'APPROVED').length);
 	const processing = $derived(jobs.filter((job) => job.status === 'PROCESSING').length);
 	const completed = $derived(jobs.filter((job) => job.status === 'COMPLETED').length);
 	const failed = $derived(jobs.filter((job) => job.status === 'FAILED').length);
@@ -120,8 +123,8 @@
 	</div>
 	<div class="stat-card">
 		<div class="section-label">Queue</div>
-		<div class="metric-value mt-2">{pending + processing}</div>
-		<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{pending} pending · {processing} active</div>
+		<div class="metric-value mt-2">{awaitingApproval + ready + processing}</div>
+		<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{awaitingApproval} review · {ready} ready · {processing} active</div>
 	</div>
 	<div class="stat-card">
 		<div class="section-label">Processed</div>

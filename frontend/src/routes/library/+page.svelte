@@ -6,9 +6,12 @@
 		triggerLibraryRescan,
 		fetchLibraryMetadata,
 		fetchLibraryInternetMetadata,
+		searchLibraryInternetMetadata,
 		fetchLibraryInternetMetadataBulk,
 		saveSelectedLibraryInternetMetadata,
 		fetchSelectedLibraryInternetMetadata,
+		fetchRelatedLibraryInternetMetadataPaths,
+		organizeLibraryFile,
 		fetchLibraryEvents,
 		fetchLibraries,
 		type LibraryEntry,
@@ -36,9 +39,15 @@
 	let internetMetadata = $state<InternetMetadataResponse | null>(null);
 	let internetMetadataLoading = $state(false);
 	let internetMetadataError = $state('');
+	let manualMetadataQuery = $state('');
 	let selectedInternetMatch = $state<InternetMetadataMatch | null>(null);
+	let relatedPaths = $state<string[]>([]);
 	let internetSaveLoading = $state(false);
 	let internetSaveError = $state('');
+	let organizePreview = $state<import('$lib/api').OrganizeLibraryResult | null>(null);
+	let organizeLoading = $state(false);
+	let organizeError = $state('');
+	let organizeStatus = $state('');
 	let bulkInternetLoading = $state(false);
 	let bulkInternetStatus = $state('');
 	let libraryLoading = $state(true);
@@ -158,8 +167,13 @@
 		metadataError = '';
 		internetMetadata = null;
 		internetMetadataError = '';
+		manualMetadataQuery = '';
 		selectedInternetMatch = null;
+		relatedPaths = [];
 		internetSaveError = '';
+		organizePreview = null;
+		organizeError = '';
+		organizeStatus = '';
 		metadataLoading = true;
 		try {
 			const [metadata, selected] = await Promise.all([
@@ -168,6 +182,10 @@
 			]);
 			selectedMetadata = metadata;
 			selectedInternetMatch = selected?.selected ?? null;
+			if (selected?.selected) {
+				const related = await fetchRelatedLibraryInternetMetadataPaths(item.relative_path).catch(() => ({ paths: [] }));
+				relatedPaths = related.paths;
+			}
 		} catch (error) {
 			metadataError = error instanceof Error ? error.message : 'Metadata fetch failed';
 		} finally {
@@ -176,17 +194,30 @@
 	}
 
 	async function loadInternetMetadata(item: LibraryEntry) {
+		await runInternetLookup(item, null);
+	}
+
+	async function runInternetLookup(item: LibraryEntry, queryOverride: string | null) {
 		internetMetadataLoading = true;
 		internetMetadataError = '';
 		internetSaveError = '';
+		organizePreview = null;
+		organizeError = '';
 		internetMetadata = null;
 		try {
-			internetMetadata = await fetchLibraryInternetMetadata(item.relative_path);
+			internetMetadata = queryOverride && queryOverride.trim()
+				? await searchLibraryInternetMetadata(item.relative_path, queryOverride.trim())
+				: await fetchLibraryInternetMetadata(item.relative_path);
 		} catch (error) {
 			internetMetadataError = error instanceof Error ? error.message : 'Internet metadata lookup failed';
 		} finally {
 			internetMetadataLoading = false;
 		}
+	}
+
+	async function runManualInternetLookup() {
+		if (!selectedItem) return;
+		await runInternetLookup(selectedItem, manualMetadataQuery);
 	}
 
 	function matchesSelected(match: InternetMetadataMatch): boolean {
@@ -204,13 +235,66 @@
 		if (!selectedItem) return;
 		internetSaveLoading = true;
 		internetSaveError = '';
+		organizePreview = null;
+		organizeError = '';
+		organizeStatus = '';
 		try {
 			const saved = await saveSelectedLibraryInternetMetadata(selectedItem.relative_path, match);
 			selectedInternetMatch = saved.selected;
+			const related = await fetchRelatedLibraryInternetMetadataPaths(selectedItem.relative_path).catch(() => ({ paths: [] }));
+			relatedPaths = related.paths;
 		} catch (error) {
 			internetSaveError = error instanceof Error ? error.message : 'Failed to save selected match';
 		} finally {
 			internetSaveLoading = false;
+		}
+	}
+
+	async function previewCanonicalRename() {
+		if (!selectedItem || !selectedInternetMatch) return;
+		organizeLoading = true;
+		organizeError = '';
+		organizeStatus = '';
+		try {
+			organizePreview = await organizeLibraryFile({
+				path: selectedItem.relative_path,
+				library_id: selectedItem.library_id ?? undefined,
+				selected: selectedInternetMatch,
+				scope: 'movie_folder',
+				apply: false
+			});
+		} catch (error) {
+			organizeError = error instanceof Error ? error.message : 'Preview failed';
+		} finally {
+			organizeLoading = false;
+		}
+	}
+
+	async function applyCanonicalRename(mergeExisting = false) {
+		if (!selectedItem || !selectedInternetMatch) return;
+		organizeLoading = true;
+		organizeError = '';
+		organizeStatus = '';
+		try {
+			const result = await organizeLibraryFile({
+				path: selectedItem.relative_path,
+				library_id: selectedItem.library_id ?? undefined,
+				selected: selectedInternetMatch,
+				scope: 'movie_folder',
+				merge_existing: mergeExisting,
+				apply: true
+			});
+			organizePreview = result;
+			organizeStatus = result.changed ? 'Library item renamed to the canonical target.' : 'Library item already matches the canonical target.';
+			await loadLibrary();
+			const updated = library.find((item) => item.relative_path === result.target_relative_path) ?? null;
+			if (updated) {
+				await loadMetadata(updated);
+			}
+		} catch (error) {
+			organizeError = error instanceof Error ? error.message : 'Apply failed';
+		} finally {
+			organizeLoading = false;
 		}
 	}
 
@@ -393,6 +477,10 @@
 	function activeLibraryName(): string {
 		if (!activeLibraryId) return 'All Libraries';
 		return libraryFolders.find((l) => l.id === activeLibraryId)?.name ?? 'Unknown';
+	}
+
+	function providerLabel(provider: string): string {
+		return provider.toUpperCase();
 	}
 </script>
 
@@ -610,6 +698,18 @@
 								</button>
 							</div>
 						<p class="mt-0.5 break-all font-mono text-[11px] text-[color:var(--ink-muted)]">{selectedMetadata.relative_path}</p>
+						<div class="mt-3 flex flex-wrap gap-2">
+							<input
+								class="min-w-[16rem] flex-1 rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]"
+								type="search"
+								placeholder="Override metadata search query"
+								bind:value={manualMetadataQuery}
+								onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void runManualInternetLookup(); } }}
+							/>
+							<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={runManualInternetLookup} disabled={internetMetadataLoading || !manualMetadataQuery.trim()}>
+								Search Override
+							</button>
+						</div>
 					</div>
 					<div class="grid gap-2 sm:grid-cols-2">
 						<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
@@ -697,9 +797,22 @@
 						<div class="mb-2 flex items-center justify-between">
 							<div class="section-label">Internet Metadata</div>
 						</div>
+						{#if internetMetadata?.search_candidates?.length}
+							<div class="mb-2 rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.45)] px-3 py-2 text-[11px] text-[color:var(--ink-muted)]">
+								Search candidates: <span class="font-semibold text-[color:var(--ink-strong)]">{internetMetadata.search_candidates.join(' -> ')}</span>
+							</div>
+						{/if}
 						{#if selectedInternetMatch}
 							<div class="mb-2 rounded-lg border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-3 py-2 text-xs text-[color:var(--olive)]">
 								Selected: <span class="font-semibold">{selectedInternetMatch.title}{selectedInternetMatch.year ? ` (${selectedInternetMatch.year})` : ''}</span> via {selectedInternetMatch.provider}
+							</div>
+						{/if}
+						{#if relatedPaths.length > 0}
+							<div class="mb-2 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">
+								<div class="mb-1 font-semibold uppercase tracking-[0.12em]">Related Library Paths</div>
+								{#each relatedPaths as path (path)}
+									<div class="font-mono text-[11px] text-[color:var(--ink-strong)]">{path}</div>
+								{/each}
 							</div>
 						{/if}
 						{#if internetSaveError}
@@ -710,6 +823,23 @@
 						{:else if internetMetadataLoading}
 							<div class="text-xs text-[color:var(--ink-muted)]">Querying provider…</div>
 						{:else if internetMetadata}
+							{#if internetMetadata.providers.length > 0}
+								<div class="mb-2 grid gap-2 sm:grid-cols-2">
+									{#each internetMetadata.providers as provider (provider.provider)}
+										<div class="rounded-lg border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.45)] px-3 py-2 text-[11px] text-[color:var(--ink-muted)]">
+											<div class="flex items-center justify-between gap-2">
+												<span class="font-semibold uppercase tracking-[0.12em] text-[color:var(--ink-strong)]">{providerLabel(provider.provider)}</span>
+												<span>{provider.match_count} match{provider.match_count === 1 ? '' : 'es'}</span>
+											</div>
+											{#if provider.warning}
+												<div class="mt-1 text-[color:var(--danger)]">{provider.warning}</div>
+											{:else if provider.match_count === 0}
+												<div class="mt-1">No matches returned.</div>
+											{/if}
+										</div>
+									{/each}
+								</div>
+							{/if}
 							{#if internetMetadata.provider_used}
 								<div class="mb-2 text-[11px] text-[color:var(--ink-muted)]">Searched: <span class="font-semibold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]">{internetMetadata.provider_used}</span></div>
 							{/if}
@@ -748,6 +878,45 @@
 							{/if}
 						{:else}
 							<div class="text-xs text-[color:var(--ink-muted)]">Lookup with OMDb (IMDb-backed) and TVDB using your configured API keys.</div>
+						{/if}
+
+						{#if selectedInternetMatch && selectedItem.library_id}
+							<div class="mt-3 rounded-lg border border-[color:var(--line)] px-3 py-2.5">
+								<div class="mb-2 flex items-center justify-between gap-2">
+									<div class="section-label">Canonical Rename</div>
+									<span class="text-[11px] text-[color:var(--ink-muted)]">Library: {libraryFolders.find((library) => library.id === selectedItem?.library_id)?.name ?? selectedItem?.library_id}</span>
+								</div>
+								<div class="flex flex-wrap gap-2">
+									<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={previewCanonicalRename} disabled={organizeLoading}>
+										{organizeLoading ? 'Working…' : 'Preview Canonical Rename'}
+									</button>
+									<button class="rounded-lg bg-[color:var(--accent)] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50" onclick={() => applyCanonicalRename(false)} disabled={organizeLoading || organizePreview?.target_exists}>
+										Apply Rename
+									</button>
+									{#if organizePreview?.target_exists}
+										<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => applyCanonicalRename(true)} disabled={organizeLoading}>
+											Merge Into Existing Folder
+										</button>
+									{/if}
+								</div>
+								{#if organizePreview}
+									<div class="mt-3 rounded-lg bg-[color:rgba(244,236,223,0.55)] px-3 py-2 text-xs">
+										<div class="text-[color:var(--ink-muted)]">Current</div>
+										<div class="break-all font-mono text-[color:var(--ink-strong)]">{organizePreview.current_relative_path}</div>
+										<div class="mt-2 text-[color:var(--ink-muted)]">Target</div>
+										<div class="break-all font-mono text-[color:var(--ink-strong)]">{organizePreview.target_relative_path}</div>
+										{#if organizePreview.target_exists}
+											<div class="mt-2 text-[color:var(--danger)]">A file already exists at the canonical target. This usually means the same movie already exists in another folder.</div>
+										{/if}
+									</div>
+								{/if}
+								{#if organizeError}
+									<div class="mt-2 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{organizeError}</div>
+								{/if}
+								{#if organizeStatus}
+									<div class="mt-2 rounded-lg border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-3 py-2 text-xs text-[color:var(--olive)]">{organizeStatus}</div>
+								{/if}
+							</div>
 						{/if}
 					</div>
 				</div>

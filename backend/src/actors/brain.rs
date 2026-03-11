@@ -6,6 +6,43 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
 use tracing::{info, warn};
 
+pub async fn test_llm_connection(llm_config: &LlmConfig) -> Result<String> {
+    let system_prompt = "You validate API connectivity and must return strict JSON.";
+    let user_prompt = "Return JSON exactly like {\"status\":\"ok\",\"message\":\"connection verified\"}.";
+    let client = reqwest::Client::new();
+
+    let (url, body) = match llm_config.provider.as_str() {
+        "google" => build_google_request(llm_config, system_prompt, user_prompt, 0.0),
+        "openai" => build_openai_request(llm_config, system_prompt, user_prompt, 0.0),
+        "ollama" => build_ollama_request(llm_config, system_prompt, user_prompt, 0.0),
+        other => anyhow::bail!("unsupported LLM provider: {other}"),
+    };
+
+    let mut req = client.post(&url).json(&body);
+    if llm_config.provider == "google" {
+        let Some(key) = llm_config.api_key.as_deref().filter(|value| !value.trim().is_empty()) else {
+            anyhow::bail!("Google AI API key is required");
+        };
+        req = req.header("x-goog-api-key", key);
+    } else if llm_config.provider == "openai" {
+        let Some(key) = llm_config.api_key.as_deref().filter(|value| !value.trim().is_empty()) else {
+            anyhow::bail!("OpenAI API key is required");
+        };
+        req = req.bearer_auth(key);
+    }
+
+    let resp = req.send().await.context("LLM HTTP request failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("LLM API returned {status}: {text}");
+    }
+
+    let json: serde_json::Value = resp.json().await?;
+    let content = extract_llm_content(&json)?;
+    Ok(content.to_string())
+}
+
 /// The Brain actor receives identified media from the Identifier, consults the
 /// LLM to determine optimal processing parameters, and enqueues jobs via the
 /// Queue actor.
@@ -64,6 +101,11 @@ impl BrainActor {
         let probe_json = serde_json::to_string_pretty(&media.probe)?;
         let cfg = self.config.read().await;
         let standards = &cfg.golden_standards;
+        let system_prompt = if cfg.system_prompt.trim().is_empty() {
+            SYSTEM_PROMPT.to_string()
+        } else {
+            cfg.system_prompt.trim().to_string()
+        };
 
         let subtitle_summary = {
             let sub_streams: Vec<_> = media.probe.streams.iter()
@@ -112,7 +154,7 @@ impl BrainActor {
 
         let mut temperature = 0.1_f64;
         for attempt in 0..3 {
-            match self.call_llm(&user_prompt, temperature).await {
+            match self.call_llm(&system_prompt, &user_prompt, temperature).await {
                 Ok(decision) => return Ok(decision),
                 Err(e) => {
                     warn!(attempt, err = %e, "brain: LLM call failed, retrying");
@@ -123,15 +165,25 @@ impl BrainActor {
         anyhow::bail!("LLM failed after 3 attempts");
     }
 
-    async fn call_llm(&self, user_prompt: &str, temperature: f64) -> Result<ProcessingDecision> {
+    async fn call_llm(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+        temperature: f64,
+    ) -> Result<ProcessingDecision> {
         let (url, body) = match self.llm_config.provider.as_str() {
-            "openai" => self.build_openai_request(user_prompt, temperature),
-            "ollama" => self.build_ollama_request(user_prompt, temperature),
+            "google" => build_google_request(&self.llm_config, system_prompt, user_prompt, temperature),
+            "openai" => build_openai_request(&self.llm_config, system_prompt, user_prompt, temperature),
+            "ollama" => build_ollama_request(&self.llm_config, system_prompt, user_prompt, temperature),
             other => anyhow::bail!("unsupported LLM provider: {other}"),
         };
 
         let mut req = self.client.post(&url).json(&body);
-        if let Some(key) = &self.llm_config.api_key {
+        if self.llm_config.provider == "google" {
+            if let Some(key) = &self.llm_config.api_key {
+                req = req.header("x-goog-api-key", key);
+            }
+        } else if let Some(key) = &self.llm_config.api_key {
             req = req.bearer_auth(key);
         }
 
@@ -146,50 +198,8 @@ impl BrainActor {
         self.parse_llm_response(&json)
     }
 
-    fn build_openai_request(
-        &self,
-        user_prompt: &str,
-        temperature: f64,
-    ) -> (String, serde_json::Value) {
-        let url = format!("{}/chat/completions", self.llm_config.base_url);
-        let body = serde_json::json!({
-            "model": self.llm_config.model,
-            "temperature": temperature,
-            "response_format": { "type": "json_object" },
-            "messages": [
-                { "role": "system", "content": SYSTEM_PROMPT },
-                { "role": "user", "content": user_prompt }
-            ]
-        });
-        (url, body)
-    }
-
-    fn build_ollama_request(
-        &self,
-        user_prompt: &str,
-        temperature: f64,
-    ) -> (String, serde_json::Value) {
-        let url = format!("{}/api/chat", self.llm_config.base_url);
-        let body = serde_json::json!({
-            "model": self.llm_config.model,
-            "stream": false,
-            "format": "json",
-            "options": { "temperature": temperature },
-            "messages": [
-                { "role": "system", "content": SYSTEM_PROMPT },
-                { "role": "user", "content": user_prompt }
-            ]
-        });
-        (url, body)
-    }
-
     fn parse_llm_response(&self, json: &serde_json::Value) -> Result<ProcessingDecision> {
-        // Extract the content string from the model response.
-        let content = json
-            .pointer("/choices/0/message/content")          // OpenAI
-            .or_else(|| json.pointer("/message/content"))   // Ollama
-            .and_then(|v| v.as_str())
-            .context("missing content in LLM response")?;
+        let content = extract_llm_content(json)?;
 
         let parsed: LlmOutput = serde_json::from_str(content)
             .context("failed to parse LLM JSON output")?;
@@ -232,6 +242,87 @@ impl BrainActor {
             rationale: "Fallback: CPU-based libx264/aac transcoding".into(),
         }
     }
+}
+
+fn build_openai_request(
+    llm_config: &LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+) -> (String, serde_json::Value) {
+    let url = format!("{}/chat/completions", llm_config.base_url);
+        let body = serde_json::json!({
+            "model": llm_config.model,
+            "temperature": temperature,
+            "response_format": { "type": "json_object" },
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": user_prompt }
+            ]
+        });
+    (url, body)
+}
+
+fn build_google_request(
+    llm_config: &LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+) -> (String, serde_json::Value) {
+        let url = format!(
+            "{}/models/{}:generateContent",
+            llm_config.base_url.trim_end_matches('/'),
+            llm_config.model
+        );
+        let body = serde_json::json!({
+            "systemInstruction": {
+                "parts": [
+                    { "text": system_prompt }
+                ]
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        { "text": user_prompt }
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": temperature,
+                "responseMimeType": "application/json"
+            }
+        });
+    (url, body)
+}
+
+fn build_ollama_request(
+    llm_config: &LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+) -> (String, serde_json::Value) {
+    let url = format!("{}/api/chat", llm_config.base_url);
+        let body = serde_json::json!({
+            "model": llm_config.model,
+            "stream": false,
+            "format": "json",
+            "options": { "temperature": temperature },
+            "messages": [
+                { "role": "system", "content": system_prompt },
+                { "role": "user", "content": user_prompt }
+            ]
+        });
+    (url, body)
+}
+
+fn extract_llm_content<'a>(json: &'a serde_json::Value) -> Result<&'a str> {
+    json
+        .pointer("/candidates/0/content/parts/0/text")
+        .or_else(|| json.pointer("/choices/0/message/content"))
+        .or_else(|| json.pointer("/message/content"))
+        .and_then(|value| value.as_str())
+        .context("missing content in LLM response")
 }
 
 #[derive(Deserialize)]

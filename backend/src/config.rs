@@ -41,6 +41,9 @@ pub struct AppConfig {
     /// System prompt sent to the LLM for ffmpeg command generation.
     #[serde(default)]
     pub system_prompt: String,
+    /// Whether AI-generated jobs should be auto-approved into the execution queue.
+    #[serde(default = "default_true")]
+    pub auto_approve_ai_jobs: bool,
     /// Named library folders within `data_path`.
     #[serde(default)]
     pub libraries: Vec<LibraryFolder>,
@@ -66,13 +69,13 @@ pub struct InternetMetadataConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlmConfig {
-    /// Provider: "openai" or "ollama".
+    /// Provider: "google", "openai" or "ollama".
     pub provider: String,
-    /// Base URL (e.g. "https://api.openai.com/v1" or "http://localhost:11434").
+    /// Base URL (e.g. "https://generativelanguage.googleapis.com/v1beta", "https://api.openai.com/v1" or "http://localhost:11434").
     pub base_url: String,
     /// Model identifier.
     pub model: String,
-    /// API key (required for OpenAI, ignored for Ollama).
+    /// API key (required for Google/OpenAI, ignored for Ollama).
     pub api_key: Option<String>,
 }
 
@@ -201,9 +204,9 @@ impl Default for AppConfig {
             config_path: "/config".into(),
             port: 3000,
             llm: LlmConfig {
-                provider: "ollama".into(),
-                base_url: "http://localhost:11434".into(),
-                model: "llama3".into(),
+                provider: "google".into(),
+                base_url: "https://generativelanguage.googleapis.com/v1beta".into(),
+                model: "gemini-3.1-flash-lite-preview".into(),
                 api_key: None,
             },
             max_io_concurrency: 4,
@@ -214,7 +217,8 @@ impl Default for AppConfig {
             bulk_metadata_concurrency: default_bulk_metadata_concurrency(),
             bulk_metadata_max_inflight: default_bulk_metadata_max_inflight(),
             golden_standards: GoldenStandards::default(),
-            system_prompt: String::new(),
+            system_prompt: SYSTEM_PROMPT_DEFAULT.into(),
+            auto_approve_ai_jobs: true,
             libraries: Vec::new(),
             internet_metadata: InternetMetadataConfig::default(),
         }
@@ -260,3 +264,30 @@ impl AppConfig {
         Ok(())
     }
 }
+
+const SYSTEM_PROMPT_DEFAULT: &str = "\
+You are an expert systems architect and media processing engine. \
+Your sole function is to generate highly optimized, syntactically valid FFmpeg \
+command arguments based on user requirements and host hardware capabilities. \
+The host environment utilizes a Debian Linux architecture and may expose \
+hardware acceleration depending on the configured host.\n\n\
+Constraints:\n\
+- Do not output the ffmpeg binary name; return only the exact argument array.\n\
+- Ensure all audio streams are evaluated for EBU R128 compliance. If \
+    normalization is required, flag it.\n\
+- Handle subtitle streams according to the provided subtitle standards:\n\
+    * mode=keep_all: copy all subtitle streams with -c:s copy.\n\
+    * mode=remove_all: map out all subtitle streams entirely (-sn).\n\
+    * mode=keep_preferred: use explicit -map 0:s:N for subtitle streams \
+        matching the preferred_languages list. If keep_forced is true, also \
+        include forced tracks in preferred languages even if they wouldn't \
+        otherwise match. If keep_sdh is true, include hearing-impaired tracks.\n\
+    * mode=keep_forced_only: strip all subtitle streams except those marked \
+        forced in the preferred languages.\n\
+- Copy subtitle codec unless the output container cannot hold the source \
+    format (e.g., ass/ssa going to mp4 should be converted to mov_text).\n\
+- Do not include hardcoded path names or file variables; use generic \
+    -i input.mkv and output.mp4 placeholders.\n\
+- You must strictly adhere to the provided JSON schema. Do not include \
+    markdown formatting, conversational text, thinking tokens, or preambles.\n\n\
+Output strictly as JSON: {\"arguments\": [...], \"requires_two_pass\": bool, \"rationale\": \"...\"}";

@@ -145,7 +145,7 @@ pub struct LibraryIndexScanProgress {
 #[serde(tag = "type")]
 pub enum SseEvent {
     #[serde(rename = "job_created")]
-    JobCreated { job_id: i64, file_path: String },
+    JobCreated { job_id: i64, file_path: String, status: String },
     #[serde(rename = "job_status")]
     JobStatus { job_id: i64, status: String },
     #[serde(rename = "library_change")]

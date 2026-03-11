@@ -23,3 +23,4 @@ frontend/.vite/
 # Coverage and temp
 coverage/
 tmp/
+Gaps.md

@@ -50,7 +50,14 @@ export const libraryState = $state<{
 export function handleSseEvent(event: SseEvent) {
 	if (event.type === 'job_created') {
 		jobStore.jobs = [
-			{ id: event.job_id, file_path: event.file_path, status: 'PENDING', created_at: new Date().toISOString() },
+			{
+				id: event.job_id,
+				file_path: event.file_path,
+				status: event.status,
+				created_at: new Date().toISOString(),
+				probe: null,
+				decision: null
+			},
 			...jobStore.jobs
 		];
 		return;

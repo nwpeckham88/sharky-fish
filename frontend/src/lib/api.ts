@@ -3,6 +3,21 @@ export interface Job {
 	file_path: string;
 	status: string;
 	created_at: string;
+	probe: MediaProbe | null;
+	decision: JobDecision | null;
+}
+
+export interface MediaProbe {
+	format: string;
+	duration_secs: number;
+	streams: MediaStreamInfo[];
+}
+
+export interface JobDecision {
+	job_id: number;
+	arguments: string[];
+	requires_two_pass: boolean;
+	rationale: string;
 }
 
 export interface Task {
@@ -119,8 +134,17 @@ export interface InternetMetadataResponse {
 	parsed_year: number | null;
 	media_hint: string | null;
 	provider_used: string | null;
+	search_candidates: string[];
+	providers: InternetMetadataProviderStatus[];
 	matches: InternetMetadataMatch[];
 	warnings: string[];
+}
+
+export interface InternetMetadataProviderStatus {
+	provider: string;
+	attempted: boolean;
+	match_count: number;
+	warning: string | null;
 }
 
 export interface InternetMetadataBulkItem {
@@ -149,6 +173,12 @@ export interface OrganizeLibraryResult {
 	target_relative_path: string;
 	changed: boolean;
 	applied: boolean;
+	target_exists: boolean;
+	conflict_path: string | null;
+}
+
+export interface RelatedInternetMetadataPathsResponse {
+	paths: string[];
 }
 
 export interface VideoStandards {
@@ -206,6 +236,7 @@ export interface AppConfig {
 	bulk_metadata_max_inflight: number;
 	golden_standards: GoldenStandards;
 	system_prompt: string;
+	auto_approve_ai_jobs: boolean;
 	libraries: LibraryFolder[];
 	internet_metadata: InternetMetadataConfig;
 }
@@ -215,6 +246,13 @@ export interface LibraryFolder {
 	name: string;
 	path: string;
 	media_type: 'movie' | 'tv';
+}
+
+export interface LlmTestResponse {
+	ok: boolean;
+	provider: string;
+	model: string;
+	message: string;
 }
 
 const BASE = '/api';
@@ -229,6 +267,22 @@ export async function fetchJob(id: number): Promise<{ job_id: number; tasks: Tas
 	const res = await fetch(`${BASE}/jobs/${id}`);
 	if (!res.ok) throw new Error(`Failed to fetch job ${id}: ${res.status}`);
 	return res.json();
+}
+
+export async function approveJob(id: number): Promise<void> {
+	const res = await fetch(`${BASE}/jobs/${id}/approve`, { method: 'POST' });
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to approve job ${id}: ${res.status}`);
+	}
+}
+
+export async function rejectJob(id: number): Promise<void> {
+	const res = await fetch(`${BASE}/jobs/${id}/reject`, { method: 'POST' });
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to reject job ${id}: ${res.status}`);
+	}
 }
 
 export async function fetchLibrary(
@@ -268,6 +322,13 @@ export async function fetchLibraryInternetMetadata(relativePath: string): Promis
 	return res.json();
 }
 
+export async function searchLibraryInternetMetadata(relativePath: string, queryOverride: string): Promise<InternetMetadataResponse> {
+	const params = new URLSearchParams({ path: relativePath, query: queryOverride });
+	const res = await fetch(`${BASE}/library/internet?${params.toString()}`);
+	if (!res.ok) throw new Error(`Failed to fetch internet metadata for ${relativePath}: ${res.status}`);
+	return res.json();
+}
+
 export async function fetchLibraryInternetMetadataBulk(paths: string[]): Promise<InternetMetadataBulkResponse> {
 	const res = await fetch(`${BASE}/library/internet/bulk`, {
 		method: 'POST',
@@ -296,6 +357,13 @@ export async function fetchSelectedLibraryInternetMetadata(path: string): Promis
 	return res.json();
 }
 
+export async function fetchRelatedLibraryInternetMetadataPaths(path: string): Promise<RelatedInternetMetadataPathsResponse> {
+	const params = new URLSearchParams({ path });
+	const res = await fetch(`${BASE}/library/internet/related?${params.toString()}`);
+	if (!res.ok) throw new Error(`Failed to fetch related internet metadata paths for ${path}: ${res.status}`);
+	return res.json();
+}
+
 export async function fetchLibraryEvents(limit = 24): Promise<LibraryChangeEvent[]> {
 	const params = new URLSearchParams({ limit: String(limit) });
 	const res = await fetch(`${BASE}/library/events?${params.toString()}`);
@@ -314,6 +382,8 @@ export async function organizeLibraryFile(input: {
 	selected?: InternetMetadataMatch;
 	season?: number;
 	episode?: number;
+	scope?: 'file' | 'movie_folder';
+	merge_existing?: boolean;
 	apply?: boolean;
 }): Promise<OrganizeLibraryResult> {
 	const res = await fetch(`${BASE}/library/organize`, {
@@ -344,6 +414,17 @@ export async function saveConfig(config: AppConfig): Promise<AppConfig> {
 	return res.json();
 }
 
+export async function testLlmConnection(llm: LlmConfig): Promise<LlmTestResponse> {
+	const res = await fetch(`${BASE}/config/llm/test`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(llm)
+	});
+	const data = await res.json();
+	if (!res.ok) throw new Error(data?.message || `Failed to test LLM connection: ${res.status}`);
+	return data;
+}
+
 export async function fetchHealth(): Promise<boolean> {
 	try {
 		const res = await fetch(`${BASE}/health`);
@@ -372,6 +453,19 @@ export async function addLibrary(folder: LibraryFolder): Promise<LibraryFolder> 
 	if (!res.ok) {
 		const text = await res.text();
 		throw new Error(text || `Failed to add library: ${res.status}`);
+	}
+	return res.json();
+}
+
+export async function updateLibrary(id: string, folder: LibraryFolder): Promise<LibraryFolder> {
+	const res = await fetch(`${BASE}/libraries/${encodeURIComponent(id)}`, {
+		method: 'PUT',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(folder)
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to update library: ${res.status}`);
 	}
 	return res.json();
 }

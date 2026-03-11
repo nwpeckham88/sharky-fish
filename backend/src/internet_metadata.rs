@@ -26,8 +26,18 @@ pub struct InternetMetadataResponse {
     pub parsed_year: Option<u16>,
     pub media_hint: Option<String>,
     pub provider_used: Option<String>,
+    pub search_candidates: Vec<String>,
+    pub providers: Vec<InternetMetadataProviderStatus>,
     pub matches: Vec<InternetMetadataMatch>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InternetMetadataProviderStatus {
+    pub provider: String,
+    pub attempted: bool,
+    pub match_count: usize,
+    pub warning: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -41,8 +51,37 @@ pub struct InternetMetadataBulkResponse {
     pub items: Vec<InternetMetadataBulkItem>,
 }
 
+#[derive(Debug, Clone)]
+struct SearchCandidate {
+    query: String,
+    parsed_year: Option<u16>,
+}
+
 pub async fn lookup_for_library_path(config: &AppConfig, relative_path: &str) -> Result<InternetMetadataResponse> {
-    let (query, parsed_year) = extract_title_and_year(relative_path);
+    lookup_for_library_path_with_query(config, relative_path, None).await
+}
+
+pub async fn lookup_for_library_path_with_query(
+    config: &AppConfig,
+    relative_path: &str,
+    query_override: Option<&str>,
+) -> Result<InternetMetadataResponse> {
+    let search_candidates = if let Some(query) = query_override.map(str::trim).filter(|value| !value.is_empty()) {
+        vec![build_search_candidate(query)]
+    } else {
+        extract_search_candidates(relative_path)
+    };
+    let (query, parsed_year) = search_candidates
+        .first()
+        .map(|candidate| (candidate.query.clone(), candidate.parsed_year))
+        .unwrap_or_else(|| {
+            let fallback = std::path::Path::new(relative_path)
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or(relative_path)
+                .to_string();
+            (fallback, None)
+        });
     let media_hint = infer_media_hint(config, relative_path);
 
     let client = Client::builder()
@@ -52,6 +91,7 @@ pub async fn lookup_for_library_path(config: &AppConfig, relative_path: &str) ->
 
     let mut matches: Vec<InternetMetadataMatch> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
+    let mut providers: Vec<InternetMetadataProviderStatus> = Vec::new();
 
     let omdb_key = config
         .internet_metadata
@@ -66,74 +106,159 @@ pub async fn lookup_for_library_path(config: &AppConfig, relative_path: &str) ->
         .map(str::trim)
         .filter(|k| !k.is_empty());
 
-    let selected_provider = choose_provider(
+    let provider_order = choose_provider_order(
         omdb_key.is_some(),
         tvdb_key.is_some(),
         &config.internet_metadata.default_provider,
     );
 
-    match selected_provider.as_deref() {
-        Some("omdb") => {
-            if let Some(key) = omdb_key {
-                match lookup_omdb(&client, key, &query, parsed_year, media_hint.as_deref()).await {
-                    Ok(mut found) => matches.append(&mut found),
-                    Err(e) => warnings.push(format!("OMDb lookup failed: {}", e)),
-                }
-            }
-        }
-        Some("tvdb") => {
-            if let Some(key) = tvdb_key {
-                match lookup_tvdb(
-                    &client,
-                    key,
-                    config.internet_metadata.tvdb_pin.as_deref(),
-                    &query,
-                    media_hint.as_deref(),
-                )
-                .await
-                {
-                    Ok(mut found) => matches.append(&mut found),
-                    Err(e) => warnings.push(format!("TVDB lookup failed: {}", e)),
-                }
-            }
-        }
-        None => warnings.push("No metadata provider API key configured".into()),
-        _ => warnings.push("Unknown default metadata provider configured".into()),
+    if provider_order.is_empty() {
+        warnings.push("No metadata provider API key configured".into());
     }
+
+    for provider in &provider_order {
+        match provider.as_str() {
+            "omdb" => {
+                if let Some(key) = omdb_key {
+                    let mut provider_matches = Vec::new();
+                    let mut provider_warning = None;
+                    for candidate in &search_candidates {
+                        match lookup_omdb(&client, key, &candidate.query, candidate.parsed_year, media_hint.as_deref()).await {
+                            Ok(found) if !found.is_empty() => {
+                                provider_matches = found;
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(error) => provider_warning = Some(error.to_string()),
+                        }
+                    }
+                    if let Some(warning) = provider_warning.clone() {
+                        warnings.push(format!("OMDb lookup failed: {}", warning));
+                    }
+                    providers.push(InternetMetadataProviderStatus {
+                        provider: "omdb".into(),
+                        attempted: true,
+                        match_count: provider_matches.len(),
+                        warning: provider_warning,
+                    });
+                    matches.extend(provider_matches);
+                }
+            }
+            "tvdb" => {
+                if let Some(key) = tvdb_key {
+                    let mut provider_matches = Vec::new();
+                    let mut provider_warning = None;
+                    for candidate in &search_candidates {
+                        match lookup_tvdb(
+                            &client,
+                            key,
+                            config.internet_metadata.tvdb_pin.as_deref(),
+                            &candidate.query,
+                            media_hint.as_deref(),
+                        )
+                        .await
+                        {
+                            Ok(found) if !found.is_empty() => {
+                                provider_matches = found;
+                                break;
+                            }
+                            Ok(_) => {}
+                            Err(error) => provider_warning = Some(error.to_string()),
+                        }
+                    }
+                    if let Some(warning) = provider_warning.clone() {
+                        warnings.push(format!("TVDB lookup failed: {}", warning));
+                    }
+                    providers.push(InternetMetadataProviderStatus {
+                        provider: "tvdb".into(),
+                        attempted: true,
+                        match_count: provider_matches.len(),
+                        warning: provider_warning,
+                    });
+                    matches.extend(provider_matches);
+                }
+            }
+            _ => warnings.push("Unknown default metadata provider configured".into()),
+        }
+    }
+
+    dedupe_matches(&mut matches);
 
     Ok(InternetMetadataResponse {
         query,
         parsed_year,
         media_hint,
-        provider_used: selected_provider,
+        provider_used: provider_order.first().cloned(),
+        search_candidates: search_candidates.into_iter().map(|candidate| candidate.query).collect(),
+        providers,
         matches,
         warnings,
     })
 }
 
-fn choose_provider(has_omdb: bool, has_tvdb: bool, configured_default: &str) -> Option<String> {
+fn choose_provider_order(has_omdb: bool, has_tvdb: bool, configured_default: &str) -> Vec<String> {
     match (has_omdb, has_tvdb) {
-        (false, false) => None,
-        (true, false) => Some("omdb".into()),
-        (false, true) => Some("tvdb".into()),
+        (false, false) => Vec::new(),
+        (true, false) => vec!["omdb".into()],
+        (false, true) => vec!["tvdb".into()],
         (true, true) => {
             let normalized = configured_default.trim().to_ascii_lowercase();
-            if normalized == "omdb" || normalized == "tvdb" {
-                Some(normalized)
+            if normalized == "tvdb" {
+                vec!["tvdb".into(), "omdb".into()]
             } else {
-                Some("omdb".into())
+                vec!["omdb".into(), "tvdb".into()]
             }
         }
     }
 }
 
-fn extract_title_and_year(relative_path: &str) -> (String, Option<u16>) {
-    let file_name = std::path::Path::new(relative_path)
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or(relative_path);
+fn extract_search_candidates(relative_path: &str) -> Vec<SearchCandidate> {
+    let path = std::path::Path::new(relative_path);
+    let mut raw_candidates = Vec::new();
 
-    let stem = file_name.rsplit_once('.').map(|(left, _)| left).unwrap_or(file_name);
+    if let Some(stem) = path.file_stem().and_then(|value| value.to_str()) {
+        raw_candidates.push(stem.to_string());
+    }
+    if let Some(parent) = path.parent().and_then(|value| value.file_name()).and_then(|value| value.to_str()) {
+        raw_candidates.push(parent.to_string());
+    }
+    if let Some(grandparent) = path
+        .parent()
+        .and_then(|value| value.parent())
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())
+    {
+        raw_candidates.push(grandparent.to_string());
+    }
+
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for raw in raw_candidates {
+        let Some((query, parsed_year)) = normalize_title_and_year(&raw) else {
+            continue;
+        };
+        let key = format!("{}|{}", query.to_ascii_lowercase(), parsed_year.map(|value| value.to_string()).unwrap_or_default());
+        if seen.insert(key) {
+            candidates.push(SearchCandidate { query, parsed_year });
+        }
+    }
+
+    candidates
+}
+
+fn build_search_candidate(value: &str) -> SearchCandidate {
+    if let Some((query, parsed_year)) = normalize_title_and_year(value) {
+        SearchCandidate { query, parsed_year }
+    } else {
+        SearchCandidate {
+            query: value.trim().to_string(),
+            parsed_year: None,
+        }
+    }
+}
+
+fn normalize_title_and_year(input: &str) -> Option<(String, Option<u16>)> {
+    let stem = input.rsplit_once('.').map(|(left, _)| left).unwrap_or(input);
 
     let cleaned = stem
         .replace('.', " ")
@@ -205,9 +330,9 @@ fn extract_title_and_year(relative_path: &str) -> (String, Option<u16>) {
 
     let query = normalized.trim();
     if query.is_empty() {
-        (stem.to_string(), year)
+        None
     } else {
-        (query.to_string(), year)
+        Some((query.to_string(), year))
     }
 }
 
@@ -267,6 +392,21 @@ fn infer_media_hint(config: &AppConfig, relative_path: &str) -> Option<String> {
     None
 }
 
+fn dedupe_matches(matches: &mut Vec<InternetMetadataMatch>) {
+    let mut seen = std::collections::HashSet::new();
+    matches.retain(|item| {
+        let key = format!(
+            "{}|{}|{}|{}|{}",
+            item.provider,
+            item.imdb_id.clone().unwrap_or_default(),
+            item.tvdb_id.map(|value| value.to_string()).unwrap_or_default(),
+            item.title.to_ascii_lowercase(),
+            item.year.map(|value| value.to_string()).unwrap_or_default(),
+        );
+        seen.insert(key)
+    });
+}
+
 #[derive(Debug, Deserialize)]
 struct OmdbResponse {
     #[serde(rename = "Response")]
@@ -296,66 +436,124 @@ async fn lookup_omdb(
     year: Option<u16>,
     media_hint: Option<&str>,
 ) -> Result<Vec<InternetMetadataMatch>> {
-    let mut params: Vec<(String, String)> = vec![
+    let mut exact_params: Vec<(String, String)> = vec![
         ("apikey".into(), api_key.to_string()),
         ("t".into(), query.to_string()),
         ("plot".into(), "short".into()),
     ];
 
     if let Some(y) = year {
-        params.push(("y".into(), y.to_string()));
+        exact_params.push(("y".into(), y.to_string()));
     }
     if let Some(kind) = media_hint {
         let t = if kind == "series" { "series" } else { "movie" };
-        params.push(("type".into(), t.to_string()));
+        exact_params.push(("type".into(), t.to_string()));
     }
 
     let response = client
         .get("https://www.omdbapi.com/")
-        .query(&params)
+        .query(&exact_params)
         .send()
         .await?
         .json::<OmdbResponse>()
         .await?;
 
-    if !response
+    if response
         .response
         .as_deref()
         .unwrap_or("False")
         .eq_ignore_ascii_case("true")
     {
-        return Ok(Vec::new());
+        let title = response.title.unwrap_or_else(|| query.to_string());
+        let year = response
+            .year
+            .as_deref()
+            .and_then(|v| v.split(' ').next())
+            .and_then(|v| v.parse::<u16>().ok());
+        let media_kind = response.media_type.unwrap_or_else(|| "unknown".into());
+        let genres = response
+            .genre
+            .unwrap_or_default()
+            .split(',')
+            .map(|g| g.trim().to_string())
+            .filter(|g| !g.is_empty())
+            .collect::<Vec<_>>();
+        let imdb_id = response.imdb_id.clone();
+
+        return Ok(vec![InternetMetadataMatch {
+            provider: "omdb".into(),
+            title,
+            year,
+            media_kind,
+            imdb_id: imdb_id.clone(),
+            tvdb_id: None,
+            overview: response.plot,
+            rating: response.imdb_rating.and_then(|v| v.parse::<f64>().ok()),
+            genres,
+            poster_url: response.poster.filter(|v| v != "N/A"),
+            source_url: imdb_id.map(|id| format!("https://www.imdb.com/title/{}/", id)),
+        }]);
     }
 
-    let title = response.title.unwrap_or_else(|| query.to_string());
-    let year = response
-        .year
-        .as_deref()
-        .and_then(|v| v.split(' ').next())
-        .and_then(|v| v.parse::<u16>().ok());
-    let media_kind = response.media_type.unwrap_or_else(|| "unknown".into());
-    let genres = response
-        .genre
-        .unwrap_or_default()
-        .split(',')
-        .map(|g| g.trim().to_string())
-        .filter(|g| !g.is_empty())
-        .collect::<Vec<_>>();
-    let imdb_id = response.imdb_id.clone();
+    let mut search_params: Vec<(String, String)> = vec![
+        ("apikey".into(), api_key.to_string()),
+        ("s".into(), query.to_string()),
+    ];
+    if let Some(y) = year {
+        search_params.push(("y".into(), y.to_string()));
+    }
+    if let Some(kind) = media_hint {
+        let t = if kind == "series" { "series" } else { "movie" };
+        search_params.push(("type".into(), t.to_string()));
+    }
 
-    Ok(vec![InternetMetadataMatch {
-        provider: "omdb".into(),
-        title,
-        year,
-        media_kind,
-        imdb_id: imdb_id.clone(),
-        tvdb_id: None,
-        overview: response.plot,
-        rating: response.imdb_rating.and_then(|v| v.parse::<f64>().ok()),
-        genres,
-        poster_url: response.poster.filter(|v| v != "N/A"),
-        source_url: imdb_id.map(|id| format!("https://www.imdb.com/title/{}/", id)),
-    }])
+    let response = client
+        .get("https://www.omdbapi.com/")
+        .query(&search_params)
+        .send()
+        .await?
+        .json::<OmdbSearchResponse>()
+        .await?;
+
+    Ok(response
+        .search
+        .unwrap_or_default()
+        .into_iter()
+        .take(5)
+        .map(|item| InternetMetadataMatch {
+            provider: "omdb".into(),
+            title: item.title.unwrap_or_else(|| query.to_string()),
+            year: item.year.and_then(|value| value.split(' ').next().and_then(|v| v.parse::<u16>().ok())),
+            media_kind: item.media_type.unwrap_or_else(|| "unknown".into()),
+            imdb_id: item.imdb_id.clone(),
+            tvdb_id: None,
+            overview: None,
+            rating: None,
+            genres: Vec::new(),
+            poster_url: item.poster.filter(|value| value != "N/A"),
+            source_url: item.imdb_id.map(|id| format!("https://www.imdb.com/title/{}/", id)),
+        })
+        .collect())
+}
+
+#[derive(Debug, Deserialize)]
+struct OmdbSearchResponse {
+    #[serde(rename = "Search")]
+    search: Option<Vec<OmdbSearchItem>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OmdbSearchItem {
+    #[serde(rename = "Title")]
+    title: Option<String>,
+    #[serde(rename = "Year")]
+    year: Option<String>,
+    #[serde(rename = "Type")]
+    media_type: Option<String>,
+    #[serde(rename = "imdbID")]
+    imdb_id: Option<String>,
+    #[serde(rename = "Poster")]
+    poster: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

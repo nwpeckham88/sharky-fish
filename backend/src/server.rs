@@ -1,4 +1,4 @@
-use crate::config::{AppConfig, LibraryFolder};
+use crate::config::{AppConfig, LibraryFolder, LlmConfig};
 use crate::db;
 use crate::internet_metadata;
 use crate::library;
@@ -6,6 +6,7 @@ use crate::library_index;
 use crate::metadata;
 use crate::messages::{LibraryChange, SseEvent};
 use crate::organizer;
+use crate::actors::brain;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -44,6 +45,8 @@ pub struct AppState {
 pub fn build_router(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/api/jobs", get(list_jobs))
+        .route("/api/jobs/{id}/approve", axum::routing::post(approve_job))
+        .route("/api/jobs/{id}/reject", axum::routing::post(reject_job))
         .route("/api/library", get(list_library))
         .route("/api/library/rescan", axum::routing::post(trigger_library_rescan))
         .route("/api/library/events", get(list_library_events))
@@ -53,13 +56,19 @@ pub fn build_router(state: AppState) -> Router {
             get(get_library_internet_metadata).post(save_selected_library_internet_metadata),
         )
         .route("/api/library/internet/bulk", axum::routing::post(get_library_internet_metadata_bulk))
+        .route("/api/library/internet/related", get(get_related_library_internet_metadata_paths))
         .route("/api/library/internet/selected", get(get_selected_library_internet_metadata))
+        .route("/api/library/duplicates", get(list_library_duplicates))
         .route("/api/library/organize", axum::routing::post(organize_library_file))
         .route("/api/libraries", get(list_libraries).post(add_library))
-        .route("/api/libraries/{id}", axum::routing::delete(remove_library))
+        .route(
+            "/api/libraries/{id}",
+            axum::routing::put(update_library).delete(remove_library),
+        )
         .route("/api/jobs/{id}", get(get_job))
         .route("/api/events", get(sse_handler))
         .route("/api/health", get(health))
+        .route("/api/config/llm/test", axum::routing::post(test_llm_connection))
         .route("/api/config", get(get_config).put(update_config))
         .layer(CorsLayer::permissive())
         .with_state(Arc::new(state));
@@ -105,6 +114,32 @@ struct LibraryEventsQuery {
 #[derive(Deserialize)]
 struct LibraryInternetMetadataQuery {
     path: String,
+    query: Option<String>,
+}
+
+#[derive(Serialize)]
+struct RelatedInternetMetadataPathsResponse {
+    paths: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct DuplicateGroupMemberResponse {
+    path: String,
+    file_name: String,
+    library_id: Option<String>,
+}
+
+#[derive(Serialize)]
+struct DuplicateGroupResponse {
+    key: String,
+    provider: String,
+    title: String,
+    year: Option<u16>,
+    imdb_id: Option<String>,
+    tvdb_id: Option<u64>,
+    canonical_path: Option<String>,
+    selected: internet_metadata::InternetMetadataMatch,
+    members: Vec<DuplicateGroupMemberResponse>,
 }
 
 #[derive(Deserialize)]
@@ -125,6 +160,8 @@ struct OrganizeLibraryFileRequest {
     selected: Option<internet_metadata::InternetMetadataMatch>,
     season: Option<u32>,
     episode: Option<u32>,
+    scope: Option<String>,
+    merge_existing: Option<bool>,
     apply: Option<bool>,
 }
 
@@ -153,6 +190,48 @@ async fn get_job(
     match db::fetch_tasks_for_job(&state.pool, id).await {
         Ok(tasks) => Json(serde_json::json!({ "job_id": id, "tasks": tasks })).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn approve_job(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    transition_job_status(state, id, "APPROVED").await
+}
+
+async fn reject_job(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    transition_job_status(state, id, "REJECTED").await
+}
+
+async fn transition_job_status(state: Arc<AppState>, id: i64, next_status: &str) -> axum::response::Response {
+    let Some(job) = (match db::fetch_job(&state.pool, id).await {
+        Ok(job) => job,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    if matches!(job.status.as_str(), "PROCESSING" | "COMPLETED") {
+        return (
+            StatusCode::CONFLICT,
+            format!("job {} can no longer be changed from {}", id, job.status),
+        )
+            .into_response();
+    }
+
+    match db::update_job_status(&state.pool, id, next_status).await {
+        Ok(()) => {
+            let _ = state.sse_tx.send(SseEvent::JobStatus {
+                job_id: id,
+                status: next_status.to_string(),
+            });
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
 
@@ -261,10 +340,120 @@ async fn get_library_internet_metadata(
         cfg.clone()
     };
 
-    match internet_metadata::lookup_for_library_path(&config, &params.path).await {
+    match internet_metadata::lookup_for_library_path_with_query(&config, &params.path, params.query.as_deref()).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
+}
+
+async fn get_related_library_internet_metadata_paths(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<LibraryInternetMetadataQuery>,
+) -> impl IntoResponse {
+    let Some(selected) = (match db::fetch_selected_internet_metadata(&state.pool, &params.path).await {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }) else {
+        return Json(RelatedInternetMetadataPathsResponse { paths: Vec::new() }).into_response();
+    };
+
+    match db::find_related_selected_internet_metadata_paths(
+        &state.pool,
+        &params.path,
+        selected.imdb_id.as_deref(),
+        selected.tvdb_id,
+    )
+    .await
+    {
+        Ok(paths) => Json(RelatedInternetMetadataPathsResponse { paths }).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn list_library_duplicates(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<LibraryQuery>,
+) -> impl IntoResponse {
+    let rows = match db::list_duplicate_candidates(&state.pool, params.library_id.as_deref()).await {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    };
+
+    let config = {
+        let cfg = state.config.read().await;
+        cfg.clone()
+    };
+
+    let mut grouped = std::collections::BTreeMap::<String, Vec<db::DuplicateCandidateRow>>::new();
+    for row in rows {
+        let key = row
+            .imdb_id
+            .clone()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("imdb:{value}"))
+            .or_else(|| row.tvdb_id.map(|value| format!("tvdb:{value}")));
+        if let Some(key) = key {
+            grouped.entry(key).or_default().push(row);
+        }
+    }
+
+    let groups = grouped
+        .into_iter()
+        .filter_map(|(key, mut members)| {
+            if members.len() < 2 {
+                return None;
+            }
+            members.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+            let first = members.first()?;
+            let selected = internet_metadata::InternetMetadataMatch {
+                provider: first.provider.clone(),
+                title: first.title.clone(),
+                year: first.year.map(|value| value as u16),
+                media_kind: first.media_kind.clone(),
+                imdb_id: first.imdb_id.clone(),
+                tvdb_id: first.tvdb_id.map(|value| value as u64),
+                overview: None,
+                rating: None,
+                genres: Vec::new(),
+                poster_url: None,
+                source_url: None,
+            };
+
+            let canonical_path = first
+                .library_id
+                .as_deref()
+                .and_then(|library_id| config.libraries.iter().find(|library| library.id == library_id))
+                .map(|library| organizer::movie_target_container(&library.path, &selected))
+                .and_then(|target_dir| {
+                    let prefix = format!("{target_dir}/");
+                    members
+                        .iter()
+                        .find(|member| member.relative_path.starts_with(&prefix))
+                        .map(|member| member.relative_path.clone())
+                });
+
+            Some(DuplicateGroupResponse {
+                key,
+                provider: first.provider.clone(),
+                title: first.title.clone(),
+                year: first.year.map(|value| value as u16),
+                imdb_id: first.imdb_id.clone(),
+                tvdb_id: first.tvdb_id.map(|value| value as u64),
+                canonical_path,
+                selected,
+                members: members
+                    .into_iter()
+                    .map(|member| DuplicateGroupMemberResponse {
+                        path: member.relative_path,
+                        file_name: member.file_name,
+                        library_id: member.library_id,
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    Json(groups).into_response()
 }
 
 async fn get_library_internet_metadata_bulk(
@@ -312,6 +501,8 @@ async fn get_library_internet_metadata_bulk(
                         parsed_year: None,
                         media_hint: None,
                         provider_used: None,
+                        search_candidates: vec![path.clone()],
+                        providers: Vec::new(),
                         matches: Vec::new(),
                         warnings: vec![error.to_string()],
                     });
@@ -428,6 +619,8 @@ async fn organize_library_file(
             selected,
             season: request.season,
             episode: request.episode,
+            scope: request.scope,
+            merge_existing: request.merge_existing.unwrap_or(false),
         },
         apply,
     )
@@ -478,6 +671,36 @@ async fn update_config(
     }
     *cfg = updated.clone();
     Json(updated).into_response()
+}
+
+#[derive(Serialize)]
+struct LlmTestResponse {
+    ok: bool,
+    provider: String,
+    model: String,
+    message: String,
+}
+
+async fn test_llm_connection(Json(llm): Json<LlmConfig>) -> impl IntoResponse {
+    match brain::test_llm_connection(&llm).await {
+        Ok(message) => Json(LlmTestResponse {
+            ok: true,
+            provider: llm.provider,
+            model: llm.model,
+            message,
+        })
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(LlmTestResponse {
+                ok: false,
+                provider: llm.provider,
+                model: llm.model,
+                message: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -540,4 +763,41 @@ async fn remove_library(
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
     StatusCode::NO_CONTENT.into_response()
+}
+
+async fn update_library(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    Json(folder): Json<LibraryFolder>,
+) -> impl IntoResponse {
+    if folder.id.is_empty() || folder.name.is_empty() || folder.path.is_empty() {
+        return (StatusCode::BAD_REQUEST, "id, name, and path are required").into_response();
+    }
+    if !matches!(folder.media_type.as_str(), "movie" | "tv") {
+        return (StatusCode::BAD_REQUEST, "media_type must be \"movie\" or \"tv\"").into_response();
+    }
+    if folder.path.contains("..") {
+        return (StatusCode::BAD_REQUEST, "path must not contain '..'").into_response();
+    }
+
+    let mut cfg = state.config.write().await;
+    if cfg.libraries.iter().any(|library| library.id == folder.id && library.id != id) {
+        return (StatusCode::CONFLICT, "A library with this id already exists").into_response();
+    }
+
+    let full_path = PathBuf::from(&cfg.data_path).join(&folder.path);
+    if !full_path.is_dir() {
+        return (StatusCode::BAD_REQUEST, "Path does not exist or is not a directory").into_response();
+    }
+
+    let Some(existing) = cfg.libraries.iter_mut().find(|library| library.id == id) else {
+        return (StatusCode::NOT_FOUND, "Library not found").into_response();
+    };
+    *existing = folder.clone();
+
+    if let Err(error) = cfg.save() {
+        return (StatusCode::INTERNAL_SERVER_ERROR, error).into_response();
+    }
+
+    Json(folder).into_response()
 }

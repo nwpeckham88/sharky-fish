@@ -3,8 +3,10 @@
 	import {
 		fetchConfig,
 		saveConfig,
+		testLlmConnection,
 		fetchLibraries,
 		addLibrary,
+		updateLibrary,
 		removeLibrary,
 		type AppConfig,
 		type LibraryFolder
@@ -14,11 +16,14 @@
 	let config = $state<AppConfig | null>(null);
 	let loading = $state(true);
 	let saving = $state(false);
+	let testingLlm = $state(false);
+	let llmTestResult = $state<{ ok: boolean; message: string } | null>(null);
 	let toast = $state<{ msg: string; ok: boolean } | null>(null);
 
 	// Library folder management
 	let libraries = $state<LibraryFolder[]>([]);
 	let newLib = $state<LibraryFolder>({ id: '', name: '', path: '', media_type: 'movie' });
+	let editingLibraryId = $state<string | null>(null);
 	let addingLibrary = $state(false);
 	let libraryError = $state('');
 
@@ -47,6 +52,31 @@
 			saving = false;
 			setTimeout(() => { toast = null; }, 3000);
 		}
+	}
+
+	async function runLlmTest() {
+		if (!config) return;
+		testingLlm = true;
+		llmTestResult = null;
+		try {
+			const result = await testLlmConnection(config.llm);
+			llmTestResult = { ok: result.ok, message: result.message };
+		} catch (error) {
+			llmTestResult = {
+				ok: false,
+				message: error instanceof Error ? error.message : 'Failed to test LLM connection'
+			};
+		} finally {
+			testingLlm = false;
+		}
+	}
+
+	function resetToGeminiDefaults() {
+		if (!config) return;
+		config.llm.provider = 'google';
+		config.llm.base_url = 'https://generativelanguage.googleapis.com/v1beta';
+		config.llm.model = 'gemini-3.1-flash-lite-preview';
+		llmTestResult = null;
 	}
 
 	const CODECS = [
@@ -121,9 +151,12 @@
 	}
 
 	const LLM_PROVIDERS = [
+		{ value: 'google', label: 'Google AI API (Gemini)' },
 		{ value: 'ollama', label: 'Ollama (local)' },
 		{ value: 'openai', label: 'OpenAI API' },
 	];
+
+	const GEMINI_DEFAULT_MODEL = 'gemini-3.1-flash-lite-preview';
 
 	const METADATA_PROVIDERS = [
 		{ value: 'omdb', label: 'OMDb (IMDb-backed)' },
@@ -153,11 +186,17 @@
 		}
 		addingLibrary = true;
 		try {
-			const added = await addLibrary(newLib);
-			libraries = [...libraries, added];
+			if (editingLibraryId) {
+				const updated = await updateLibrary(editingLibraryId, newLib);
+				libraries = libraries.map((library) => (library.id === editingLibraryId ? updated : library));
+				toaster('Library updated', true);
+			} else {
+				const added = await addLibrary(newLib);
+				libraries = [...libraries, added];
+				toaster('Library added', true);
+			}
 			newLib = { id: '', name: '', path: '', media_type: 'movie' };
-			toast = { msg: 'Library added', ok: true };
-			setTimeout(() => { toast = null; }, 3000);
+			editingLibraryId = null;
 		} catch (e) {
 			libraryError = e instanceof Error ? e.message : 'Failed to add library';
 		} finally {
@@ -165,16 +204,34 @@
 		}
 	}
 
+	function startEditLibrary(library: LibraryFolder) {
+		editingLibraryId = library.id;
+		newLib = { ...library };
+		libraryError = '';
+	}
+
+	function cancelEditLibrary() {
+		editingLibraryId = null;
+		newLib = { id: '', name: '', path: '', media_type: 'movie' };
+		libraryError = '';
+	}
+
 	async function handleRemoveLibrary(id: string) {
 		try {
 			await removeLibrary(id);
 			libraries = libraries.filter((l) => l.id !== id);
-			toast = { msg: 'Library removed', ok: true };
-			setTimeout(() => { toast = null; }, 3000);
+			if (editingLibraryId === id) {
+				cancelEditLibrary();
+			}
+			toaster('Library removed', true);
 		} catch (e) {
-			toast = { msg: e instanceof Error ? e.message : 'Failed to remove library', ok: false };
-			setTimeout(() => { toast = null; }, 3000);
+			toaster(e instanceof Error ? e.message : 'Failed to remove library', false);
 		}
+	}
+
+	function toaster(message: string, ok: boolean) {
+		toast = { msg: message, ok };
+		setTimeout(() => { toast = null; }, 3000);
 	}
 </script>
 
@@ -228,7 +285,10 @@
 								</div>
 							</div>
 						</div>
-						<button onclick={() => handleRemoveLibrary(lib.id)} class="rounded-lg border border-[color:var(--line)] px-3 py-1.5 text-xs font-semibold text-[color:var(--danger)] hover:bg-[color:rgba(138,75,67,0.08)]" title="Remove library">Remove</button>
+						<div class="flex gap-2">
+							<button onclick={() => startEditLibrary(lib)} class="rounded-lg border border-[color:var(--line)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] hover:bg-[color:rgba(214,180,111,0.08)]" title="Edit library">Edit</button>
+							<button onclick={() => handleRemoveLibrary(lib.id)} class="rounded-lg border border-[color:var(--line)] px-3 py-1.5 text-xs font-semibold text-[color:var(--danger)] hover:bg-[color:rgba(138,75,67,0.08)]" title="Remove library">Remove</button>
+						</div>
 					</div>
 				{/each}
 			</div>
@@ -240,7 +300,7 @@
 
 		<!-- Add New Library -->
 		<div class="rounded-[1rem] border border-[color:var(--line)] p-5">
-			<h3 class="section-label mb-4">Add Library Folder</h3>
+			<h3 class="section-label mb-4">{editingLibraryId ? 'Edit Library Folder' : 'Add Library Folder'}</h3>
 			{#if libraryError}
 				<div class="mb-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-4 py-2.5 text-sm text-[color:var(--danger)]">{libraryError}</div>
 			{/if}
@@ -265,8 +325,11 @@
 					<input type="text" bind:value={newLib.id} placeholder="auto" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-muted)]" />
 				</label>
 			</div>
-			<div class="mt-4 flex justify-end">
-				<button onclick={handleAddLibrary} disabled={addingLibrary} class="rounded-lg bg-[color:var(--accent)] px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{addingLibrary ? 'Adding…' : 'Add Library'}</button>
+			<div class="mt-4 flex justify-end gap-2">
+				{#if editingLibraryId}
+					<button onclick={cancelEditLibrary} class="rounded-lg border border-[color:var(--line)] px-5 py-2.5 text-sm font-semibold text-[color:var(--ink-strong)]">Cancel</button>
+				{/if}
+				<button onclick={handleAddLibrary} disabled={addingLibrary} class="rounded-lg bg-[color:var(--accent)] px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{addingLibrary ? (editingLibraryId ? 'Saving…' : 'Adding…') : (editingLibraryId ? 'Save Library' : 'Add Library')}</button>
 			</div>
 		</div>
 	</section>
@@ -440,13 +503,37 @@
 {:else if activeTab === 'system'}
 	<section class="surface-card p-6">
 		<h2 class="mb-4 text-xl text-[color:var(--ink-strong)]">System Profile</h2>
-		<p class="mb-6 text-sm text-[color:var(--ink-muted)]">Configure the LLM connection, tune performance parameters, and review storage paths.</p>
+		<p class="mb-6 text-sm text-[color:var(--ink-muted)]">Configure the LLM connection, tune AI automation policy, and review system settings. New installs default to Google AI API with Gemini 3.1 Flash-Lite Preview.</p>
 
 		<div class="grid gap-5 md:grid-cols-2">
+			<!-- Automation -->
+			<div class="rounded-[1rem] border border-[color:var(--line)] p-5 md:col-span-2">
+				<h3 class="section-label mb-4">Automation Policy</h3>
+				<div class="grid gap-4 lg:grid-cols-[minmax(0,1.2fr)_minmax(0,0.8fr)] lg:items-start">
+					<div>
+						<label class="flex items-start gap-3 cursor-pointer">
+							<input type="checkbox" bind:checked={config.auto_approve_ai_jobs} class="mt-1 rounded border-[color:var(--line)] accent-[color:var(--accent)]" />
+							<div>
+								<span class="block text-sm font-semibold text-[color:var(--ink-strong)]">Auto-approve AI jobs</span>
+								<span class="mt-1 block text-xs leading-5 text-[color:var(--ink-muted)]">When enabled, new AI-generated transcode plans move directly into the ready queue. Operators can still reject them from Intake until processing begins.</span>
+							</div>
+						</label>
+					</div>
+					<div class="rounded-xl border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.55)] px-4 py-3 text-xs leading-5 text-[color:var(--ink-muted)]">
+						<p class="font-semibold uppercase tracking-[0.14em] text-[color:var(--accent-deep)]">Current behavior</p>
+						<p class="mt-2">{config.auto_approve_ai_jobs ? 'AI decisions go straight to The Forge queue as APPROVED items.' : 'AI decisions pause in Intake as AWAITING_APPROVAL until an operator approves them.'}</p>
+					</div>
+				</div>
+			</div>
+
 			<!-- LLM Configuration -->
 			<div class="rounded-[1rem] border border-[color:var(--line)] p-5">
 				<h3 class="section-label mb-4">LLM Endpoint</h3>
 				<div class="space-y-4">
+					<div class="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.45)] px-3 py-2.5 text-xs text-[color:var(--ink-muted)]">
+						<span>Recommended default: <span class="font-mono text-[color:var(--ink-strong)]">{GEMINI_DEFAULT_MODEL}</span></span>
+						<button onclick={resetToGeminiDefaults} class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)]">Reset to Gemini Default</button>
+					</div>
 					<label class="block">
 						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Provider</span>
 						<select bind:value={config.llm.provider} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]">
@@ -464,9 +551,20 @@
 						<input type="text" bind:value={config.llm.model} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
 					</label>
 					<label class="block">
-						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">API Key {config.llm.provider === 'ollama' ? '(not required for Ollama)' : ''}</span>
+						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">API Key {config.llm.provider === 'ollama' ? '(not required for Ollama)' : config.llm.provider === 'google' ? '(Google AI Studio key)' : ''}</span>
 						<input type="password" value={config.llm.api_key ?? ''} oninput={(e) => { if (config) config.llm.api_key = (e.target as HTMLInputElement).value || null; }} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
 					</label>
+					{#if config.llm.provider === 'google'}
+						<p class="text-xs text-[color:var(--ink-muted)]">Recommended model: <span class="font-mono text-[color:var(--ink-strong)]">{GEMINI_DEFAULT_MODEL}</span></p>
+					{/if}
+					<div class="flex flex-wrap items-center gap-2 pt-1">
+						<button onclick={runLlmTest} disabled={testingLlm} class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm font-semibold text-[color:var(--ink-strong)] disabled:opacity-50">
+							{testingLlm ? 'Testing…' : 'Test LLM Connection'}
+						</button>
+						{#if llmTestResult}
+							<span class="rounded-lg px-3 py-2 text-xs font-semibold {llmTestResult.ok ? 'bg-[color:var(--olive)]/15 text-[color:var(--olive)]' : 'bg-red-500/15 text-red-400'}">{llmTestResult.message}</span>
+						{/if}
+					</div>
 				</div>
 			</div>
 

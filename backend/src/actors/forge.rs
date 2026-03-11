@@ -87,10 +87,6 @@ impl ForgeActor {
     }
 
     async fn execute_job(&self, job: &QueuedJob) -> Result<()> {
-        let _ = self.sse_tx.send(SseEvent::JobCreated {
-            job_id: job.job_id,
-            file_path: job.source_path.to_string_lossy().into(),
-        });
         let _ = self.sse_tx.send(SseEvent::JobStatus {
             job_id: job.job_id,
             status: "PROCESSING".into(),

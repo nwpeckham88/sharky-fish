@@ -1,8 +1,8 @@
 use anyhow::Result;
-use crate::messages::MediaProbe;
+use crate::messages::{MediaProbe, ProcessingDecision};
 use crate::internet_metadata::InternetMetadataMatch;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, Row, SqlitePool};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -44,6 +44,17 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             task_type   TEXT    NOT NULL,
             payload     TEXT,
             status      TEXT    NOT NULL DEFAULT 'QUEUED'
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS job_analysis (
+            job_id          INTEGER PRIMARY KEY REFERENCES jobs(id) ON DELETE CASCADE,
+            probe_json      TEXT NOT NULL,
+            decision_json   TEXT NOT NULL,
+            updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     )
     .execute(pool)
@@ -198,6 +209,16 @@ pub struct Job {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct JobWithAnalysis {
+    pub id: i64,
+    pub file_path: String,
+    pub status: String,
+    pub created_at: String,
+    pub probe: Option<MediaProbe>,
+    pub decision: Option<ProcessingDecision>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
 pub struct Task {
     pub id: i64,
@@ -263,6 +284,19 @@ pub struct LibraryIndexRow {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
+pub struct DuplicateCandidateRow {
+    pub relative_path: String,
+    pub file_name: String,
+    pub library_id: Option<String>,
+    pub provider: String,
+    pub title: String,
+    pub year: Option<i64>,
+    pub media_kind: String,
+    pub imdb_id: Option<String>,
+    pub tvdb_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
 pub struct LibrarySummaryRow {
     pub total_items: i64,
     pub total_bytes: i64,
@@ -283,13 +317,40 @@ pub struct LibraryScanStateRow {
 }
 
 /// Insert a new job and return its id.
-pub async fn insert_job(pool: &SqlitePool, file_path: &str) -> Result<i64> {
-    let id = sqlx::query("INSERT INTO jobs (file_path) VALUES (?)")
+pub async fn insert_job(pool: &SqlitePool, file_path: &str, status: &str) -> Result<i64> {
+    let id = sqlx::query("INSERT INTO jobs (file_path, status) VALUES (?, ?)")
         .bind(file_path)
+        .bind(status)
         .execute(pool)
         .await?
         .last_insert_rowid();
     Ok(id)
+}
+
+pub async fn upsert_job_analysis(
+    pool: &SqlitePool,
+    job_id: i64,
+    probe: &MediaProbe,
+    decision: &ProcessingDecision,
+) -> Result<()> {
+    let probe_json = serde_json::to_string(probe)?;
+    let decision_json = serde_json::to_string(decision)?;
+
+    sqlx::query(
+        "INSERT INTO job_analysis (job_id, probe_json, decision_json, updated_at)
+         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(job_id) DO UPDATE SET
+            probe_json = excluded.probe_json,
+            decision_json = excluded.decision_json,
+            updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(job_id)
+    .bind(probe_json)
+    .bind(decision_json)
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 /// Insert a task for a given job.
@@ -323,6 +384,17 @@ pub async fn update_job_status(pool: &SqlitePool, job_id: i64, status: &str) -> 
     Ok(())
 }
 
+pub async fn fetch_job(pool: &SqlitePool, job_id: i64) -> Result<Option<Job>> {
+    let row = sqlx::query_as::<_, Job>(
+        "SELECT id, file_path, status, created_at FROM jobs WHERE id = ?",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
+}
+
 /// Update task status and optionally its payload.
 pub async fn update_task(
     pool: &SqlitePool,
@@ -339,10 +411,10 @@ pub async fn update_task(
     Ok(())
 }
 
-/// Fetch pending jobs ordered by creation time.
-pub async fn fetch_pending_jobs(pool: &SqlitePool, limit: i64) -> Result<Vec<Job>> {
+/// Fetch approved jobs ordered by creation time.
+pub async fn fetch_ready_jobs(pool: &SqlitePool, limit: i64) -> Result<Vec<Job>> {
     let rows = sqlx::query_as::<_, Job>(
-        "SELECT id, file_path, status, created_at FROM jobs WHERE status = 'PENDING' ORDER BY created_at ASC LIMIT ?"
+        "SELECT id, file_path, status, created_at FROM jobs WHERE status = 'APPROVED' ORDER BY created_at ASC LIMIT ?"
     )
     .bind(limit)
     .fetch_all(pool)
@@ -372,15 +444,41 @@ pub async fn fetch_resumable_jobs(pool: &SqlitePool) -> Result<Vec<Job>> {
 }
 
 /// List jobs with pagination.
-pub async fn list_jobs(pool: &SqlitePool, limit: i64, offset: i64) -> Result<Vec<Job>> {
-    let rows = sqlx::query_as::<_, Job>(
-        "SELECT id, file_path, status, created_at FROM jobs ORDER BY created_at DESC LIMIT ? OFFSET ?"
+pub async fn list_jobs(pool: &SqlitePool, limit: i64, offset: i64) -> Result<Vec<JobWithAnalysis>> {
+    let rows = sqlx::query(
+        "SELECT j.id, j.file_path, j.status, j.created_at, a.probe_json, a.decision_json
+         FROM jobs j
+         LEFT JOIN job_analysis a ON a.job_id = j.id
+         ORDER BY j.created_at DESC
+         LIMIT ? OFFSET ?",
     )
     .bind(limit)
     .bind(offset)
     .fetch_all(pool)
     .await?;
-    Ok(rows)
+
+    let mut jobs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let probe = row
+            .try_get::<Option<String>, _>("probe_json")?
+            .map(|json| serde_json::from_str::<MediaProbe>(&json))
+            .transpose()?;
+        let decision = row
+            .try_get::<Option<String>, _>("decision_json")?
+            .map(|json| serde_json::from_str::<ProcessingDecision>(&json))
+            .transpose()?;
+
+        jobs.push(JobWithAnalysis {
+            id: row.try_get("id")?,
+            file_path: row.try_get("file_path")?,
+            status: row.try_get("status")?,
+            created_at: row.try_get("created_at")?,
+            probe,
+            decision,
+        });
+    }
+
+    Ok(jobs)
 }
 
 pub async fn fetch_media_metadata(pool: &SqlitePool, file_path: &str) -> Result<Option<CachedMediaMetadata>> {
@@ -535,6 +633,32 @@ pub async fn fetch_selected_internet_metadata(
     Ok(row)
 }
 
+pub async fn find_related_selected_internet_metadata_paths(
+    pool: &SqlitePool,
+    relative_path: &str,
+    imdb_id: Option<&str>,
+    tvdb_id: Option<i64>,
+) -> Result<Vec<String>> {
+    if imdb_id.is_none() && tvdb_id.is_none() {
+        return Ok(Vec::new());
+    }
+
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT relative_path
+         FROM selected_internet_metadata
+         WHERE relative_path != ?1
+           AND ((?2 IS NOT NULL AND imdb_id = ?2) OR (?3 IS NOT NULL AND tvdb_id = ?3))
+         ORDER BY relative_path ASC",
+    )
+    .bind(relative_path)
+    .bind(imdb_id)
+    .bind(tvdb_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
 pub async fn upsert_library_index_entry(
     pool: &SqlitePool,
     relative_path: &str,
@@ -651,6 +775,27 @@ pub async fn summarize_library_index(
     .await?;
 
     Ok(row)
+}
+
+pub async fn list_duplicate_candidates(
+    pool: &SqlitePool,
+    library_id: Option<&str>,
+) -> Result<Vec<DuplicateCandidateRow>> {
+    let rows = sqlx::query_as::<_, DuplicateCandidateRow>(
+        "SELECT l.relative_path, l.file_name, l.library_id,
+                s.provider, s.title, s.year, s.media_kind, s.imdb_id, s.tvdb_id
+         FROM selected_internet_metadata s
+         INNER JOIN library_index l ON l.relative_path = s.relative_path
+         WHERE s.media_kind = 'movie'
+           AND (?1 IS NULL OR l.library_id = ?1)
+           AND ((s.imdb_id IS NOT NULL AND trim(s.imdb_id) != '') OR s.tvdb_id IS NOT NULL)
+         ORDER BY COALESCE(s.imdb_id, ''), COALESCE(s.tvdb_id, 0), l.relative_path ASC",
+    )
+    .bind(library_id)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
 }
 
 pub async fn fetch_library_scan_state(pool: &SqlitePool) -> Result<LibraryScanStateRow> {

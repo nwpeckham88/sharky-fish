@@ -12,6 +12,8 @@ pub struct OrganizeRequest {
     pub selected: InternetMetadataMatch,
     pub season: Option<u32>,
     pub episode: Option<u32>,
+    pub scope: Option<String>,
+    pub merge_existing: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -20,6 +22,9 @@ pub struct OrganizeResult {
     pub target_relative_path: String,
     pub changed: bool,
     pub applied: bool,
+    pub scope: String,
+    pub target_exists: bool,
+    pub conflict_path: Option<String>,
 }
 
 pub async fn preview_or_apply(
@@ -30,6 +35,7 @@ pub async fn preview_or_apply(
 ) -> Result<OrganizeResult> {
     let current_relative = sanitize_relative_path(&request.relative_path)?;
     let current_relative_str = current_relative.to_string_lossy().replace('\\', "/");
+    let scope = request.scope.as_deref().unwrap_or("file");
 
     let library_folder = resolve_library_folder(config, &current_relative_str, request.library_id.as_deref())
         .context("unable to resolve library folder for path")?;
@@ -54,31 +60,63 @@ pub async fn preview_or_apply(
     let target_relative = sanitize_relative_path(&target_relative)?;
     let target_relative_str = target_relative.to_string_lossy().replace('\\', "/");
 
-    let changed = current_relative_str != target_relative_str;
+    let (changed, target_exists, conflict_path) = if scope == "movie_folder" && library_folder.media_type == "movie" {
+        let source_container = current_relative
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(PathBuf::new);
+        let source_container_str = source_container.to_string_lossy().replace('\\', "/");
+        let target_container = movie_target_container(&library_folder.path, &request.selected);
+        let target_container = sanitize_relative_path(&target_container)?;
+        let target_container_str = target_container.to_string_lossy().replace('\\', "/");
+        let target_container_abs = library_root.join(&target_container);
+        let changed = source_container_str != target_container_str;
+        let target_exists = changed && target_container_abs.exists();
+        (changed, target_exists, target_exists.then_some(target_container_str))
+    } else {
+        let changed = current_relative_str != target_relative_str;
+        let target_abs = library_root.join(&target_relative);
+        let target_exists = changed && target_abs.exists();
+        (changed, target_exists, target_exists.then_some(target_relative_str.clone()))
+    };
+
     if apply && changed {
         let source_abs = library_root.join(&current_relative);
-        let target_abs = library_root.join(&target_relative);
 
-        if !source_abs.exists() {
-            anyhow::bail!("source file does not exist");
-        }
-        if target_abs.exists() {
-            anyhow::bail!("target file already exists");
-        }
+        if scope == "movie_folder" && library_folder.media_type == "movie" {
+            apply_movie_folder_organization(
+                library_root,
+                &current_relative,
+                &target_relative,
+                library_folder,
+                &request.selected,
+                request.merge_existing,
+            )
+            .await?;
+        } else {
+            let target_abs = library_root.join(&target_relative);
 
-        if let Some(parent) = target_abs.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
+            if !source_abs.exists() {
+                anyhow::bail!("source file does not exist");
+            }
+            if target_exists {
+                anyhow::bail!("target file already exists: {}", target_relative_str);
+            }
 
-        tokio::fs::rename(&source_abs, &target_abs)
-            .await
-            .with_context(|| {
-                format!(
-                    "failed to rename '{}' to '{}'",
-                    source_abs.display(),
-                    target_abs.display()
-                )
-            })?;
+            if let Some(parent) = target_abs.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+
+            tokio::fs::rename(&source_abs, &target_abs)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to rename '{}' to '{}'",
+                        source_abs.display(),
+                        target_abs.display()
+                    )
+                })?;
+        }
     }
 
     Ok(OrganizeResult {
@@ -86,7 +124,134 @@ pub async fn preview_or_apply(
         target_relative_path: target_relative_str,
         changed,
         applied: apply && changed,
+        scope: scope.to_string(),
+        target_exists,
+        conflict_path,
     })
+}
+
+pub fn movie_target_container(library_prefix: &str, selected: &InternetMetadataMatch) -> String {
+    let title = sanitize_segment(&selected.title);
+    let year = selected.year.map(|value| value.to_string()).unwrap_or_else(|| "0000".into());
+    format!("{}/{} ({})", trim_slashes(library_prefix), title, year)
+}
+
+async fn apply_movie_folder_organization(
+    library_root: &Path,
+    current_relative: &Path,
+    target_relative: &Path,
+    library_folder: &LibraryFolder,
+    selected: &InternetMetadataMatch,
+    merge_existing: bool,
+) -> Result<()> {
+    let source_file_abs = library_root.join(current_relative);
+    if !source_file_abs.exists() {
+        anyhow::bail!("source file does not exist");
+    }
+
+    let source_dir_relative = current_relative.parent().unwrap_or_else(|| Path::new(""));
+    let source_dir_abs = library_root.join(source_dir_relative);
+    let target_dir_relative = PathBuf::from(movie_target_container(&library_folder.path, selected));
+    let target_dir_abs = library_root.join(&target_dir_relative);
+
+    let source_stem = current_relative
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("movie")
+        .to_string();
+    let target_stem = target_relative
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("movie")
+        .to_string();
+
+    if source_dir_abs == target_dir_abs {
+        rename_matching_sidecars_in_dir(&source_dir_abs, &source_stem, &target_stem).await?;
+        return Ok(());
+    }
+
+    if !target_dir_abs.exists() {
+        if let Some(parent) = target_dir_abs.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::rename(&source_dir_abs, &target_dir_abs)
+            .await
+            .with_context(|| format!("failed to rename '{}' to '{}'", source_dir_abs.display(), target_dir_abs.display()))?;
+        rename_matching_sidecars_in_dir(&target_dir_abs, &source_stem, &target_stem).await?;
+        return Ok(());
+    }
+
+    if !merge_existing {
+        anyhow::bail!("target folder already exists: {}", target_dir_relative.display());
+    }
+
+    merge_movie_folder_contents(&source_dir_abs, &target_dir_abs, &source_stem, &target_stem).await?;
+    Ok(())
+}
+
+async fn rename_matching_sidecars_in_dir(dir_abs: &Path, source_stem: &str, target_stem: &str) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(dir_abs).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let Some(mapped) = remap_movie_entry_name(&file_name, source_stem, target_stem) else {
+            continue;
+        };
+        let dest_path = dir_abs.join(&mapped);
+        if dest_path == path {
+            continue;
+        }
+        if dest_path.exists() {
+            continue;
+        }
+        tokio::fs::rename(&path, &dest_path)
+            .await
+            .with_context(|| format!("failed to rename '{}' to '{}'", path.display(), dest_path.display()))?;
+    }
+    Ok(())
+}
+
+async fn merge_movie_folder_contents(
+    source_dir_abs: &Path,
+    target_dir_abs: &Path,
+    source_stem: &str,
+    target_stem: &str,
+) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(source_dir_abs).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        let mapped_name = remap_movie_entry_name(&file_name, source_stem, target_stem)
+            .unwrap_or_else(|| file_name.to_string());
+        let dest_path = target_dir_abs.join(mapped_name);
+        if dest_path.exists() {
+            continue;
+        }
+        tokio::fs::rename(&path, &dest_path)
+            .await
+            .with_context(|| format!("failed to merge '{}' into '{}'", path.display(), dest_path.display()))?;
+    }
+
+    if tokio::fs::read_dir(source_dir_abs).await?.next_entry().await?.is_none() {
+        let _ = tokio::fs::remove_dir(source_dir_abs).await;
+    }
+    Ok(())
+}
+
+fn remap_movie_entry_name(file_name: &str, source_stem: &str, target_stem: &str) -> Option<String> {
+    if file_name == source_stem {
+        return Some(target_stem.to_string());
+    }
+    let prefix = format!("{}.", source_stem);
+    if let Some(rest) = file_name.strip_prefix(&prefix) {
+        return Some(format!("{}.{}", target_stem, rest));
+    }
+    None
 }
 
 fn resolve_library_folder<'a>(

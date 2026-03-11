@@ -1,9 +1,13 @@
 use crate::db;
+use crate::config::AppConfig;
 use crate::messages::{QueueMsg, QueuedJob};
 use anyhow::Result;
 use sqlx::SqlitePool;
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{info, warn};
+
+use crate::messages::SseEvent;
 
 /// The Queue actor owns all job/task lifecycle state, backed by SQLite durable
 /// execution tables.  It receives enqueue requests from the Brain and poll
@@ -11,11 +15,23 @@ use tracing::{info, warn};
 pub struct QueueActor {
     rx: mpsc::Receiver<QueueMsg>,
     pool: SqlitePool,
+    sse_tx: broadcast::Sender<SseEvent>,
+    config: Arc<RwLock<AppConfig>>,
 }
 
 impl QueueActor {
-    pub fn new(rx: mpsc::Receiver<QueueMsg>, pool: SqlitePool) -> Self {
-        Self { rx, pool }
+    pub fn new(
+        rx: mpsc::Receiver<QueueMsg>,
+        pool: SqlitePool,
+        sse_tx: broadcast::Sender<SseEvent>,
+        config: Arc<RwLock<AppConfig>>,
+    ) -> Self {
+        Self {
+            rx,
+            pool,
+            sse_tx,
+            config,
+        }
     }
 
     pub async fn run(mut self) -> Result<()> {
@@ -53,9 +69,20 @@ impl QueueActor {
         media: &crate::messages::IdentifiedMedia,
         decision: &mut crate::messages::ProcessingDecision,
     ) -> Result<()> {
-        let file_path = media.path.to_string_lossy();
-        let job_id = db::insert_job(&self.pool, &file_path).await?;
+        let file_path = media.path.to_string_lossy().to_string();
+        let auto_approve = {
+            let cfg = self.config.read().await;
+            cfg.auto_approve_ai_jobs
+        };
+        let initial_status = if auto_approve {
+            "APPROVED"
+        } else {
+            "AWAITING_APPROVAL"
+        };
+
+        let job_id = db::insert_job(&self.pool, &file_path, initial_status).await?;
         decision.job_id = job_id;
+        db::upsert_job_analysis(&self.pool, job_id, &media.probe, decision).await?;
 
         // If two-pass normalization is required, create two tasks.
         if decision.requires_two_pass {
@@ -79,18 +106,28 @@ impl QueueActor {
             .await?;
         }
 
+        let _ = self.sse_tx.send(SseEvent::JobCreated {
+            job_id,
+            file_path: file_path.clone(),
+            status: initial_status.into(),
+        });
+
         info!(job_id, file = %file_path, "queue: job enqueued");
         Ok(())
     }
 
     async fn poll_next(&self) -> Option<QueuedJob> {
-        let jobs = db::fetch_pending_jobs(&self.pool, 1).await.ok()?;
+        let jobs = db::fetch_ready_jobs(&self.pool, 1).await.ok()?;
         let job = jobs.into_iter().next()?;
 
         // Mark as processing.
         db::update_job_status(&self.pool, job.id, "PROCESSING")
             .await
             .ok()?;
+        let _ = self.sse_tx.send(SseEvent::JobStatus {
+            job_id: job.id,
+            status: "PROCESSING".into(),
+        });
 
         let tasks = db::fetch_tasks_for_job(&self.pool, job.id).await.ok()?;
 
@@ -117,8 +154,8 @@ impl QueueActor {
             Ok(jobs) if !jobs.is_empty() => {
                 info!(count = jobs.len(), "queue: resuming interrupted jobs");
                 for job in jobs {
-                    // Reset to PENDING so they re-enter the pipeline.
-                    let _ = db::update_job_status(&self.pool, job.id, "PENDING").await;
+                    // Reset to APPROVED so they re-enter the execution queue.
+                    let _ = db::update_job_status(&self.pool, job.id, "APPROVED").await;
                 }
             }
             _ => {}
