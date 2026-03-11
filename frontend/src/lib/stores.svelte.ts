@@ -61,17 +61,23 @@ export function getReviewState() {
 		showGroups.set(job.group_key, existing);
 	}
 
+	const sortedShowGroups = Array.from(showGroups.values())
+		.map((jobs) => jobs.sort((left, right) => left.file_path.localeCompare(right.file_path)))
+		.sort((left, right) => {
+			const leftLabel = left[0]?.group_label ?? left[0]?.file_path ?? '';
+			const rightLabel = right[0]?.group_label ?? right[0]?.file_path ?? '';
+			return leftLabel.localeCompare(rightLabel);
+		});
+	const groupedJobIds = new Set(sortedShowGroups.flatMap((group) => group.map((job) => job.id)));
+	const standaloneReviewJobs = awaitingApproval.filter((job) => !groupedJobIds.has(job.id));
+
 	return {
 		awaitingApproval,
-		showGroups: Array.from(showGroups.values())
-			.map((jobs) => jobs.sort((left, right) => left.file_path.localeCompare(right.file_path)))
-			.sort((left, right) => {
-				const leftLabel = left[0]?.group_label ?? left[0]?.file_path ?? '';
-				const rightLabel = right[0]?.group_label ?? right[0]?.file_path ?? '';
-				return leftLabel.localeCompare(rightLabel);
-			}),
+		showGroups: sortedShowGroups,
+		standaloneReviewJobs,
 		counts: {
-			awaitingApproval: awaitingApproval.length
+			awaitingApprovalJobs: awaitingApproval.length,
+			awaitingApprovalItems: sortedShowGroups.length + standaloneReviewJobs.length
 		}
 	};
 }

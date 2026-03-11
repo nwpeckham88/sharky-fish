@@ -379,21 +379,6 @@ pub struct LibraryScanStateRow {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
-pub struct ManagedItemsSummaryRow {
-    pub total_items: i64,
-    pub needs_attention_count: i64,
-    pub unprocessed_count: i64,
-    pub reviewed_count: i64,
-    pub kept_original_count: i64,
-    pub awaiting_approval_count: i64,
-    pub approved_count: i64,
-    pub processed_count: i64,
-    pub failed_count: i64,
-    pub missing_metadata_count: i64,
-    pub missing_sidecar_count: i64,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
 pub struct ManagedItemRow {
     pub relative_path: String,
     pub file_path: String,
@@ -1242,28 +1227,6 @@ pub async fn update_managed_item_status(
     Ok(())
 }
 
-pub async fn list_unprocessed_managed_items(
-    pool: &SqlitePool,
-    limit: i64,
-    offset: i64,
-) -> Result<Vec<ManagedItemRow>> {
-    let rows = sqlx::query_as::<_, ManagedItemRow>(
-        "SELECT relative_path, file_path, file_name, media_type, size_bytes, modified_at,
-                library_id, managed_status, selected_metadata_json, last_decision_json,
-                sidecar_path, first_seen_at, last_seen_at, updated_at
-         FROM managed_items
-         WHERE managed_status = 'UNPROCESSED'
-         ORDER BY modified_at DESC, relative_path ASC
-         LIMIT ? OFFSET ?",
-    )
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(pool)
-    .await?;
-
-    Ok(rows)
-}
-
 pub async fn list_managed_items_filtered(
     pool: &SqlitePool,
     managed_status: Option<&str>,
@@ -1311,30 +1274,4 @@ pub async fn list_managed_items_filtered(
     .await?;
 
     Ok(rows)
-}
-
-pub async fn summarize_managed_items(pool: &SqlitePool) -> Result<ManagedItemsSummaryRow> {
-    let row = sqlx::query_as::<_, ManagedItemsSummaryRow>(
-        "SELECT
-            COUNT(*) AS total_items,
-            COALESCE(SUM(CASE
-                WHEN managed_status IN ('UNPROCESSED', 'FAILED', 'AWAITING_APPROVAL')
-                    OR (selected_metadata_json IS NULL AND managed_status NOT IN ('KEPT_ORIGINAL', 'PROCESSED'))
-                    OR sidecar_path IS NULL
-                THEN 1 ELSE 0
-            END), 0) AS needs_attention_count,
-            COALESCE(SUM(CASE WHEN managed_status = 'UNPROCESSED' THEN 1 ELSE 0 END), 0) AS unprocessed_count,
-            COALESCE(SUM(CASE WHEN managed_status = 'REVIEWED' THEN 1 ELSE 0 END), 0) AS reviewed_count,
-            COALESCE(SUM(CASE WHEN managed_status = 'KEPT_ORIGINAL' THEN 1 ELSE 0 END), 0) AS kept_original_count,
-            COALESCE(SUM(CASE WHEN managed_status = 'AWAITING_APPROVAL' THEN 1 ELSE 0 END), 0) AS awaiting_approval_count,
-            COALESCE(SUM(CASE WHEN managed_status = 'APPROVED' THEN 1 ELSE 0 END), 0) AS approved_count,
-            COALESCE(SUM(CASE WHEN managed_status = 'PROCESSED' THEN 1 ELSE 0 END), 0) AS processed_count,
-            COALESCE(SUM(CASE WHEN managed_status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed_count,
-            COALESCE(SUM(CASE WHEN selected_metadata_json IS NULL AND managed_status NOT IN ('KEPT_ORIGINAL', 'PROCESSED') THEN 1 ELSE 0 END), 0) AS missing_metadata_count,
-            COALESCE(SUM(CASE WHEN sidecar_path IS NULL THEN 1 ELSE 0 END), 0) AS missing_sidecar_count
-         FROM managed_items",
-    )
-    .fetch_one(pool)
-    .await?;
-    Ok(row)
 }

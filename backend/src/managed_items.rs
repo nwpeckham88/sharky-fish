@@ -217,11 +217,13 @@ pub async fn persist_processing_decision(
 
 pub async fn list_unprocessed(
     pool: &SqlitePool,
+    config: &AppConfig,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<IntakeManagedItem>> {
-    let rows = db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
-    let items = aggregate_backlog_items(configless_default(), rows)?;
+    let rows = db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0)
+        .await?;
+    let items = aggregate_backlog_items(config, rows)?;
     Ok(paginate_items(
         items
             .into_iter()
@@ -243,9 +245,9 @@ pub async fn list_filtered(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<IntakeManagedItem>> {
-    let rows = db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
+    let rows = db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0)
+        .await?;
     let items = aggregate_backlog_items(config, rows)?;
-    let items = aggregate_backlog_items(config, all_rows)?;
 
     Ok(paginate_items(
         items
@@ -276,11 +278,9 @@ pub async fn list_filtered(
     ))
 }
 
-        static DEFAULT_CONFIG: std::sync::OnceLock<AppConfig> = std::sync::OnceLock::new();
-        DEFAULT_CONFIG.get_or_init(AppConfig::default)
-    }
 pub async fn summarize(pool: &SqlitePool, config: &AppConfig) -> Result<BacklogSummary> {
-    let all_rows = db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
+    let all_rows = db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0)
+        .await?;
     let items = aggregate_backlog_items(config, all_rows)?;
 
     Ok(BacklogSummary {
@@ -297,16 +297,6 @@ pub async fn summarize(pool: &SqlitePool, config: &AppConfig) -> Result<BacklogS
         missing_sidecar_count: items.iter().filter(|item| item.missing_sidecar).count() as u64,
         organize_needed_count: items.iter().filter(|item| item.organize_needed).count() as u64,
     })
-}
-
-fn base_needs_attention(row: &db::ManagedItemRow) -> bool {
-    row.managed_status == "UNPROCESSED"
-        || row.managed_status == "FAILED"
-        || row.managed_status == "AWAITING_APPROVAL"
-        || (row.selected_metadata_json.is_none()
-            && row.managed_status != "KEPT_ORIGINAL"
-            && row.managed_status != "PROCESSED")
-        || row.sidecar_path.is_none()
 }
 
 fn item_needs_attention(item: &IntakeManagedItem) -> bool {
@@ -436,7 +426,13 @@ fn derive_tv_group_from_library(
     library_id: Option<&str>,
 ) -> Option<JobGroup> {
     let library = if let Some(id) = library_id {
-        config.libraries.iter().find(|candidate| candidate.id == id)
+        config.libraries.iter().find(|candidate| {
+            if candidate.id != id || candidate.media_type != "tv" {
+                return false;
+            }
+            let prefix = normalize_library_prefix(&candidate.path);
+            relative_path == prefix || relative_path.starts_with(&format!("{prefix}/"))
+        })
     } else {
         config
             .libraries
@@ -620,11 +616,6 @@ fn paginate_items(items: Vec<IntakeManagedItem>, limit: i64, offset: i64) -> Vec
         .collect()
 }
 
-fn configless_default() -> &'static AppConfig {
-    static DEFAULT_CONFIG: std::sync::OnceLock<AppConfig> = std::sync::OnceLock::new();
-    DEFAULT_CONFIG.get_or_init(AppConfig::default)
-}
-
 pub async fn reconcile_after_organize(
     pool: &SqlitePool,
     library_root: &Path,
@@ -718,6 +709,9 @@ async fn write_sidecar_from_row(library_root: &Path, row: &db::ManagedItemRow) -
 }
 
 fn intake_item_from_row(config: &AppConfig, row: db::ManagedItemRow) -> Result<IntakeManagedItem> {
+    let missing_metadata = row_missing_metadata(&row);
+    let missing_sidecar = row_missing_sidecar(&row);
+    let organize_needed = managed_item_needs_organize(config, &row);
     let selected_metadata = row
         .selected_metadata_json
         .as_deref()
@@ -739,9 +733,9 @@ fn intake_item_from_row(config: &AppConfig, row: db::ManagedItemRow) -> Result<I
         library_id: row.library_id,
         managed_status: row.managed_status.clone(),
         has_sidecar: row.sidecar_path.is_some(),
-        missing_metadata: row_missing_metadata(&row),
-        missing_sidecar: row_missing_sidecar(&row),
-        organize_needed: managed_item_needs_organize(config, &row),
+        missing_metadata,
+        missing_sidecar,
+        organize_needed,
         selected_metadata,
         last_decision,
         group_key: None,

@@ -33,8 +33,16 @@ export interface IntakeManagedItem {
 	library_id: string | null;
 	managed_status: string;
 	has_sidecar: boolean;
+	missing_metadata: boolean;
+	missing_sidecar: boolean;
+	organize_needed: boolean;
 	selected_metadata: InternetMetadataMatch | null;
 	last_decision: JobDecision | null;
+	group_key: string | null;
+	group_label: string | null;
+	group_kind: string;
+	member_paths: string[];
+	member_count: number;
 }
 
 export interface BacklogSummary {

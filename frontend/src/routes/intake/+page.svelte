@@ -118,8 +118,8 @@
 	const reviewState = $derived(getReviewState());
 	const reviewJobs = $derived(reviewState.awaitingApproval);
 	const showGroups = $derived(reviewState.showGroups);
-	const groupedJobIds = $derived(new Set(showGroups.flatMap((group) => group.map((job) => job.id))));
-	const standaloneReviewJobs = $derived(reviewJobs.filter((job) => !groupedJobIds.has(job.id)));
+	const standaloneReviewJobs = $derived(reviewState.standaloneReviewJobs);
+	const reviewItemCount = $derived(reviewState.counts.awaitingApprovalItems);
 	const executionCounts = $derived(getExecutionState().counts);
 </script>
 
@@ -145,7 +145,7 @@
 			</div>
 			<div class="rounded-[1rem] border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-4">
 				<div class="text-xs uppercase tracking-[0.16em] text-[color:var(--ink-muted)]">Awaiting Approval</div>
-				<div class="mt-2 text-2xl font-semibold text-[color:var(--ink-strong)]">{reviewJobs.length}</div>
+				<div class="mt-2 text-2xl font-semibold text-[color:var(--ink-strong)]">{reviewItemCount}</div>
 			</div>
 			<div class="rounded-[1rem] border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-4">
 				<div class="text-xs uppercase tracking-[0.16em] text-[color:var(--ink-muted)]">Approved / Processing</div>
@@ -165,10 +165,10 @@
 	<section class="mb-6">
 		<div class="mb-3 flex items-center gap-3">
 			<h2 class="text-lg text-[color:var(--ink-strong)]">Awaiting Approval</h2>
-			<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-[color:var(--accent-deep)]">{reviewJobs.length}</span>
+			<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-[color:var(--accent-deep)]">{reviewItemCount}</span>
 		</div>
 
-		{#if reviewJobs.length === 0}
+		{#if reviewItemCount === 0}
 			<div class="surface-card border-dashed px-6 py-12 text-center">
 				<p class="font-[family-name:var(--font-display)] text-xl text-[color:var(--ink-strong)]">No plans await approval</p>
 				<p class="mt-2 text-sm text-[color:var(--ink-muted)]">Use the backlog page to create AI reviews for unprocessed files, then approve them here.</p>

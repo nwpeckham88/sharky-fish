@@ -3,10 +3,12 @@
 	import { page } from '$app/state';
 	import { onDestroy, onMount } from 'svelte';
 	import {
+		createBulkIntakeReviews,
 		createIntakeReview,
 		fetchBacklogItems,
 		fetchLibrary,
 		fetchLibraryEvents,
+		updateBulkIntakeManagedStatus,
 		updateIntakeManagedStatus,
 		type BacklogFilter,
 		type IntakeManagedItem,
@@ -62,6 +64,7 @@
 	let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const reviewJobs = $derived(getReviewState().awaitingApproval);
+	const reviewItemCount = $derived(getReviewState().counts.awaitingApprovalItems);
 	const executionCounts = $derived(getExecutionState().counts);
 	const failedJobs = $derived(getExecutionState().failed);
 
@@ -163,8 +166,24 @@
 		reviewBusy = { ...reviewBusy, [item.relative_path]: true };
 		backlogError = '';
 		try {
-			const job = await createIntakeReview(item.relative_path);
-			jobStore.jobs = [job, ...jobStore.jobs.filter((existing) => existing.id !== job.id)];
+			if (item.group_kind === 'tv_show') {
+				const response = await createBulkIntakeReviews(item.member_paths);
+				jobStore.jobs = [
+					...response.jobs,
+					...jobStore.jobs.filter(
+						(existing) => !response.jobs.some((created) => created.id === existing.id)
+					)
+				];
+				if (response.failure_count > 0) {
+					const firstFailure = response.failures[0];
+					backlogError = firstFailure
+						? `Created ${response.success_count} review job(s); ${response.failure_count} failed. ${firstFailure.path}: ${firstFailure.error}`
+						: `Created ${response.success_count} review job(s); ${response.failure_count} failed.`;
+				}
+			} else {
+				const job = await createIntakeReview(item.relative_path);
+				jobStore.jobs = [job, ...jobStore.jobs.filter((existing) => existing.id !== job.id)];
+			}
 			await Promise.all([refreshManagedItemStore(), loadBacklog(activeBacklogFilter)]);
 		} catch (error) {
 			backlogError = error instanceof Error ? error.message : 'Failed to create AI review';
@@ -177,7 +196,17 @@
 		statusBusy = { ...statusBusy, [item.relative_path]: true };
 		backlogError = '';
 		try {
-			await updateIntakeManagedStatus(item.relative_path, status);
+			if (item.group_kind === 'tv_show') {
+				const response = await updateBulkIntakeManagedStatus(item.member_paths, status);
+				if (response.failure_count > 0) {
+					const firstFailure = response.failures[0];
+					backlogError = firstFailure
+						? `Updated ${response.success_count} path(s); ${response.failure_count} failed. ${firstFailure.path}: ${firstFailure.error}`
+						: `Updated ${response.success_count} path(s); ${response.failure_count} failed.`;
+				}
+			} else {
+				await updateIntakeManagedStatus(item.relative_path, status);
+			}
 			await Promise.all([refreshManagedItemStore(), loadBacklog(activeBacklogFilter)]);
 		} catch (error) {
 			backlogError = error instanceof Error ? error.message : 'Failed to update managed status';
@@ -271,7 +300,7 @@
 			</div>
 		</div>
 		<div class="mt-5 flex flex-wrap gap-2">
-			<a href="/intake" class="rounded-full bg-[color:var(--accent)] px-4 py-2 text-sm font-semibold text-white no-underline">Review {reviewJobs.length} AI plan{reviewJobs.length === 1 ? '' : 's'}</a>
+			<a href="/intake" class="rounded-full bg-[color:var(--accent)] px-4 py-2 text-sm font-semibold text-white no-underline">Review {reviewItemCount} item{reviewItemCount === 1 ? '' : 's'}</a>
 			<a href="/library" class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm font-semibold text-[color:var(--ink-strong)] no-underline">Audit library state</a>
 			<a href="/forge" class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm font-semibold text-[color:var(--ink-strong)] no-underline">Open execution</a>
 		</div>
@@ -286,7 +315,7 @@
 						<div class="text-sm font-semibold text-[color:var(--ink-strong)]">Awaiting Approval</div>
 						<div class="mt-1 text-xs text-[color:var(--ink-muted)]">Plans queued for operator decision</div>
 					</div>
-					<span class="status-chip processing">{reviewJobs.length}</span>
+					<span class="status-chip processing">{reviewItemCount}</span>
 				</div>
 			</div>
 			<div class="rounded-[1rem] border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-4">
@@ -351,34 +380,42 @@
 			</div>
 		{:else}
 			<div class="space-y-3">
-				{#each backlogItems.slice(0, 8) as item (item.relative_path)}
+				{#each backlogItems.slice(0, 8) as item (item.group_key ?? item.relative_path)}
 					<div class="rounded-[1rem] border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-4">
 						<div class="flex flex-wrap items-start justify-between gap-3">
 							<div class="min-w-0 flex-1">
 								<div class="flex flex-wrap items-center gap-2">
 									<span class="status-chip {statusTone(item.managed_status)}">{statusLabel(item.managed_status)}</span>
-									<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">{item.media_type}</span>
+									<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">{item.group_kind === 'tv_show' ? 'tv show' : item.media_type}</span>
 									{#if item.library_id}
 										<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">{item.library_id}</span>
 									{/if}
 									{#if item.has_sidecar}
 										<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">sidecar</span>
 									{/if}
-									{#if !item.selected_metadata}
+									{#if item.missing_metadata}
 										<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">needs metadata</span>
 									{/if}
+									{#if item.organize_needed}
+										<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">organize needed</span>
+									{/if}
+									{#if item.group_kind === 'tv_show'}
+										<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">{item.member_count} file{item.member_count === 1 ? '' : 's'}</span>
+									{/if}
 								</div>
-								<h3 class="mt-3 truncate text-base font-semibold text-[color:var(--ink-strong)]">{item.file_name}</h3>
-								<p class="mt-1 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</p>
+								<h3 class="mt-3 truncate text-base font-semibold text-[color:var(--ink-strong)]">{item.group_label ?? item.file_name}</h3>
+								<p class="mt-1 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.group_kind === 'tv_show' ? `${item.member_count} episode file${item.member_count === 1 ? '' : 's'} grouped under this show` : item.relative_path}</p>
 								<p class="mt-3 text-sm text-[color:var(--ink-muted)]">
-									{#if item.managed_status === 'UNPROCESSED'}
+									{#if item.group_kind === 'tv_show' && item.managed_status === 'UNPROCESSED'}
+										No durable sharky-fish context exists for this show yet. Create one review bundle for the full show or mark the show as intentionally left alone.
+									{:else if item.managed_status === 'UNPROCESSED'}
 										No durable sharky-fish context exists for this file yet. Choose whether to review it with AI or mark it as intentionally left alone.
 									{:else if item.managed_status === 'FAILED'}
-										This item has a failed execution history. Inspect the plan and task pipeline before resubmitting work.
+										This {item.group_kind === 'tv_show' ? 'show' : 'item'} has a failed execution history. Inspect the plan and task pipeline before resubmitting work.
 									{:else if item.managed_status === 'AWAITING_APPROVAL'}
-										This item already has an AI plan and is waiting for an operator decision.
+										This {item.group_kind === 'tv_show' ? 'show already has AI plans' : 'item already has an AI plan'} and is waiting for an operator decision.
 									{:else}
-										This item still needs library shaping follow-up based on metadata or persistence state.
+										This {item.group_kind === 'tv_show' ? 'show' : 'item'} still needs library shaping follow-up based on metadata or persistence state.
 									{/if}
 								</p>
 							</div>
@@ -426,7 +463,7 @@
 				</div>
 				<a href="/intake" class="text-sm font-semibold text-[color:var(--accent-deep)] no-underline hover:underline">Open review</a>
 			</div>
-			{#if reviewJobs.length === 0}
+			{#if reviewItemCount === 0}
 				<p class="text-sm text-[color:var(--ink-muted)]">No AI plans are waiting for approval.</p>
 			{:else}
 				<div class="space-y-2">

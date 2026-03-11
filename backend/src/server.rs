@@ -303,7 +303,8 @@ async fn list_unprocessed_intake_items(
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(50).clamp(1, 500);
     let offset = params.offset.unwrap_or(0).max(0);
-    match managed_items::list_unprocessed(&state.pool, limit, offset).await {
+    let config = { state.config.read().await.clone() };
+    match managed_items::list_unprocessed(&state.pool, &config, limit, offset).await {
         Ok(items) => Json(items).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
