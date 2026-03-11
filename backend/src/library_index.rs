@@ -1,5 +1,6 @@
 use crate::config::LibraryFolder;
 use crate::db;
+use crate::managed_items;
 use crate::messages::{LibraryIndexScanProgress, SseEvent};
 
 use anyhow::Result;
@@ -59,6 +60,7 @@ pub async fn run_full_rescan(
 
         let (tx, rx) = mpsc::channel::<IndexCandidate>(queue_capacity);
         let discovered_total = Arc::new(AtomicUsize::new(0));
+        let scan_library_root = library_root.clone();
         let producer_total = discovered_total.clone();
         let producer_root = library_root.clone();
         let producer_libraries = libraries;
@@ -135,6 +137,7 @@ pub async fn run_full_rescan(
         let mut stream = ReceiverStream::new(rx)
             .map(|candidate| {
                 let pool = pool.clone();
+                let library_root = scan_library_root.clone();
                 async move {
                     db::upsert_library_index_entry(
                         &pool,
@@ -142,6 +145,19 @@ pub async fn run_full_rescan(
                         &candidate.file_path,
                         &candidate.file_name,
                         &candidate.extension,
+                        &candidate.media_type,
+                        candidate.size_bytes,
+                        candidate.modified_at,
+                        candidate.library_id.as_deref(),
+                    )
+                    .await?;
+
+                    managed_items::sync_library_file(
+                        &pool,
+                        &library_root,
+                        &candidate.relative_path,
+                        &candidate.file_path,
+                        &candidate.file_name,
                         &candidate.media_type,
                         candidate.size_bytes,
                         candidate.modified_at,
@@ -175,6 +191,7 @@ pub async fn run_full_rescan(
 
         let total = discovered_total.load(Ordering::Relaxed).max(scanned_items);
         db::update_library_scan_progress(&pool, scanned_items, total).await?;
+    db::delete_stale_managed_items(&pool).await?;
 
         let completed_at = unix_now();
         db::complete_library_scan(&pool, completed_at, scanned_items).await?;
@@ -235,11 +252,13 @@ pub async fn apply_library_path_change(
     // Deletions and missing files should evict stale rows.
     if change == "removed" || !path.exists() {
         db::delete_library_index_entry(pool, &relative_path).await?;
+        managed_items::remove_missing_item(pool, &relative_path).await?;
         return Ok(());
     }
 
     let Some(media_type) = detect_media_type(path) else {
         db::delete_library_index_entry(pool, &relative_path).await?;
+        managed_items::remove_missing_item(pool, &relative_path).await?;
         return Ok(());
     };
 
@@ -247,6 +266,7 @@ pub async fn apply_library_path_change(
         Ok(value) => value,
         Err(_) => {
             db::delete_library_index_entry(pool, &relative_path).await?;
+            managed_items::remove_missing_item(pool, &relative_path).await?;
             return Ok(());
         }
     };
@@ -276,6 +296,19 @@ pub async fn apply_library_path_change(
         &path.display().to_string(),
         &file_name,
         &extension,
+        media_type,
+        metadata.len(),
+        modified_at,
+        library_id.as_deref(),
+    )
+    .await?;
+
+    managed_items::sync_library_file(
+        pool,
+        library_root,
+        &relative_path,
+        &path.display().to_string(),
+        &file_name,
         media_type,
         metadata.len(),
         modified_at,

@@ -187,6 +187,34 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     .await?;
 
     sqlx::query(
+        "CREATE TABLE IF NOT EXISTS managed_items (
+            relative_path           TEXT PRIMARY KEY,
+            file_path               TEXT NOT NULL,
+            file_name               TEXT NOT NULL,
+            media_type              TEXT NOT NULL,
+            size_bytes              INTEGER NOT NULL,
+            modified_at             INTEGER NOT NULL,
+            library_id              TEXT,
+            managed_status          TEXT NOT NULL DEFAULT 'UNPROCESSED',
+            selected_metadata_json  TEXT,
+            last_decision_json      TEXT,
+            sidecar_path            TEXT,
+            first_seen_at           INTEGER NOT NULL,
+            last_seen_at            INTEGER NOT NULL,
+            updated_at              DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_managed_items_status_modified
+         ON managed_items (managed_status, modified_at DESC, relative_path ASC)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
         "INSERT INTO library_scan_state (id, status, scanned_items, total_items)
          VALUES (1, 'idle', 0, 0)
          ON CONFLICT(id) DO NOTHING",
@@ -316,6 +344,24 @@ pub struct LibraryScanStateRow {
     pub last_error: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
+pub struct ManagedItemRow {
+    pub relative_path: String,
+    pub file_path: String,
+    pub file_name: String,
+    pub media_type: String,
+    pub size_bytes: i64,
+    pub modified_at: i64,
+    pub library_id: Option<String>,
+    pub managed_status: String,
+    pub selected_metadata_json: Option<String>,
+    pub last_decision_json: Option<String>,
+    pub sidecar_path: Option<String>,
+    pub first_seen_at: i64,
+    pub last_seen_at: i64,
+    pub updated_at: String,
+}
+
 /// Insert a new job and return its id.
 pub async fn insert_job(pool: &SqlitePool, file_path: &str, status: &str) -> Result<i64> {
     let id = sqlx::query("INSERT INTO jobs (file_path, status) VALUES (?, ?)")
@@ -393,6 +439,40 @@ pub async fn fetch_job(pool: &SqlitePool, job_id: i64) -> Result<Option<Job>> {
     .await?;
 
     Ok(row)
+}
+
+pub async fn fetch_job_with_analysis(pool: &SqlitePool, job_id: i64) -> Result<Option<JobWithAnalysis>> {
+    let row = sqlx::query(
+        "SELECT j.id, j.file_path, j.status, j.created_at, a.probe_json, a.decision_json
+         FROM jobs j
+         LEFT JOIN job_analysis a ON a.job_id = j.id
+         WHERE j.id = ?",
+    )
+    .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(None);
+    };
+
+    let probe = row
+        .try_get::<Option<String>, _>("probe_json")?
+        .map(|json| serde_json::from_str::<MediaProbe>(&json))
+        .transpose()?;
+    let decision = row
+        .try_get::<Option<String>, _>("decision_json")?
+        .map(|json| serde_json::from_str::<ProcessingDecision>(&json))
+        .transpose()?;
+
+    Ok(Some(JobWithAnalysis {
+        id: row.try_get("id")?,
+        file_path: row.try_get("file_path")?,
+        status: row.try_get("status")?,
+        created_at: row.try_get("created_at")?,
+        probe,
+        decision,
+    }))
 }
 
 /// Update task status and optionally its payload.
@@ -879,4 +959,115 @@ pub async fn fail_library_scan(
     .await?;
 
     Ok(())
+}
+
+pub async fn fetch_managed_item(pool: &SqlitePool, relative_path: &str) -> Result<Option<ManagedItemRow>> {
+    let row = sqlx::query_as::<_, ManagedItemRow>(
+        "SELECT relative_path, file_path, file_name, media_type, size_bytes, modified_at,
+                library_id, managed_status, selected_metadata_json, last_decision_json,
+                sidecar_path, first_seen_at, last_seen_at, updated_at
+         FROM managed_items
+         WHERE relative_path = ?",
+    )
+    .bind(relative_path)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
+}
+
+pub async fn upsert_managed_item(
+    pool: &SqlitePool,
+    relative_path: &str,
+    file_path: &str,
+    file_name: &str,
+    media_type: &str,
+    size_bytes: u64,
+    modified_at: u64,
+    library_id: Option<&str>,
+    managed_status: &str,
+    selected_metadata_json: Option<&str>,
+    last_decision_json: Option<&str>,
+    sidecar_path: Option<&str>,
+    first_seen_at: u64,
+    last_seen_at: u64,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO managed_items (
+            relative_path, file_path, file_name, media_type, size_bytes, modified_at,
+            library_id, managed_status, selected_metadata_json, last_decision_json,
+            sidecar_path, first_seen_at, last_seen_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(relative_path) DO UPDATE SET
+            file_path = excluded.file_path,
+            file_name = excluded.file_name,
+            media_type = excluded.media_type,
+            size_bytes = excluded.size_bytes,
+            modified_at = excluded.modified_at,
+            library_id = excluded.library_id,
+            managed_status = excluded.managed_status,
+            selected_metadata_json = excluded.selected_metadata_json,
+            last_decision_json = excluded.last_decision_json,
+            sidecar_path = excluded.sidecar_path,
+            first_seen_at = managed_items.first_seen_at,
+            last_seen_at = excluded.last_seen_at,
+            updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(relative_path)
+    .bind(file_path)
+    .bind(file_name)
+    .bind(media_type)
+    .bind(size_bytes as i64)
+    .bind(modified_at as i64)
+    .bind(library_id)
+    .bind(managed_status)
+    .bind(selected_metadata_json)
+    .bind(last_decision_json)
+    .bind(sidecar_path)
+    .bind(first_seen_at as i64)
+    .bind(last_seen_at as i64)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn delete_managed_item(pool: &SqlitePool, relative_path: &str) -> Result<()> {
+    sqlx::query("DELETE FROM managed_items WHERE relative_path = ?")
+        .bind(relative_path)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn delete_stale_managed_items(pool: &SqlitePool) -> Result<()> {
+    sqlx::query(
+        "DELETE FROM managed_items
+         WHERE relative_path NOT IN (SELECT relative_path FROM library_index)",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_unprocessed_managed_items(
+    pool: &SqlitePool,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ManagedItemRow>> {
+    let rows = sqlx::query_as::<_, ManagedItemRow>(
+        "SELECT relative_path, file_path, file_name, media_type, size_bytes, modified_at,
+                library_id, managed_status, selected_metadata_json, last_decision_json,
+                sidecar_path, first_seen_at, last_seen_at, updated_at
+         FROM managed_items
+         WHERE managed_status = 'UNPROCESSED'
+         ORDER BY modified_at DESC, relative_path ASC
+         LIMIT ? OFFSET ?",
+    )
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
 }

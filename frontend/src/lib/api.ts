@@ -20,6 +20,20 @@ export interface JobDecision {
 	rationale: string;
 }
 
+export interface IntakeManagedItem {
+	relative_path: string;
+	file_path: string;
+	file_name: string;
+	media_type: string;
+	size_bytes: number;
+	modified_at: number;
+	library_id: string | null;
+	managed_status: string;
+	has_sidecar: boolean;
+	selected_metadata: InternetMetadataMatch | null;
+	last_decision: JobDecision | null;
+}
+
 export interface Task {
 	id: number;
 	job_id: number;
@@ -260,6 +274,12 @@ const BASE = '/api';
 export async function fetchJobs(limit = 50, offset = 0): Promise<Job[]> {
 	const res = await fetch(`${BASE}/jobs?limit=${limit}&offset=${offset}`);
 	if (!res.ok) throw new Error(`Failed to fetch jobs: ${res.status}`);
+	return res.json();
+}
+
+export async function fetchUnprocessedIntake(limit = 50, offset = 0): Promise<IntakeManagedItem[]> {
+	const res = await fetch(`${BASE}/intake/unprocessed?limit=${limit}&offset=${offset}`);
+	if (!res.ok) throw new Error(`Failed to fetch unprocessed intake items: ${res.status}`);
 	return res.json();
 }
 

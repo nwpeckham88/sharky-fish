@@ -3,6 +3,7 @@ use crate::db;
 use crate::internet_metadata;
 use crate::library;
 use crate::library_index;
+use crate::managed_items;
 use crate::metadata;
 use crate::messages::{LibraryChange, SseEvent};
 use crate::organizer;
@@ -47,6 +48,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{id}/approve", axum::routing::post(approve_job))
         .route("/api/jobs/{id}/reject", axum::routing::post(reject_job))
+        .route("/api/intake/unprocessed", get(list_unprocessed_intake_items))
         .route("/api/library", get(list_library))
         .route("/api/library/rescan", axum::routing::post(trigger_library_rescan))
         .route("/api/library/events", get(list_library_events))
@@ -225,12 +227,43 @@ async fn transition_job_status(state: Arc<AppState>, id: i64, next_status: &str)
 
     match db::update_job_status(&state.pool, id, next_status).await {
         Ok(()) => {
+            if let Ok(relative_path) = Path::new(&job.file_path).strip_prefix(&state.library_path) {
+                if let Ok(Some(job_with_analysis)) = db::fetch_job_with_analysis(&state.pool, id).await {
+                    if let Some(decision) = job_with_analysis.decision {
+                        let relative_path = relative_path.to_string_lossy().replace('\\', "/");
+                        if let Err(error) = managed_items::persist_processing_decision(
+                            &state.pool,
+                            &state.library_path,
+                            &relative_path,
+                            next_status,
+                            &decision,
+                        )
+                        .await
+                        {
+                            tracing::warn!(err = %error, job_id = id, "failed to persist managed item decision sidecar");
+                        }
+                    }
+                }
+            }
+
             let _ = state.sse_tx.send(SseEvent::JobStatus {
                 job_id: id,
                 status: next_status.to_string(),
             });
             StatusCode::NO_CONTENT.into_response()
         }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn list_unprocessed_intake_items(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<Pagination>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50).clamp(1, 500);
+    let offset = params.offset.unwrap_or(0).max(0);
+    match managed_items::list_unprocessed(&state.pool, limit, offset).await {
+        Ok(items) => Json(items).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }
@@ -525,11 +558,24 @@ async fn save_selected_library_internet_metadata(
     }
 
     match db::upsert_selected_internet_metadata(&state.pool, request.path.trim(), &request.selected).await {
-        Ok(()) => Json(SelectedInternetMetadataResponse {
-            path: request.path.trim().to_string(),
-            selected: request.selected,
-        })
-        .into_response(),
+        Ok(()) => {
+            if let Err(error) = managed_items::persist_selected_metadata(
+                &state.pool,
+                &state.library_path,
+                request.path.trim(),
+                &request.selected,
+            )
+            .await
+            {
+                tracing::warn!(err = %error, path = request.path.trim(), "failed to persist managed item sidecar");
+            }
+
+            Json(SelectedInternetMetadataResponse {
+                path: request.path.trim().to_string(),
+                selected: request.selected,
+            })
+            .into_response()
+        }
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }
 }

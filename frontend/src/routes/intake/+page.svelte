@@ -1,9 +1,13 @@
 <script lang="ts">
-	import { approveJob, rejectJob, type Job, type MediaProbe } from '$lib/api';
+	import { onMount } from 'svelte';
+	import { approveJob, fetchUnprocessedIntake, rejectJob, type IntakeManagedItem, type Job, type MediaProbe } from '$lib/api';
 	import { jobStore, progressStore } from '$lib/stores.svelte';
 
 	let actionBusy = $state<Record<number, 'approve' | 'reject' | null>>({});
 	let actionErrors = $state<Record<number, string>>({});
+	let unprocessedItems = $state<IntakeManagedItem[]>([]);
+	let unprocessedError = $state('');
+	let unprocessedLoading = $state(true);
 
 	function statusTone(status: string): string {
 		switch (status) {
@@ -49,6 +53,28 @@
 		return job.decision?.arguments.join(' ') ?? 'No AI command generated yet.';
 	}
 
+	function formatBytes(bytes: number): string {
+		if (!bytes || bytes <= 0) return '0 B';
+		const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+		let value = bytes;
+		let index = 0;
+		while (value >= 1024 && index < units.length - 1) {
+			value /= 1024;
+			index += 1;
+		}
+		return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
+	}
+
+	onMount(async () => {
+		try {
+			unprocessedItems = await fetchUnprocessedIntake(200);
+		} catch (error) {
+			unprocessedError = error instanceof Error ? error.message : 'Failed to load unprocessed library items';
+		} finally {
+			unprocessedLoading = false;
+		}
+	});
+
 	async function runAction(jobId: number, action: 'approve' | 'reject') {
 		actionBusy = { ...actionBusy, [jobId]: action };
 		actionErrors = { ...actionErrors, [jobId]: '' };
@@ -89,6 +115,45 @@
 {#if loading}
 	<div class="surface-card px-8 py-16 text-center text-[color:var(--ink-muted)]">Loading intake queue…</div>
 {:else}
+	<section class="mb-6">
+		<div class="mb-3 flex items-center gap-3">
+			<h2 class="text-lg text-[color:var(--ink-strong)]">Unprocessed Library Files</h2>
+			<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-[color:var(--accent-deep)]">{unprocessedItems.length}</span>
+		</div>
+
+		{#if unprocessedLoading}
+			<div class="surface-card px-6 py-10 text-center text-[color:var(--ink-muted)]">Scanning for unprocessed library files…</div>
+		{:else if unprocessedError}
+			<div class="surface-card border-[color:rgba(138,75,67,0.22)] px-6 py-6 text-sm text-[color:var(--danger)]">{unprocessedError}</div>
+		{:else if unprocessedItems.length === 0}
+			<div class="surface-card border-dashed px-6 py-10 text-center">
+				<p class="font-[family-name:var(--font-display)] text-xl text-[color:var(--ink-strong)]">No unprocessed library files</p>
+				<p class="mt-2 text-sm text-[color:var(--ink-muted)]">Library items without sharky-fish context will appear here after scan so you can shape them up intentionally.</p>
+			</div>
+		{:else}
+			<div class="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+				{#each unprocessedItems as item (item.relative_path)}
+					<div class="triage-card">
+						<div class="mb-3 flex items-center justify-between gap-2">
+							<span class="rounded-full bg-[color:rgba(74,107,90,0.12)] px-2.5 py-1 text-[11px] font-bold uppercase tracking-[0.16em] text-[color:var(--olive)]">Needs shaping</span>
+							<span class="text-xs text-[color:var(--ink-muted)]">{item.media_type}</span>
+						</div>
+						<h3 class="mb-1 truncate text-sm font-semibold text-[color:var(--ink-strong)]">{item.file_name}</h3>
+						<p class="mb-3 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</p>
+						<div class="flex flex-wrap gap-2">
+							<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]">{formatBytes(item.size_bytes)}</span>
+							{#if item.library_id}
+								<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]">{item.library_id}</span>
+							{/if}
+							<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-2.5 py-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]">{new Date(item.modified_at * 1000).toLocaleDateString()}</span>
+						</div>
+						<p class="mt-4 text-xs text-[color:var(--ink-muted)]">This file has no persisted sharky-fish context yet. Run metadata lookup and organization from the Library view, then that context will survive rescans through a sidecar.</p>
+					</div>
+				{/each}
+			</div>
+		{/if}
+	</section>
+
 	<!-- Pending Triage -->
 	<section class="mb-6">
 		<div class="mb-3 flex items-center gap-3">

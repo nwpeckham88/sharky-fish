@@ -4,10 +4,12 @@ mod db;
 mod internet_metadata;
 mod library;
 mod library_index;
+mod managed_items;
 mod metadata;
 mod messages;
 mod organizer;
 mod server;
+mod sidecar;
 
 use crate::actors::{
     brain::BrainActor, forge::ForgeActor, identifier::IdentifierActor, queue::QueueActor,
