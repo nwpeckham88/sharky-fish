@@ -38,14 +38,14 @@ struct CreateIntakeReviewRequest {
 
 #[derive(Deserialize)]
 struct BulkPathsRequest {
+    paths: Vec<String>,
+}
 
 #[derive(Serialize)]
 struct BulkInternetAutoSelectResponse {
 	success_count: usize,
 	failure_count: usize,
 	failures: Vec<BulkFailure>,
-}
-    paths: Vec<String>,
 }
 
 #[derive(Deserialize)]
