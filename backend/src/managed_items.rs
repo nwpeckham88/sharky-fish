@@ -30,8 +30,16 @@ pub struct IntakeManagedItem {
     pub library_id: Option<String>,
     pub managed_status: String,
     pub has_sidecar: bool,
+    pub missing_metadata: bool,
+    pub missing_sidecar: bool,
+    pub organize_needed: bool,
     pub selected_metadata: Option<InternetMetadataMatch>,
     pub last_decision: Option<ProcessingDecision>,
+    pub group_key: Option<String>,
+    pub group_label: Option<String>,
+    pub group_kind: String,
+    pub member_paths: Vec<String>,
+    pub member_count: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -212,8 +220,16 @@ pub async fn list_unprocessed(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<IntakeManagedItem>> {
-    let rows = db::list_unprocessed_managed_items(pool, limit, offset).await?;
-    rows.into_iter().map(intake_item_from_row).collect()
+    let rows = db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
+    let items = aggregate_backlog_items(configless_default(), rows)?;
+    Ok(paginate_items(
+        items
+            .into_iter()
+            .filter(|item| item.managed_status == "UNPROCESSED")
+            .collect(),
+        limit,
+        offset,
+    ))
 }
 
 pub async fn list_filtered(
@@ -227,63 +243,59 @@ pub async fn list_filtered(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<IntakeManagedItem>> {
-    let rows = if needs_attention_only || organize_needed_only {
-        let all_rows =
-            db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
+    let rows = db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
+    let items = aggregate_backlog_items(config, rows)?;
+    let items = aggregate_backlog_items(config, all_rows)?;
 
-        all_rows
+    Ok(paginate_items(
+        items
             .into_iter()
-            .filter(|row| {
-                let organize_needed = managed_item_needs_organize(config, row);
-                if organize_needed_only {
-                    return organize_needed;
+            .filter(|item| {
+                if let Some(status) = managed_status {
+                    if item.managed_status != status {
+                        return false;
+                    }
                 }
-                base_needs_attention(row) || organize_needed
+                if missing_metadata_only && !item.missing_metadata {
+                    return false;
+                }
+                if missing_sidecar_only && !item.missing_sidecar {
+                    return false;
+                }
+                if organize_needed_only && !item.organize_needed {
+                    return false;
+                }
+                if needs_attention_only && !item_needs_attention(item) {
+                    return false;
+                }
+                true
             })
-            .skip(offset.max(0) as usize)
-            .take(limit.max(0) as usize)
-            .collect()
-    } else {
-        db::list_managed_items_filtered(
-            pool,
-            managed_status,
-            missing_metadata_only,
-            missing_sidecar_only,
-            needs_attention_only,
-            limit,
-            offset,
-        )
-        .await?
-    };
-    rows.into_iter().map(intake_item_from_row).collect()
+            .collect(),
+        limit,
+        offset,
+    ))
 }
 
+        static DEFAULT_CONFIG: std::sync::OnceLock<AppConfig> = std::sync::OnceLock::new();
+        DEFAULT_CONFIG.get_or_init(AppConfig::default)
+    }
 pub async fn summarize(pool: &SqlitePool, config: &AppConfig) -> Result<BacklogSummary> {
-    let row = db::summarize_managed_items(pool).await?;
-    let all_rows =
-        db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
-    let organize_needed_count = all_rows
-        .iter()
-        .filter(|item| managed_item_needs_organize(config, item))
-        .count() as u64;
-    let needs_attention_count = all_rows
-        .iter()
-        .filter(|item| base_needs_attention(item) || managed_item_needs_organize(config, item))
-        .count() as u64;
+    let all_rows = db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
+    let items = aggregate_backlog_items(config, all_rows)?;
 
     Ok(BacklogSummary {
-        total_items: row.total_items.max(0) as u64,
-        needs_attention_count,
-        unprocessed_count: row.unprocessed_count.max(0) as u64,
-        reviewed_count: row.reviewed_count.max(0) as u64,
-        kept_original_count: row.kept_original_count.max(0) as u64,
-        awaiting_approval_count: row.awaiting_approval_count.max(0) as u64,
-        approved_count: row.approved_count.max(0) as u64,
-        processed_count: row.processed_count.max(0) as u64,
-        failed_count: row.failed_count.max(0) as u64,
-        missing_metadata_count: row.missing_metadata_count.max(0) as u64,
-        missing_sidecar_count: row.missing_sidecar_count.max(0) as u64,
-        organize_needed_count,
+        total_items: items.len() as u64,
+        needs_attention_count: items.iter().filter(|item| item_needs_attention(item)).count() as u64,
+        unprocessed_count: items.iter().filter(|item| item.managed_status == "UNPROCESSED").count() as u64,
+        reviewed_count: items.iter().filter(|item| item.managed_status == "REVIEWED").count() as u64,
+        kept_original_count: items.iter().filter(|item| item.managed_status == "KEPT_ORIGINAL").count() as u64,
+        awaiting_approval_count: items.iter().filter(|item| item.managed_status == "AWAITING_APPROVAL").count() as u64,
+        approved_count: items.iter().filter(|item| item.managed_status == "APPROVED").count() as u64,
+        processed_count: items.iter().filter(|item| item.managed_status == "PROCESSED").count() as u64,
+        failed_count: items.iter().filter(|item| item.managed_status == "FAILED").count() as u64,
+        missing_metadata_count: items.iter().filter(|item| item.missing_metadata).count() as u64,
+        missing_sidecar_count: items.iter().filter(|item| item.missing_sidecar).count() as u64,
+        organize_needed_count: items.iter().filter(|item| item.organize_needed).count() as u64,
     })
 }
 
@@ -295,6 +307,15 @@ fn base_needs_attention(row: &db::ManagedItemRow) -> bool {
             && row.managed_status != "KEPT_ORIGINAL"
             && row.managed_status != "PROCESSED")
         || row.sidecar_path.is_none()
+}
+
+fn item_needs_attention(item: &IntakeManagedItem) -> bool {
+    item.managed_status == "UNPROCESSED"
+        || item.managed_status == "FAILED"
+        || item.managed_status == "AWAITING_APPROVAL"
+        || item.missing_metadata
+        || item.missing_sidecar
+        || item.organize_needed
 }
 
 fn managed_item_needs_organize(config: &AppConfig, row: &db::ManagedItemRow) -> bool {
@@ -459,6 +480,151 @@ fn normalize_library_prefix(value: &str) -> String {
     value.trim_matches('/').replace('\\', "/")
 }
 
+fn aggregate_backlog_items(
+    config: &AppConfig,
+    rows: Vec<db::ManagedItemRow>,
+) -> Result<Vec<IntakeManagedItem>> {
+    let mut items = Vec::new();
+    let mut grouped_rows = std::collections::HashMap::<String, (JobGroup, Vec<db::ManagedItemRow>)>::new();
+
+    for row in rows {
+        if let Some(group) = backlog_group_for_row(config, &row) {
+            grouped_rows
+                .entry(group.key.clone())
+                .or_insert_with(|| (group.clone(), Vec::new()))
+                .1
+                .push(row);
+            continue;
+        }
+
+        items.push(intake_item_from_row(config, row)?);
+    }
+
+    for (_, (group, group_rows)) in grouped_rows {
+        items.push(intake_item_from_group(config, group, group_rows)?);
+    }
+
+    items.sort_by(compare_backlog_items);
+    Ok(items)
+}
+
+fn backlog_group_for_row(config: &AppConfig, row: &db::ManagedItemRow) -> Option<JobGroup> {
+    row.selected_metadata_json
+        .as_deref()
+        .and_then(|json| serde_json::from_str::<InternetMetadataMatch>(json).ok())
+        .and_then(job_group_from_selected_metadata)
+        .or_else(|| derive_tv_group_from_library(config, &row.relative_path, row.library_id.as_deref()))
+}
+
+fn intake_item_from_group(
+    config: &AppConfig,
+    group: JobGroup,
+    mut rows: Vec<db::ManagedItemRow>,
+) -> Result<IntakeManagedItem> {
+    rows.sort_by(compare_managed_item_rows);
+    let lead = rows
+        .first()
+        .cloned()
+        .context("backlog group missing representative row")?;
+
+    let member_paths = rows
+        .iter()
+        .map(|row| row.relative_path.clone())
+        .collect::<Vec<_>>();
+    let missing_metadata = rows.iter().any(row_missing_metadata);
+    let missing_sidecar = rows.iter().any(row_missing_sidecar);
+    let organize_needed = rows.iter().any(|row| managed_item_needs_organize(config, row));
+    let selected_metadata = if missing_metadata {
+        None
+    } else {
+        rows.iter()
+            .filter_map(|row| row.selected_metadata_json.as_deref())
+            .find_map(|json| serde_json::from_str::<InternetMetadataMatch>(json).ok())
+    };
+    let last_decision = lead
+        .last_decision_json
+        .as_deref()
+        .map(serde_json::from_str::<ProcessingDecision>)
+        .transpose()?;
+
+    Ok(IntakeManagedItem {
+        relative_path: lead.relative_path,
+        file_path: lead.file_path,
+        file_name: group.label.clone(),
+        media_type: lead.media_type,
+        size_bytes: rows.iter().map(|row| row.size_bytes.max(0) as u64).sum(),
+        modified_at: rows
+            .iter()
+            .map(|row| row.modified_at.max(0) as u64)
+            .max()
+            .unwrap_or(0),
+        library_id: lead.library_id,
+        managed_status: lead.managed_status,
+        has_sidecar: !missing_sidecar,
+        missing_metadata,
+        missing_sidecar,
+        organize_needed,
+        selected_metadata,
+        last_decision,
+        group_key: Some(group.key),
+        group_label: Some(group.label),
+        group_kind: group.kind,
+        member_count: member_paths.len() as u64,
+        member_paths,
+    })
+}
+
+fn compare_managed_item_rows(left: &db::ManagedItemRow, right: &db::ManagedItemRow) -> std::cmp::Ordering {
+    status_priority(&left.managed_status)
+        .cmp(&status_priority(&right.managed_status))
+        .then_with(|| right.modified_at.cmp(&left.modified_at))
+        .then_with(|| left.relative_path.cmp(&right.relative_path))
+}
+
+fn compare_backlog_items(left: &IntakeManagedItem, right: &IntakeManagedItem) -> std::cmp::Ordering {
+    status_priority(&left.managed_status)
+        .cmp(&status_priority(&right.managed_status))
+        .then_with(|| right.modified_at.cmp(&left.modified_at))
+        .then_with(|| left.file_name.cmp(&right.file_name))
+        .then_with(|| left.relative_path.cmp(&right.relative_path))
+}
+
+fn status_priority(status: &str) -> u8 {
+    match status {
+        "FAILED" => 0,
+        "UNPROCESSED" => 1,
+        "AWAITING_APPROVAL" => 2,
+        "APPROVED" => 3,
+        "REVIEWED" => 4,
+        "KEPT_ORIGINAL" => 5,
+        "PROCESSED" => 6,
+        _ => 7,
+    }
+}
+
+fn row_missing_metadata(row: &db::ManagedItemRow) -> bool {
+    row.selected_metadata_json.is_none()
+        && row.managed_status != "KEPT_ORIGINAL"
+        && row.managed_status != "PROCESSED"
+}
+
+fn row_missing_sidecar(row: &db::ManagedItemRow) -> bool {
+    row.sidecar_path.is_none()
+}
+
+fn paginate_items(items: Vec<IntakeManagedItem>, limit: i64, offset: i64) -> Vec<IntakeManagedItem> {
+    items
+        .into_iter()
+        .skip(offset.max(0) as usize)
+        .take(limit.max(0) as usize)
+        .collect()
+}
+
+fn configless_default() -> &'static AppConfig {
+    static DEFAULT_CONFIG: std::sync::OnceLock<AppConfig> = std::sync::OnceLock::new();
+    DEFAULT_CONFIG.get_or_init(AppConfig::default)
+}
+
 pub async fn reconcile_after_organize(
     pool: &SqlitePool,
     library_root: &Path,
@@ -551,7 +717,7 @@ async fn write_sidecar_from_row(library_root: &Path, row: &db::ManagedItemRow) -
     sidecar::write_sidecar(library_root, &doc).await
 }
 
-fn intake_item_from_row(row: db::ManagedItemRow) -> Result<IntakeManagedItem> {
+fn intake_item_from_row(config: &AppConfig, row: db::ManagedItemRow) -> Result<IntakeManagedItem> {
     let selected_metadata = row
         .selected_metadata_json
         .as_deref()
@@ -564,18 +730,112 @@ fn intake_item_from_row(row: db::ManagedItemRow) -> Result<IntakeManagedItem> {
         .transpose()?;
 
     Ok(IntakeManagedItem {
-        relative_path: row.relative_path,
+        relative_path: row.relative_path.clone(),
         file_path: row.file_path,
         file_name: row.file_name,
         media_type: row.media_type,
         size_bytes: row.size_bytes.max(0) as u64,
         modified_at: row.modified_at.max(0) as u64,
         library_id: row.library_id,
-        managed_status: row.managed_status,
+        managed_status: row.managed_status.clone(),
         has_sidecar: row.sidecar_path.is_some(),
+        missing_metadata: row_missing_metadata(&row),
+        missing_sidecar: row_missing_sidecar(&row),
+        organize_needed: managed_item_needs_organize(config, &row),
         selected_metadata,
         last_decision,
+        group_key: None,
+        group_label: None,
+        group_kind: "file".into(),
+        member_paths: vec![row.relative_path],
+        member_count: 1,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LibraryFolder;
+
+    fn row(relative_path: &str, status: &str, selected_metadata_json: Option<&str>) -> db::ManagedItemRow {
+        db::ManagedItemRow {
+            relative_path: relative_path.into(),
+            file_path: format!("/data/{relative_path}"),
+            file_name: relative_path.rsplit('/').next().unwrap_or(relative_path).into(),
+            media_type: "video".into(),
+            size_bytes: 100,
+            modified_at: 10,
+            library_id: Some("tv".into()),
+            managed_status: status.into(),
+            selected_metadata_json: selected_metadata_json.map(str::to_string),
+            last_decision_json: None,
+            sidecar_path: Some(format!("{relative_path}.json")),
+            first_seen_at: 1,
+            last_seen_at: 10,
+            updated_at: "2026-03-11T00:00:00Z".into(),
+        }
+    }
+
+    fn series_metadata(title: &str) -> String {
+        serde_json::json!({
+            "provider": "tvdb",
+            "title": title,
+            "year": 2024,
+            "media_kind": "series",
+            "imdb_id": null,
+            "tvdb_id": 12345,
+            "overview": null,
+            "rating": null,
+            "genres": [],
+            "poster_url": null,
+            "source_url": null
+        })
+        .to_string()
+    }
+
+    fn config() -> AppConfig {
+        let mut config = AppConfig::default();
+        config.libraries = vec![LibraryFolder {
+            id: "tv".into(),
+            name: "TV".into(),
+            path: "tv".into(),
+            media_type: "tv".into(),
+        }];
+        config
+    }
+
+    #[test]
+    fn aggregates_tv_rows_into_one_backlog_item() {
+        let config = config();
+        let items = aggregate_backlog_items(
+            &config,
+            vec![
+                row("tv/Fallout/Season 01/Fallout - S01E01.mkv", "UNPROCESSED", Some(&series_metadata("Fallout"))),
+                row("tv/Fallout/Season 01/Fallout - S01E02.mkv", "REVIEWED", Some(&series_metadata("Fallout"))),
+            ],
+        )
+        .expect("grouped backlog items");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].group_kind, "tv_show");
+        assert_eq!(items[0].group_label.as_deref(), Some("Fallout"));
+        assert_eq!(items[0].member_count, 2);
+        assert_eq!(items[0].managed_status, "UNPROCESSED");
+    }
+
+    #[test]
+    fn keeps_movies_as_individual_items() {
+        let config = config();
+        let items = aggregate_backlog_items(
+            &config,
+            vec![row("movies/Dune (2021).mkv", "UNPROCESSED", None)],
+        )
+        .expect("backlog items");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].group_kind, "file");
+        assert_eq!(items[0].member_count, 1);
+    }
 }
 
 fn unix_now() -> u64 {

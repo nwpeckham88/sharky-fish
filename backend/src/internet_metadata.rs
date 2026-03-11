@@ -2,6 +2,7 @@ use anyhow::Result;
 use reqwest::Client;
 use serde::Deserialize;
 use serde::Serialize;
+use serde_json::Value;
 
 use crate::config::AppConfig;
 
@@ -592,39 +593,6 @@ struct OmdbSearchItem {
     poster: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct TvdbLoginResponse {
-    data: Option<TvdbLoginData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TvdbLoginData {
-    token: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct TvdbSearchResponse {
-    data: Option<Vec<TvdbSearchItem>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct TvdbSearchItem {
-    #[serde(default)]
-    tvdb_id: Option<u64>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    year: Option<String>,
-    #[serde(default)]
-    overview: Option<String>,
-    #[serde(default)]
-    image_url: Option<String>,
-    #[serde(default)]
-    slug: Option<String>,
-    #[serde(default)]
-    status: Option<String>,
-}
-
 async fn lookup_tvdb(
     client: &Client,
     api_key: &str,
@@ -637,22 +605,49 @@ async fn lookup_tvdb(
         body["pin"] = serde_json::Value::String(value.trim().to_string());
     }
 
-    let login = client
+    let login_response = client
         .post("https://api4.thetvdb.com/v4/login")
         .json(&body)
         .send()
-        .await?
-        .json::<TvdbLoginResponse>()
         .await?;
+    let login_status = login_response.status();
+    let login_body = login_response.text().await?;
+    if !login_status.is_success() {
+        return Err(anyhow::anyhow!(
+            "TVDB login failed ({}): {}",
+            login_status,
+            summarize_tvdb_body(&login_body)
+        ));
+    }
 
-    let token = login
-        .data
-        .map(|v| v.token)
+    let login_json: Value = serde_json::from_str(&login_body).map_err(|error| {
+        anyhow::anyhow!(
+            "TVDB login decode failed: {}; body: {}",
+            error,
+            summarize_tvdb_body(&login_body)
+        )
+    })?;
+
+    let token = login_json
+        .get("data")
+        .and_then(|value| value.get("token"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            login_json
+                .get("token")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        })
         .ok_or_else(|| anyhow::anyhow!("TVDB login did not return a token"))?;
 
     let mut req = client
         .get("https://api4.thetvdb.com/v4/search")
-        .bearer_auth(token)
+        .bearer_auth(&token)
         .query(&[("query", query)]);
 
     if let Some(kind) = media_hint {
@@ -660,42 +655,219 @@ async fn lookup_tvdb(
         req = req.query(&[("type", tvdb_kind)]);
     }
 
-    let result = req.send().await?.json::<TvdbSearchResponse>().await?;
+    let response = req.send().await?;
+    let search_status = response.status();
+    let search_body = response.text().await?;
+    if !search_status.is_success() {
+        return Err(anyhow::anyhow!(
+            "TVDB search failed ({}): {}",
+            search_status,
+            summarize_tvdb_body(&search_body)
+        ));
+    }
 
-    let mut matches = Vec::new();
-    if let Some(items) = result.data {
-        for item in items.into_iter().take(5) {
-            let title = item.name.unwrap_or_else(|| query.to_string());
-            let year = item.year.as_deref().and_then(|v| v.parse::<u16>().ok());
-            let media_kind = media_hint.unwrap_or("unknown").to_string();
-            let source_url = item
-                .slug
-                .as_ref()
-                .map(|slug| format!("https://thetvdb.com/{}", slug.trim_start_matches('/')))
-                .or_else(|| {
-                    item.tvdb_id
-                        .map(|id| format!("https://thetvdb.com/dereferrer/series/{}", id))
-                });
+    let search_json: Value = serde_json::from_str(&search_body).map_err(|error| {
+        anyhow::anyhow!(
+            "TVDB search decode failed: {}; body: {}",
+            error,
+            summarize_tvdb_body(&search_body)
+        )
+    })?;
 
-            matches.push(InternetMetadataMatch {
+    Ok(parse_tvdb_matches(&search_json, query, media_hint))
+}
+
+fn parse_tvdb_matches(
+    response: &Value,
+    query: &str,
+    media_hint: Option<&str>,
+) -> Vec<InternetMetadataMatch> {
+    tvdb_result_items(response)
+        .into_iter()
+        .take(5)
+        .map(|item| {
+            let tvdb_id = first_present_u64(&item, &["tvdb_id", "id", "objectID"]);
+            let title = first_present_string(&item, &["name", "title", "slugName"])
+                .unwrap_or_else(|| query.to_string());
+            let year = parse_tvdb_year(&item);
+            let media_kind = parse_tvdb_media_kind(&item, media_hint);
+            let source_url = build_tvdb_source_url(&item, tvdb_id, &media_kind);
+            let overview = first_present_string(&item, &["overview", "description"]);
+            let poster_url = first_present_string(&item, &["image_url", "image", "thumbnail"]);
+            let status = first_present_string(&item, &["status"]);
+
+            InternetMetadataMatch {
                 provider: "tvdb".into(),
                 title,
                 year,
                 media_kind,
                 imdb_id: None,
-                tvdb_id: item.tvdb_id,
-                overview: item.overview,
+                tvdb_id,
+                overview,
                 rating: None,
-                genres: item
-                    .status
-                    .as_deref()
-                    .map(|v| vec![v.to_string()])
-                    .unwrap_or_default(),
-                poster_url: item.image_url,
+                genres: status.into_iter().collect(),
+                poster_url,
                 source_url,
-            });
+            }
+        })
+        .collect()
+}
+
+fn tvdb_result_items(response: &Value) -> Vec<Value> {
+    response
+        .get("data")
+        .and_then(Value::as_array)
+        .or_else(|| {
+            response
+                .get("data")
+                .and_then(|value| value.get("results"))
+                .and_then(Value::as_array)
+        })
+        .or_else(|| response.get("results").and_then(Value::as_array))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn first_present_string(item: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        item.get(*key).and_then(|value| match value {
+            Value::String(text) => {
+                let trimmed = text.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_string())
+            }
+            Value::Number(number) => Some(number.to_string()),
+            Value::Object(map) => map.get("name").and_then(Value::as_str).map(str::trim).and_then(
+                |text| (!text.is_empty()).then(|| text.to_string()),
+            ),
+            _ => None,
+        })
+    })
+}
+
+fn first_present_u64(item: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        item.get(*key).and_then(|value| match value {
+            Value::Number(number) => number.as_u64(),
+            Value::String(text) => text.trim().parse::<u64>().ok(),
+            _ => None,
+        })
+    })
+}
+
+fn parse_tvdb_year(item: &Value) -> Option<u16> {
+    first_present_string(item, &["year", "release_year"])
+        .and_then(|value| value.parse::<u16>().ok())
+        .or_else(|| {
+            first_present_string(item, &["first_air_time", "firstAired", "release_date"])
+                .and_then(|value| value.get(..4).and_then(|year| year.parse::<u16>().ok()))
+        })
+}
+
+fn parse_tvdb_media_kind(item: &Value, media_hint: Option<&str>) -> String {
+    first_present_string(item, &["type", "type_name"])
+        .map(|kind| {
+            let normalized = kind.trim().to_ascii_lowercase();
+            if normalized.contains("movie") {
+                "movie".to_string()
+            } else if normalized.contains("series") || normalized.contains("show") {
+                "series".to_string()
+            } else {
+                normalized
+            }
+        })
+        .unwrap_or_else(|| media_hint.unwrap_or("unknown").to_string())
+}
+
+fn build_tvdb_source_url(item: &Value, tvdb_id: Option<u64>, media_kind: &str) -> Option<String> {
+    if let Some(slug) = first_present_string(item, &["slug"]) {
+        if slug.starts_with("http://") || slug.starts_with("https://") {
+            return Some(slug);
         }
+        return Some(format!(
+            "https://thetvdb.com/{}",
+            slug.trim_start_matches('/')
+        ));
     }
 
-    Ok(matches)
+    let path_kind = if media_kind == "movie" { "movie" } else { "series" };
+    tvdb_id.map(|id| format!("https://thetvdb.com/dereferrer/{}/{}", path_kind, id))
+}
+
+fn summarize_tvdb_body(body: &str) -> String {
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    let compact = if compact.is_empty() {
+        "<empty response body>".to_string()
+    } else {
+        compact
+    };
+
+    const LIMIT: usize = 240;
+    if compact.len() <= LIMIT {
+        compact
+    } else {
+        format!("{}...", &compact[..LIMIT])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parse_tvdb_matches_accepts_array_payloads_with_numeric_fields() {
+        let payload = json!({
+            "data": [
+                {
+                    "id": 12345,
+                    "name": "Will Trent",
+                    "year": 2023,
+                    "overview": "Special Agent Will Trent investigates.",
+                    "image_url": "https://images.example/will-trent.jpg",
+                    "slug": "series/will-trent",
+                    "type": "series",
+                    "status": "Continuing"
+                }
+            ]
+        });
+
+        let matches = parse_tvdb_matches(&payload, "Will Trent", Some("series"));
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].title, "Will Trent");
+        assert_eq!(matches[0].tvdb_id, Some(12345));
+        assert_eq!(matches[0].year, Some(2023));
+        assert_eq!(matches[0].media_kind, "series");
+        assert_eq!(matches[0].source_url.as_deref(), Some("https://thetvdb.com/series/will-trent"));
+    }
+
+    #[test]
+    fn parse_tvdb_matches_accepts_nested_results_and_string_ids() {
+        let payload = json!({
+            "data": {
+                "results": [
+                    {
+                        "tvdb_id": "67890",
+                        "title": "Will Trent",
+                        "first_air_time": "2023-01-03",
+                        "thumbnail": "https://images.example/thumb.jpg",
+                        "type": "series",
+                        "description": "Nested search response"
+                    }
+                ]
+            }
+        });
+
+        let matches = parse_tvdb_matches(&payload, "Will Trent", Some("series"));
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].tvdb_id, Some(67890));
+        assert_eq!(matches[0].year, Some(2023));
+        assert_eq!(matches[0].poster_url.as_deref(), Some("https://images.example/thumb.jpg"));
+        assert_eq!(matches[0].overview.as_deref(), Some("Nested search response"));
+        assert_eq!(
+            matches[0].source_url.as_deref(),
+            Some("https://thetvdb.com/dereferrer/series/67890")
+        );
+    }
 }
