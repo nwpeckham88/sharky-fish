@@ -97,7 +97,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let brain = BrainActor::new(identified_rx, queue_tx.clone(), cfg.llm.clone(), shared_config.clone());
+    let brain = BrainActor::new(identified_rx, queue_tx.clone(), shared_config.clone());
     tokio::spawn(async move {
         if let Err(e) = brain.run().await {
             tracing::error!(err = %e, "brain actor crashed");

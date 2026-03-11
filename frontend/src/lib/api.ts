@@ -34,6 +34,33 @@ export interface IntakeManagedItem {
 	last_decision: JobDecision | null;
 }
 
+export interface BacklogSummary {
+	total_items: number;
+	needs_attention_count: number;
+	unprocessed_count: number;
+	reviewed_count: number;
+	kept_original_count: number;
+	awaiting_approval_count: number;
+	approved_count: number;
+	processed_count: number;
+	failed_count: number;
+	missing_metadata_count: number;
+	missing_sidecar_count: number;
+	organize_needed_count: number;
+}
+
+export type BacklogFilter =
+	| 'all'
+	| 'needs_attention'
+	| 'unprocessed'
+	| 'failed'
+	| 'awaiting_approval'
+	| 'approved'
+	| 'reviewed'
+	| 'missing_metadata'
+	| 'missing_sidecar'
+	| 'organize_needed';
+
 export interface Task {
 	id: number;
 	job_id: number;
@@ -64,6 +91,11 @@ export interface LibraryEntry {
 	size_bytes: number;
 	modified_at: number | null;
 	library_id: string | null;
+	managed_status: string | null;
+	has_sidecar: boolean;
+	has_selected_metadata: boolean;
+	organize_target_path: string | null;
+	organize_needed: boolean;
 }
 
 export interface LibraryScanStatus {
@@ -281,6 +313,52 @@ export async function fetchUnprocessedIntake(limit = 50, offset = 0): Promise<In
 	const res = await fetch(`${BASE}/intake/unprocessed?limit=${limit}&offset=${offset}`);
 	if (!res.ok) throw new Error(`Failed to fetch unprocessed intake items: ${res.status}`);
 	return res.json();
+}
+
+export async function fetchBacklogSummary(): Promise<BacklogSummary> {
+	const res = await fetch(`${BASE}/backlog/summary`);
+	if (!res.ok) throw new Error(`Failed to fetch backlog summary: ${res.status}`);
+	return res.json();
+}
+
+export async function fetchBacklogItems(
+	filter: BacklogFilter = 'needs_attention',
+	limit = 50,
+	offset = 0
+): Promise<IntakeManagedItem[]> {
+	const params = new URLSearchParams({
+		filter,
+		limit: String(limit),
+		offset: String(offset)
+	});
+	const res = await fetch(`${BASE}/backlog/items?${params.toString()}`);
+	if (!res.ok) throw new Error(`Failed to fetch backlog items: ${res.status}`);
+	return res.json();
+}
+
+export async function createIntakeReview(path: string): Promise<Job> {
+	const res = await fetch(`${BASE}/intake/review`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ path })
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to create review job: ${res.status}`);
+	}
+	return res.json();
+}
+
+export async function updateIntakeManagedStatus(path: string, status: 'REVIEWED' | 'KEPT_ORIGINAL'): Promise<void> {
+	const res = await fetch(`${BASE}/intake/status`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ path, status })
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to update managed status: ${res.status}`);
+	}
 }
 
 export async function fetchJob(id: number): Promise<{ job_id: number; tasks: Task[] }> {

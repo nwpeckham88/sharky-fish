@@ -6,7 +6,14 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { fetchJobs, fetchHealth } from '$lib/api';
 	import { createEventSource } from '$lib/sse';
-	import { jobStore, healthStore, handleSseEvent } from '$lib/stores.svelte';
+	import {
+		jobStore,
+		healthStore,
+		handleSseEvent,
+		managedItemStore,
+		refreshManagedItemStore
+	} from '$lib/stores.svelte';
+	import { statusLabel } from '$lib/status';
 
 	let { children } = $props();
 	let collapsed = $state(false);
@@ -16,12 +23,11 @@
 	let healthTimer: ReturnType<typeof setInterval> | undefined;
 
 	const navItems = [
-		{ href: '/', label: 'Dashboard', icon: 'dashboard' },
-		{ href: '/intake', label: 'Intake', icon: 'intake' },
+		{ href: '/', label: 'Backlog', icon: 'dashboard', badge: 'backlog' },
+		{ href: '/intake', label: 'Review', icon: 'intake', badge: 'review' },
 		{ href: '/library', label: 'Library', icon: 'library' },
-		{ href: '/organize', label: 'File Organization', icon: 'organize' },
-		{ href: '/forge', label: 'The Forge', icon: 'forge' },
-		{ href: '/settings', label: 'Settings', icon: 'settings' },
+		{ href: '/forge', label: 'Execution', icon: 'forge' },
+		{ href: '/settings', label: 'Settings', icon: 'settings' }
 	] as const;
 
 	function isActive(href: string): boolean {
@@ -30,7 +36,6 @@
 	}
 
 	onMount(async () => {
-		// Load initial jobs into global store
 		try {
 			jobStore.jobs = await fetchJobs(200);
 		} catch {
@@ -39,12 +44,12 @@
 			jobStore.loading = false;
 		}
 
-		// Single SSE connection for the whole app
+		void refreshManagedItemStore();
+
 		es = createEventSource(handleSseEvent, () => {
 			healthStore.connected = false;
 		});
 
-		// Health polling
 		checkHealth();
 		healthTimer = setInterval(checkHealth, 15000);
 
@@ -81,6 +86,42 @@
 			searchEl?.blur();
 		}
 	}
+
+	function pageTitle(pathname: string): string {
+		if (pathname === '/') return 'Backlog';
+		if (pathname.startsWith('/intake')) return 'Review';
+		if (pathname.startsWith('/library')) return 'Library';
+		if (pathname.startsWith('/organize')) return 'Organize';
+		if (pathname.startsWith('/forge')) return 'Execution';
+		if (pathname.startsWith('/settings')) return 'Settings';
+		return 'sharky-fish';
+	}
+
+	function pageSubtitle(pathname: string): string {
+		if (pathname === '/') return 'Shape the library backlog, not the queue.';
+		if (pathname.startsWith('/intake')) return 'Approve or reject AI-generated plans before they enter execution.';
+		if (pathname.startsWith('/library')) return 'Audit managed state, sidecars, metadata, and organization.';
+		if (pathname.startsWith('/organize')) return 'Rename files into the canonical library structure.';
+		if (pathname.startsWith('/forge')) return 'Monitor approved, running, completed, and failed work.';
+		if (pathname.startsWith('/settings')) return 'Configure standards, prompts, and system policy.';
+		return 'Library shaping workspace';
+	}
+
+	const backlogBadge = $derived(
+		managedItemStore.summary.needs_attention_count
+	);
+	const reviewBadge = $derived(managedItemStore.summary.awaiting_approval_count);
+
+	function navBadge(item: (typeof navItems)[number]): number | null {
+		if ('badge' in item && item.badge === 'backlog') return backlogBadge;
+		if ('badge' in item && item.badge === 'review') return reviewBadge;
+		return null;
+	}
+
+	$effect(() => {
+		jobStore.jobs.length;
+		void refreshManagedItemStore();
+	});
 </script>
 
 <svelte:head>
@@ -89,7 +130,6 @@
 </svelte:head>
 
 <div class="shell">
-	<!-- Left Navigation Rail -->
 	<nav class="nav-rail" class:collapsed>
 		<div class="nav-brand">
 			<div class="nav-logo">
@@ -114,8 +154,6 @@
 							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
 						{:else if item.icon === 'library'}
 							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg>
-						{:else if item.icon === 'organize'}
-							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 6h18"/><path d="M7 12h10"/><path d="M10 18h4"/></svg>
 						{:else if item.icon === 'forge'}
 							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
 						{:else if item.icon === 'settings'}
@@ -124,6 +162,10 @@
 					</span>
 					{#if !collapsed}
 						<span class="nav-label">{item.label}</span>
+						{@const badge = navBadge(item)}
+						{#if badge !== null && badge > 0}
+							<span class="nav-badge">{badge}</span>
+						{/if}
 					{/if}
 				</a>
 			{/each}
@@ -135,32 +177,26 @@
 		</button>
 	</nav>
 
-	<!-- Main Content Area -->
 	<div class="main-area">
 		<header class="top-bar">
 			<div class="flex items-center gap-3">
 				<div>
-					<h1 class="font-[family-name:var(--font-display)] text-xl tracking-[0.02em] text-[color:var(--ink-strong)]">
-						{#if page.url.pathname === '/'}Dashboard
-						{:else if page.url.pathname.startsWith('/intake')}Intake Triage
-						{:else if page.url.pathname.startsWith('/library')}Library Audit
-						{:else if page.url.pathname.startsWith('/organize')}File Organization
-						{:else if page.url.pathname.startsWith('/forge')}The Forge
-						{:else if page.url.pathname.startsWith('/settings')}Settings
-						{:else}sharky-fish
-						{/if}
-					</h1>
+					<h1 class="font-[family-name:var(--font-display)] text-xl tracking-[0.02em] text-[color:var(--ink-strong)]">{pageTitle(page.url.pathname)}</h1>
+					<p class="mt-1 text-sm text-[color:var(--ink-muted)]">{pageSubtitle(page.url.pathname)}</p>
 				</div>
 			</div>
 			<div class="flex items-center gap-3">
-			<label class="hidden items-center gap-2 rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm text-[color:var(--ink-muted)] sm:flex">
-				<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
-				<input bind:this={searchEl} bind:value={searchQuery} onkeydown={handleSearchKeydown} class="w-32 bg-transparent text-sm text-[color:var(--ink-strong)] outline-none placeholder:text-[color:var(--ink-muted)]" placeholder="Search…" />
-				<kbd class="rounded border border-[color:var(--line)] bg-[color:var(--paper)] px-1.5 py-0.5 font-mono text-[10px]">⌘K</kbd>
-			</label>
-			<div class="flex items-center gap-2 rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2" title={healthStore.connected ? 'Backend connected' : 'Backend disconnected'}>
-				<span class="llm-pulse" class:disconnected={!healthStore.connected}></span>
-				<span class="text-xs font-semibold uppercase tracking-[0.18em] text-[color:var(--ink-muted)]">{healthStore.connected ? 'Online' : 'Offline'}</span>
+				<label class="hidden items-center gap-2 rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm text-[color:var(--ink-muted)] sm:flex">
+					<svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+					<input bind:this={searchEl} bind:value={searchQuery} onkeydown={handleSearchKeydown} class="w-32 bg-transparent text-sm text-[color:var(--ink-strong)] outline-none placeholder:text-[color:var(--ink-muted)]" placeholder="Search…" />
+					<kbd class="rounded border border-[color:var(--line)] bg-[color:var(--paper)] px-1.5 py-0.5 font-mono text-[10px]">⌘K</kbd>
+				</label>
+				<div class="flex items-center gap-2 rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2" title={healthStore.connected ? 'Backend connected' : 'Backend disconnected'}>
+					<span class="llm-pulse" class:disconnected={!healthStore.connected}></span>
+					<span class="text-xs font-semibold uppercase tracking-[0.18em] text-[color:var(--ink-muted)]">{healthStore.connected ? 'Online' : 'Offline'}</span>
+					{#if reviewBadge > 0}
+						<span class="text-xs text-[color:var(--ink-muted)]">· {reviewBadge} {statusLabel('AWAITING_APPROVAL')}</span>
+					{/if}
 				</div>
 			</div>
 		</header>

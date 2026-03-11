@@ -43,30 +43,120 @@ pub async fn test_llm_connection(llm_config: &LlmConfig) -> Result<String> {
     Ok(content.to_string())
 }
 
+pub async fn create_processing_decision(
+    app_config: &AppConfig,
+    media: &IdentifiedMedia,
+) -> Result<ProcessingDecision> {
+    let client = reqwest::Client::new();
+    let probe_json = serde_json::to_string_pretty(&media.probe)?;
+    let standards = &app_config.golden_standards;
+    let system_prompt = if app_config.system_prompt.trim().is_empty() {
+        SYSTEM_PROMPT.to_string()
+    } else {
+        app_config.system_prompt.trim().to_string()
+    };
+
+    let subtitle_summary = {
+        let sub_streams: Vec<_> = media
+            .probe
+            .streams
+            .iter()
+            .filter(|s| s.codec_type == "subtitle")
+            .collect();
+        if sub_streams.is_empty() {
+            "No subtitle streams present.".to_string()
+        } else {
+            let descs: Vec<String> = sub_streams
+                .iter()
+                .map(|s| {
+                    let lang = s.language.as_deref().unwrap_or("und");
+                    let mut flags = Vec::new();
+                    if s.disposition.forced {
+                        flags.push("forced");
+                    }
+                    if s.disposition.hearing_impaired {
+                        flags.push("SDH");
+                    }
+                    if s.disposition.default {
+                        flags.push("default");
+                    }
+                    let flag_str = if flags.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", flags.join(", "))
+                    };
+                    format!("  #{}: {} ({}){}", s.index, lang, s.codec_name, flag_str)
+                })
+                .collect();
+            format!("Subtitle streams:\n{}", descs.join("\n"))
+        }
+    };
+
+    let user_prompt = format!(
+        "Analyze the following media probe data and generate optimized FFmpeg arguments.\n\n\
+         File: {}\n\n\
+         Golden Standards:\n\
+         - Video: codec={}, max_bitrate={}Mbps, resolution_ceiling={}\n\
+         - Audio: target_lufs={}, target_true_peak={}, max_channels={}\n\
+         - Subtitles: mode={}, preferred_languages=[{}], keep_forced={}, keep_sdh={}\n\n\
+         {}\n\n\
+         Probe:\n```json\n{}\n```",
+        media.path.display(),
+        standards.video.codec,
+        standards.video.max_bitrate_mbps,
+        standards.video.resolution_ceiling,
+        standards.audio.target_lufs,
+        standards.audio.target_true_peak,
+        standards.audio.max_channels,
+        standards.subtitle.mode,
+        standards.subtitle.preferred_languages.join(", "),
+        standards.subtitle.keep_forced,
+        standards.subtitle.keep_sdh,
+        subtitle_summary,
+        probe_json
+    );
+
+    let mut temperature = 0.1_f64;
+    for attempt in 0..3 {
+        match call_llm(
+            &client,
+            &app_config.llm,
+            &system_prompt,
+            &user_prompt,
+            temperature,
+        )
+        .await
+        {
+            Ok(decision) => return Ok(decision),
+            Err(e) => {
+                warn!(attempt, err = %e, "brain: LLM call failed, retrying");
+                temperature += 0.1;
+            }
+        }
+    }
+
+    anyhow::bail!("LLM failed after 3 attempts")
+}
+
 /// The Brain actor receives identified media from the Identifier, consults the
 /// LLM to determine optimal processing parameters, and enqueues jobs via the
 /// Queue actor.
 pub struct BrainActor {
     rx: mpsc::Receiver<IdentifiedMedia>,
     queue_tx: mpsc::Sender<QueueMsg>,
-    llm_config: LlmConfig,
     config: Arc<RwLock<AppConfig>>,
-    client: reqwest::Client,
 }
 
 impl BrainActor {
     pub fn new(
         rx: mpsc::Receiver<IdentifiedMedia>,
         queue_tx: mpsc::Sender<QueueMsg>,
-        llm_config: LlmConfig,
         config: Arc<RwLock<AppConfig>>,
     ) -> Self {
         Self {
             rx,
             queue_tx,
-            llm_config,
             config,
-            client: reqwest::Client::new(),
         }
     }
 
@@ -98,92 +188,62 @@ impl BrainActor {
     }
 
     async fn decide(&self, media: &IdentifiedMedia) -> Result<ProcessingDecision> {
-        let probe_json = serde_json::to_string_pretty(&media.probe)?;
-        let cfg = self.config.read().await;
-        let standards = &cfg.golden_standards;
-        let system_prompt = if cfg.system_prompt.trim().is_empty() {
-            SYSTEM_PROMPT.to_string()
-        } else {
-            cfg.system_prompt.trim().to_string()
-        };
+        let cfg = self.config.read().await.clone();
+        create_processing_decision(&cfg, media).await
+    }
 
-        let subtitle_summary = {
-            let sub_streams: Vec<_> = media.probe.streams.iter()
-                .filter(|s| s.codec_type == "subtitle")
-                .collect();
-            if sub_streams.is_empty() {
-                "No subtitle streams present.".to_string()
+        /// Hard-coded CPU-based libx264 fallback when LLM is unavailable.
+        fn fallback_decision(media: &IdentifiedMedia) -> ProcessingDecision {
+            let has_video = media.probe.streams.iter().any(|s| s.codec_type == "video");
+            let args = if has_video {
+                vec![
+                    "-i".into(), "input.mkv".into(),
+                    "-c:v".into(), "libx264".into(),
+                    "-preset".into(), "medium".into(),
+                    "-crf".into(), "20".into(),
+                    "-c:a".into(), "aac".into(),
+                    "-b:a".into(), "192k".into(),
+                    "-movflags".into(), "+faststart".into(),
+                    "output.mp4".into(),
+                ]
             } else {
-                let descs: Vec<String> = sub_streams.iter().map(|s| {
-                    let lang = s.language.as_deref().unwrap_or("und");
-                    let mut flags = Vec::new();
-                    if s.disposition.forced { flags.push("forced"); }
-                    if s.disposition.hearing_impaired { flags.push("SDH"); }
-                    if s.disposition.default { flags.push("default"); }
-                    let flag_str = if flags.is_empty() { String::new() } else { format!(" [{}]", flags.join(", ")) };
-                    format!("  #{}: {} ({}){}",  s.index, lang, s.codec_name, flag_str)
-                }).collect();
-                format!("Subtitle streams:\n{}", descs.join("\n"))
-            }
-        };
+                vec![
+                    "-i".into(), "input.mkv".into(),
+                    "-c:a".into(), "aac".into(),
+                    "-b:a".into(), "192k".into(),
+                    "output.m4a".into(),
+                ]
+            };
 
-        let user_prompt = format!(
-            "Analyze the following media probe data and generate optimized FFmpeg arguments.\n\n\
-             File: {}\n\n\
-             Golden Standards:\n\
-             - Video: codec={}, max_bitrate={}Mbps, resolution_ceiling={}\n\
-             - Audio: target_lufs={}, target_true_peak={}, max_channels={}\n\
-             - Subtitles: mode={}, preferred_languages=[{}], keep_forced={}, keep_sdh={}\n\n\
-             {}\n\n\
-             Probe:\n```json\n{}\n```",
-            media.path.display(),
-            standards.video.codec,
-            standards.video.max_bitrate_mbps,
-            standards.video.resolution_ceiling,
-            standards.audio.target_lufs,
-            standards.audio.target_true_peak,
-            standards.audio.max_channels,
-            standards.subtitle.mode,
-            standards.subtitle.preferred_languages.join(", "),
-            standards.subtitle.keep_forced,
-            standards.subtitle.keep_sdh,
-            subtitle_summary,
-            probe_json
-        );
-        drop(cfg);
-
-        let mut temperature = 0.1_f64;
-        for attempt in 0..3 {
-            match self.call_llm(&system_prompt, &user_prompt, temperature).await {
-                Ok(decision) => return Ok(decision),
-                Err(e) => {
-                    warn!(attempt, err = %e, "brain: LLM call failed, retrying");
-                    temperature += 0.1;
-                }
+            ProcessingDecision {
+                job_id: 0,
+                arguments: args,
+                requires_two_pass: true,
+                rationale: "Fallback: CPU-based libx264/aac transcoding".into(),
             }
         }
-        anyhow::bail!("LLM failed after 3 attempts");
     }
 
     async fn call_llm(
-        &self,
-        system_prompt: &str,
-        user_prompt: &str,
-        temperature: f64,
-    ) -> Result<ProcessingDecision> {
-        let (url, body) = match self.llm_config.provider.as_str() {
-            "google" => build_google_request(&self.llm_config, system_prompt, user_prompt, temperature),
-            "openai" => build_openai_request(&self.llm_config, system_prompt, user_prompt, temperature),
-            "ollama" => build_ollama_request(&self.llm_config, system_prompt, user_prompt, temperature),
+            client: &reqwest::Client,
+            llm_config: &LlmConfig,
+            system_prompt: &str,
+            user_prompt: &str,
+            temperature: f64,
+        ) -> Result<ProcessingDecision> {
+            let (url, body) = match llm_config.provider.as_str() {
+                "google" => build_google_request(llm_config, system_prompt, user_prompt, temperature),
+                "openai" => build_openai_request(llm_config, system_prompt, user_prompt, temperature),
+                "ollama" => build_ollama_request(llm_config, system_prompt, user_prompt, temperature),
             other => anyhow::bail!("unsupported LLM provider: {other}"),
         };
 
-        let mut req = self.client.post(&url).json(&body);
-        if self.llm_config.provider == "google" {
-            if let Some(key) = &self.llm_config.api_key {
+            let mut req = client.post(&url).json(&body);
+            if llm_config.provider == "google" {
+                if let Some(key) = &llm_config.api_key {
                 req = req.header("x-goog-api-key", key);
             }
-        } else if let Some(key) = &self.llm_config.api_key {
+            } else if let Some(key) = &llm_config.api_key {
             req = req.bearer_auth(key);
         }
 
@@ -195,53 +255,21 @@ impl BrainActor {
         }
 
         let json: serde_json::Value = resp.json().await?;
-        self.parse_llm_response(&json)
+        parse_llm_response(&json)
     }
 
-    fn parse_llm_response(&self, json: &serde_json::Value) -> Result<ProcessingDecision> {
-        let content = extract_llm_content(json)?;
+fn parse_llm_response(json: &serde_json::Value) -> Result<ProcessingDecision> {
+    let content = extract_llm_content(json)?;
 
-        let parsed: LlmOutput = serde_json::from_str(content)
-            .context("failed to parse LLM JSON output")?;
+    let parsed: LlmOutput = serde_json::from_str(content)
+        .context("failed to parse LLM JSON output")?;
 
-        Ok(ProcessingDecision {
-            job_id: 0, // assigned by Queue
-            arguments: parsed.arguments,
-            requires_two_pass: parsed.requires_two_pass,
-            rationale: parsed.rationale,
-        })
-    }
-
-    /// Hard-coded CPU-based libx264 fallback when LLM is unavailable.
-    fn fallback_decision(media: &IdentifiedMedia) -> ProcessingDecision {
-        let has_video = media.probe.streams.iter().any(|s| s.codec_type == "video");
-        let args = if has_video {
-            vec![
-                "-i".into(), "input.mkv".into(),
-                "-c:v".into(), "libx264".into(),
-                "-preset".into(), "medium".into(),
-                "-crf".into(), "20".into(),
-                "-c:a".into(), "aac".into(),
-                "-b:a".into(), "192k".into(),
-                "-movflags".into(), "+faststart".into(),
-                "output.mp4".into(),
-            ]
-        } else {
-            vec![
-                "-i".into(), "input.mkv".into(),
-                "-c:a".into(), "aac".into(),
-                "-b:a".into(), "192k".into(),
-                "output.m4a".into(),
-            ]
-        };
-
-        ProcessingDecision {
-            job_id: 0,
-            arguments: args,
-            requires_two_pass: true,
-            rationale: "Fallback: CPU-based libx264/aac transcoding".into(),
-        }
-    }
+    Ok(ProcessingDecision {
+        job_id: 0,
+        arguments: parsed.arguments,
+        requires_two_pass: parsed.requires_two_pass,
+        rationale: parsed.rationale,
+    })
 }
 
 fn build_openai_request(

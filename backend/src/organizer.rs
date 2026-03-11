@@ -1,5 +1,6 @@
 use crate::config::{AppConfig, LibraryFolder};
 use crate::internet_metadata::InternetMetadataMatch;
+use crate::sidecar;
 
 use anyhow::{Context, Result};
 use serde::Serialize;
@@ -116,6 +117,8 @@ pub async fn preview_or_apply(
                         target_abs.display()
                     )
                 })?;
+
+            rename_sidecar_for_file(library_root, &current_relative, &target_relative).await?;
         }
     }
 
@@ -134,6 +137,35 @@ pub fn movie_target_container(library_prefix: &str, selected: &InternetMetadataM
     let title = sanitize_segment(&selected.title);
     let year = selected.year.map(|value| value.to_string()).unwrap_or_else(|| "0000".into());
     format!("{}/{} ({})", trim_slashes(library_prefix), title, year)
+}
+
+pub fn preview_target_relative_path(
+    config: &AppConfig,
+    relative_path: &str,
+    library_id: Option<&str>,
+    selected: &InternetMetadataMatch,
+) -> Result<String> {
+    let current_relative = sanitize_relative_path(relative_path)?;
+    let current_relative_str = current_relative.to_string_lossy().replace('\\', "/");
+    let library_folder = resolve_library_folder(config, &current_relative_str, library_id)
+        .context("unable to resolve library folder for path")?;
+
+    let extension = current_relative
+        .extension()
+        .and_then(|v| v.to_str())
+        .map(|v| v.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let target_relative = if library_folder.media_type == "tv" {
+        let (season, episode) = infer_or_validate_episode_numbers(&current_relative_str, None, None)?;
+        build_tv_target(&library_folder.path, selected, season, episode, &extension)
+    } else {
+        build_movie_target(&library_folder.path, selected, &extension)
+    };
+
+    Ok(sanitize_relative_path(&target_relative)?
+        .to_string_lossy()
+        .replace('\\', "/"))
 }
 
 async fn apply_movie_folder_organization(
@@ -186,6 +218,34 @@ async fn apply_movie_folder_organization(
     }
 
     merge_movie_folder_contents(&source_dir_abs, &target_dir_abs, &source_stem, &target_stem).await?;
+    Ok(())
+}
+
+async fn rename_sidecar_for_file(library_root: &Path, current_relative: &Path, target_relative: &Path) -> Result<()> {
+    let current_relative = current_relative.to_string_lossy().replace('\\', "/");
+    let target_relative = target_relative.to_string_lossy().replace('\\', "/");
+    let Some(current_sidecar) = sidecar::sidecar_absolute_path(library_root, &current_relative) else {
+        return Ok(());
+    };
+    let Some(target_sidecar) = sidecar::sidecar_absolute_path(library_root, &target_relative) else {
+        return Ok(());
+    };
+
+    if !tokio::fs::try_exists(&current_sidecar).await? || current_sidecar == target_sidecar {
+        return Ok(());
+    }
+    if tokio::fs::try_exists(&target_sidecar).await? {
+        return Ok(());
+    }
+
+    if let Some(parent) = target_sidecar.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+
+    tokio::fs::rename(&current_sidecar, &target_sidecar)
+        .await
+        .with_context(|| format!("failed to rename '{}' to '{}'", current_sidecar.display(), target_sidecar.display()))?;
+
     Ok(())
 }
 

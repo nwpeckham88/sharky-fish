@@ -154,6 +154,22 @@ h4 {
 	text-overflow: ellipsis;
 }
 
+.nav-badge {
+	margin-left: auto;
+	display: inline-flex;
+	min-width: 1.5rem;
+	height: 1.5rem;
+	align-items: center;
+	justify-content: center;
+	border-radius: 999px;
+	background: rgba(164, 79, 45, 0.12);
+	border: 1px solid rgba(164, 79, 45, 0.18);
+	padding: 0 0.45rem;
+	font-size: 0.68rem;
+	font-weight: 700;
+	color: var(--accent-deep);
+}
+
 .nav-collapse-btn {
 	display: flex;
 	align-items: center;
@@ -196,6 +212,7 @@ h4 {
 	align-items: center;
 	justify-content: space-between;
 	gap: 1rem;
+	flex-wrap: wrap;
 	padding: 0.875rem 1.5rem;
 	border-bottom: 1px solid var(--line);
 	background: rgba(245, 239, 226, 0.82);

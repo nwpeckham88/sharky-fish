@@ -1,13 +1,66 @@
 use crate::db;
 use crate::config::AppConfig;
+use crate::managed_items;
+use crate::messages::IdentifiedMedia;
 use crate::messages::{QueueMsg, QueuedJob};
 use anyhow::Result;
 use sqlx::SqlitePool;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{info, warn};
 
 use crate::messages::SseEvent;
+
+pub async fn enqueue_job(
+    pool: &SqlitePool,
+    sse_tx: &broadcast::Sender<SseEvent>,
+    auto_approve: bool,
+    media: &IdentifiedMedia,
+    decision: &mut crate::messages::ProcessingDecision,
+    initial_status_override: Option<&str>,
+) -> Result<i64> {
+    let file_path = media.path.to_string_lossy().to_string();
+    let initial_status = initial_status_override.unwrap_or(if auto_approve {
+        "APPROVED"
+    } else {
+        "AWAITING_APPROVAL"
+    });
+
+    let job_id = db::insert_job(pool, &file_path, initial_status).await?;
+    decision.job_id = job_id;
+    db::upsert_job_analysis(pool, job_id, &media.probe, decision).await?;
+
+    if decision.requires_two_pass {
+        db::insert_task(pool, job_id, 1, "AUDIO_SCAN", None).await?;
+        db::insert_task(
+            pool,
+            job_id,
+            2,
+            "TRANSCODE",
+            Some(&serde_json::to_string(&decision.arguments)?),
+        )
+        .await?;
+    } else {
+        db::insert_task(
+            pool,
+            job_id,
+            1,
+            "TRANSCODE",
+            Some(&serde_json::to_string(&decision.arguments)?),
+        )
+        .await?;
+    }
+
+    let _ = sse_tx.send(SseEvent::JobCreated {
+        job_id,
+        file_path: file_path.clone(),
+        status: initial_status.into(),
+    });
+
+    info!(job_id, file = %file_path, "queue: job enqueued");
+    Ok(job_id)
+}
 
 /// The Queue actor owns all job/task lifecycle state, backed by SQLite durable
 /// execution tables.  It receives enqueue requests from the Brain and poll
@@ -56,6 +109,7 @@ impl QueueActor {
                     if let Err(e) = db::update_job_status(&self.pool, job_id, status).await {
                         warn!(job_id, err = %e, "queue: failed to mark job {status}");
                     } else {
+                        self.update_managed_completion_status(job_id, success).await;
                         info!(job_id, status, "queue: job finished");
                     }
                 }
@@ -69,51 +123,44 @@ impl QueueActor {
         media: &crate::messages::IdentifiedMedia,
         decision: &mut crate::messages::ProcessingDecision,
     ) -> Result<()> {
-        let file_path = media.path.to_string_lossy().to_string();
         let auto_approve = {
             let cfg = self.config.read().await;
             cfg.auto_approve_ai_jobs
         };
-        let initial_status = if auto_approve {
-            "APPROVED"
-        } else {
-            "AWAITING_APPROVAL"
+        enqueue_job(&self.pool, &self.sse_tx, auto_approve, media, decision, None).await?;
+        Ok(())
+    }
+
+    async fn update_managed_completion_status(&self, job_id: i64, success: bool) {
+        let data_path = {
+            let cfg = self.config.read().await;
+            PathBuf::from(&cfg.data_path)
         };
 
-        let job_id = db::insert_job(&self.pool, &file_path, initial_status).await?;
-        decision.job_id = job_id;
-        db::upsert_job_analysis(&self.pool, job_id, &media.probe, decision).await?;
+        let Ok(Some(job)) = db::fetch_job_with_analysis(&self.pool, job_id).await else {
+            return;
+        };
+        let Some(decision) = job.decision else {
+            return;
+        };
 
-        // If two-pass normalization is required, create two tasks.
-        if decision.requires_two_pass {
-            db::insert_task(&self.pool, job_id, 1, "AUDIO_SCAN", None).await?;
-            db::insert_task(
-                &self.pool,
-                job_id,
-                2,
-                "TRANSCODE",
-                Some(&serde_json::to_string(&decision.arguments)?),
-            )
-            .await?;
-        } else {
-            db::insert_task(
-                &self.pool,
-                job_id,
-                1,
-                "TRANSCODE",
-                Some(&serde_json::to_string(&decision.arguments)?),
-            )
-            .await?;
+        let Ok(relative_path) = PathBuf::from(&job.file_path).strip_prefix(&data_path).map(|v| v.to_path_buf()) else {
+            return;
+        };
+
+        let relative_path = relative_path.to_string_lossy().replace('\\', "/");
+        let next_status = if success { "PROCESSED" } else { "FAILED" };
+        if let Err(error) = managed_items::persist_processing_decision(
+            &self.pool,
+            &data_path,
+            &relative_path,
+            next_status,
+            &decision,
+        )
+        .await
+        {
+            warn!(job_id, err = %error, "queue: failed to persist managed completion state");
         }
-
-        let _ = self.sse_tx.send(SseEvent::JobCreated {
-            job_id,
-            file_path: file_path.clone(),
-            status: initial_status.into(),
-        });
-
-        info!(job_id, file = %file_path, "queue: job enqueued");
-        Ok(())
     }
 
     async fn poll_next(&self) -> Option<QueuedJob> {

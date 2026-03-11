@@ -1,6 +1,6 @@
 // Shared reactive state for the entire app (Svelte 5 Runes).
 
-import type { Job, LibraryChangeEvent } from './api';
+import { fetchBacklogSummary, type BacklogSummary, type Job, type LibraryChangeEvent } from './api';
 import type { SseEvent, SseProgress } from './sse';
 
 export interface LibraryScanState {
@@ -13,6 +13,21 @@ export interface LibraryScanState {
 	last_error: string | null;
 }
 
+const EMPTY_BACKLOG_SUMMARY: BacklogSummary = {
+	total_items: 0,
+	needs_attention_count: 0,
+	unprocessed_count: 0,
+	reviewed_count: 0,
+	kept_original_count: 0,
+	awaiting_approval_count: 0,
+	approved_count: 0,
+	processed_count: 0,
+	failed_count: 0,
+	missing_metadata_count: 0,
+	missing_sidecar_count: 0,
+	organize_needed_count: 0
+};
+
 // Jobs shared across dashboard, intake, forge
 export const jobStore = $state<{ jobs: Job[]; loading: boolean }>({
 	jobs: [],
@@ -24,6 +39,50 @@ export const progressStore = $state<Record<number, SseProgress>>({});
 
 // Backend health
 export const healthStore = $state<{ connected: boolean }>({ connected: false });
+
+// Lightweight managed-item state used for backlog badges and quick refreshes.
+export const managedItemStore = $state<{
+	summary: BacklogSummary;
+	loading: boolean;
+}>({
+	summary: { ...EMPTY_BACKLOG_SUMMARY },
+	loading: true
+});
+
+export const reviewStore = $derived.by(() => {
+	const awaitingApproval = jobStore.jobs.filter((job) => job.status === 'AWAITING_APPROVAL');
+
+	return {
+		awaitingApproval,
+		counts: {
+			awaitingApproval: awaitingApproval.length
+		}
+	};
+});
+
+export const executionStore = $derived.by(() => {
+	const approved = jobStore.jobs.filter((job) => job.status === 'APPROVED');
+	const processing = jobStore.jobs.filter((job) => job.status === 'PROCESSING');
+	const completed = jobStore.jobs.filter((job) => job.status === 'COMPLETED');
+	const failed = jobStore.jobs.filter((job) => job.status === 'FAILED');
+	const jobs = [...approved, ...processing, ...completed, ...failed].sort((left, right) =>
+		right.created_at.localeCompare(left.created_at)
+	);
+
+	return {
+		jobs,
+		approved,
+		processing,
+		completed,
+		failed,
+		counts: {
+			approved: approved.length,
+			processing: processing.length,
+			completed: completed.length,
+			failed: failed.length
+		}
+	};
+});
 
 // Library change signals from SSE (used by dashboard + library pages)
 export const libraryState = $state<{
@@ -58,7 +117,7 @@ export function handleSseEvent(event: SseEvent) {
 				probe: null,
 				decision: null
 			},
-			...jobStore.jobs
+			...jobStore.jobs.filter((job) => job.id !== event.job_id)
 		];
 		return;
 	}
@@ -104,5 +163,16 @@ export function handleSseEvent(event: SseEvent) {
 			job.id === event.job_id ? { ...job, status: event.success ? 'COMPLETED' : 'FAILED' } : job
 		);
 		delete progressStore[event.job_id];
+	}
+}
+
+export async function refreshManagedItemStore() {
+	managedItemStore.loading = true;
+	try {
+		managedItemStore.summary = await fetchBacklogSummary();
+	} catch {
+		managedItemStore.summary = { ...EMPTY_BACKLOG_SUMMARY };
+	} finally {
+		managedItemStore.loading = false;
 	}
 }

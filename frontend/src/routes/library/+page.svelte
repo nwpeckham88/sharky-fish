@@ -1,7 +1,9 @@
 <script lang="ts">
+	import { goto } from '$app/navigation';
 	import { onDestroy, onMount } from 'svelte';
 	import { page } from '$app/state';
 	import {
+		createIntakeReview,
 		fetchLibrary,
 		triggerLibraryRescan,
 		fetchLibraryMetadata,
@@ -14,6 +16,8 @@
 		organizeLibraryFile,
 		fetchLibraryEvents,
 		fetchLibraries,
+		updateIntakeManagedStatus,
+		type BacklogFilter,
 		type LibraryEntry,
 		type LibraryFolder,
 		type LibraryMetadata,
@@ -25,7 +29,92 @@
 		type LibraryScanStatus,
 		type LibraryChangeEvent
 	} from '$lib/api';
-	import { libraryState } from '$lib/stores.svelte';
+	import { jobStore, libraryState, managedItemStore, refreshManagedItemStore } from '$lib/stores.svelte';
+	import { formatBytes, formatTimestamp, statusLabel, statusTone } from '$lib/status';
+
+	type LibraryMediaFilter = 'all' | 'video' | 'audio' | 'subtitle' | 'other';
+	type LibraryManagedFilter =
+		| 'all'
+		| 'UNPROCESSED'
+		| 'REVIEWED'
+		| 'AWAITING_APPROVAL'
+		| 'APPROVED'
+		| 'PROCESSED'
+		| 'FAILED'
+		| 'KEPT_ORIGINAL'
+		| 'MISSING_METADATA'
+		| 'ORGANIZE_NEEDED'
+		| 'NO_SIDECAR';
+	type LibraryShapingView =
+		| 'all'
+		| 'unprocessed'
+		| 'awaiting_approval'
+		| 'failed'
+		| 'missing_metadata'
+		| 'organize_needed'
+		| 'missing_sidecar'
+		| 'processed';
+
+	const mediaFilters: LibraryMediaFilter[] = ['all', 'video', 'audio', 'subtitle', 'other'];
+	const managedFilters: LibraryManagedFilter[] = [
+		'all',
+		'UNPROCESSED',
+		'REVIEWED',
+		'AWAITING_APPROVAL',
+		'APPROVED',
+		'PROCESSED',
+		'FAILED',
+		'KEPT_ORIGINAL',
+		'MISSING_METADATA',
+		'ORGANIZE_NEEDED',
+		'NO_SIDECAR'
+	];
+	const shapingViews: LibraryShapingView[] = [
+		'all',
+		'unprocessed',
+		'awaiting_approval',
+		'failed',
+		'missing_metadata',
+		'organize_needed',
+		'missing_sidecar',
+		'processed'
+	];
+
+	const shapingViewFilters: Record<LibraryShapingView, { typeFilter: LibraryMediaFilter; managedStatusFilter: LibraryManagedFilter }> = {
+		all: { typeFilter: 'all', managedStatusFilter: 'all' },
+		unprocessed: { typeFilter: 'all', managedStatusFilter: 'UNPROCESSED' },
+		awaiting_approval: { typeFilter: 'all', managedStatusFilter: 'AWAITING_APPROVAL' },
+		failed: { typeFilter: 'all', managedStatusFilter: 'FAILED' },
+		missing_metadata: { typeFilter: 'all', managedStatusFilter: 'MISSING_METADATA' },
+		organize_needed: { typeFilter: 'all', managedStatusFilter: 'ORGANIZE_NEEDED' },
+		missing_sidecar: { typeFilter: 'all', managedStatusFilter: 'NO_SIDECAR' },
+		processed: { typeFilter: 'all', managedStatusFilter: 'PROCESSED' }
+	};
+
+	function parseMediaFilter(value: string | null): LibraryMediaFilter {
+		if (value && mediaFilters.includes(value as LibraryMediaFilter)) {
+			return value as LibraryMediaFilter;
+		}
+		return 'all';
+	}
+
+	function parseManagedFilter(value: string | null): LibraryManagedFilter {
+		if (value && managedFilters.includes(value as LibraryManagedFilter)) {
+			return value as LibraryManagedFilter;
+		}
+		return 'all';
+	}
+
+	function parseShapingView(value: string | null): LibraryShapingView | null {
+		if (value && shapingViews.includes(value as LibraryShapingView)) {
+			return value as LibraryShapingView;
+		}
+		return null;
+	}
+
+	function backlogFilterHref(filter: BacklogFilter): string {
+		return filter === 'needs_attention' ? '/' : `/?filter=${filter}`;
+	}
 
 	let library = $state<LibraryEntry[]>([]);
 	let librarySummary = $state<LibrarySummary>({
@@ -50,6 +139,10 @@
 	let organizeStatus = $state('');
 	let bulkInternetLoading = $state(false);
 	let bulkInternetStatus = $state('');
+	let bulkActionLoading = $state(false);
+	let bulkActionStatus = $state('');
+	let bulkActionFailedPaths = $state<string[]>([]);
+	let bulkInternetFailedPaths = $state<string[]>([]);
 	let libraryLoading = $state(true);
 	let query = $state('');
 	let offset = $state(0);
@@ -75,22 +168,94 @@
 	let activeLibraryId = $state<string | null>(null);
 
 	// Filter state
-	let typeFilter = $state('all');
+	let typeFilter = $state<LibraryMediaFilter>('all');
+	let managedStatusFilter = $state<LibraryManagedFilter>('all');
+	let rowActionBusy = $state<Record<string, string>>({});
+	let rowActionError = $state('');
 
 	// Bulk selection
 	let selectedPaths = $state<Set<string>>(new Set());
 	let bulkMode = $state(false);
 	let expandedShows = $state<Set<string>>(new Set());
 
+	const shapingViewMeta = $derived([
+		{
+			key: 'unprocessed' as const,
+			label: 'Unprocessed',
+			count: managedItemStore.summary.unprocessed_count,
+			description: 'No durable sharky-fish context yet'
+		},
+		{
+			key: 'awaiting_approval' as const,
+			label: 'Awaiting Approval',
+			count: managedItemStore.summary.awaiting_approval_count,
+			description: 'AI plans waiting for an operator decision'
+		},
+		{
+			key: 'failed' as const,
+			label: 'Failed',
+			count: managedItemStore.summary.failed_count,
+			description: 'Execution exceptions needing follow-up'
+		},
+		{
+			key: 'missing_metadata' as const,
+			label: 'Needs Metadata',
+			count: managedItemStore.summary.missing_metadata_count,
+			description: 'Items without selected internet metadata'
+		},
+		{
+			key: 'organize_needed' as const,
+			label: 'Organize Needed',
+			count: managedItemStore.summary.organize_needed_count,
+			description: 'Metadata is selected, but placement still drifts from the canonical target'
+		},
+		{
+			key: 'missing_sidecar' as const,
+			label: 'Missing Sidecar',
+			count: managedItemStore.summary.missing_sidecar_count,
+			description: 'No persisted sidecar alongside the file'
+		},
+		{
+			key: 'processed' as const,
+			label: 'Processed',
+			count: managedItemStore.summary.processed_count,
+			description: 'Shaped items that are already complete'
+		}
+	]);
+
+	const activeShapingView = $derived.by(() => {
+		if (typeFilter !== 'all') {
+			return null;
+		}
+		for (const [key, filters] of Object.entries(shapingViewFilters)) {
+			if (filters.typeFilter === typeFilter && filters.managedStatusFilter === managedStatusFilter) {
+				return key as Exclude<LibraryShapingView, 'missing_metadata'>;
+			}
+		}
+		return null;
+	});
+
 	onMount(async () => {
 		const urlQuery = page.url.searchParams.get('q');
 		if (urlQuery) query = urlQuery;
 		const urlLib = page.url.searchParams.get('library');
 		if (urlLib) activeLibraryId = urlLib;
+		const urlOffset = Number(page.url.searchParams.get('offset') ?? '0');
+		if (Number.isFinite(urlOffset) && urlOffset > 0) offset = urlOffset;
+		const urlView = parseShapingView(page.url.searchParams.get('view'));
+		const urlType = parseMediaFilter(page.url.searchParams.get('type'));
+		const urlStatus = parseManagedFilter(page.url.searchParams.get('status'));
+		if (urlView) {
+			typeFilter = shapingViewFilters[urlView].typeFilter;
+			managedStatusFilter = shapingViewFilters[urlView].managedStatusFilter;
+		} else {
+			typeFilter = urlType;
+			managedStatusFilter = urlStatus;
+		}
 		try {
 			libraryFolders = await fetchLibraries();
 		} catch { libraryFolders = []; }
-		await Promise.all([loadLibrary(), loadLibraryEvents()]);
+		await Promise.all([refreshManagedItemStore(), loadLibrary(), loadLibraryEvents()]);
 	});
 
 	onDestroy(() => {
@@ -174,6 +339,8 @@
 		organizePreview = null;
 		organizeError = '';
 		organizeStatus = '';
+		bulkActionFailedPaths = [];
+		bulkInternetFailedPaths = [];
 		metadataLoading = true;
 		try {
 			const [metadata, selected] = await Promise.all([
@@ -302,26 +469,40 @@
 		if (selectedPaths.size === 0) return;
 		bulkInternetLoading = true;
 		bulkInternetStatus = '';
+		bulkInternetFailedPaths = [];
+		bulkActionStatus = '';
 		internetSaveError = '';
 		try {
 			const paths = Array.from(selectedPaths);
 			const response = await fetchLibraryInternetMetadataBulk(paths);
 			const withMatches = response.items.filter((item) => item.result.matches.length > 0);
 			const withWarnings = response.items.filter((item) => item.result.warnings.length > 0);
+			const withoutMatches = response.items
+				.filter((item) => item.result.matches.length === 0)
+				.map((item) => item.path);
 
 			let autoSelected = 0;
+			const autoSelectFailures: string[] = [];
 			if (autoSelectTop) {
 				for (const item of withMatches) {
 					const first = item.result.matches[0];
 					if (!first) continue;
-					await saveSelectedLibraryInternetMetadata(item.path, first);
-					autoSelected += 1;
+					try {
+						await saveSelectedLibraryInternetMetadata(item.path, first);
+						autoSelected += 1;
+					} catch {
+						autoSelectFailures.push(item.path);
+					}
 				}
 				if (selectedItem) {
 					const refreshed = await fetchSelectedLibraryInternetMetadata(selectedItem.relative_path).catch(() => null);
 					selectedInternetMatch = refreshed?.selected ?? selectedInternetMatch;
 				}
 			}
+
+			bulkInternetFailedPaths = autoSelectTop
+				? [...withoutMatches, ...autoSelectFailures]
+				: withoutMatches;
 
 			bulkInternetStatus = autoSelectTop
 				? `Looked up ${response.items.length} file(s), found matches for ${withMatches.length}, auto-selected ${autoSelected}.`
@@ -333,10 +514,99 @@
 		}
 	}
 
+	async function runBulkManagedStatus(status: 'REVIEWED' | 'KEPT_ORIGINAL') {
+		if (selectedPaths.size === 0) return;
+		bulkActionLoading = true;
+		bulkActionStatus = '';
+		bulkActionFailedPaths = [];
+		rowActionError = '';
+		const paths = Array.from(selectedPaths);
+		try {
+			const results = await Promise.allSettled(
+				paths.map((path) => updateIntakeManagedStatus(path, status))
+			);
+			const successCount = results.filter((result) => result.status === 'fulfilled').length;
+			const failureCount = results.length - successCount;
+			const failedPaths = results.flatMap((result, index) => result.status === 'rejected' ? [paths[index]] : []);
+			bulkActionFailedPaths = failedPaths;
+			selectedPaths = new Set(failedPaths);
+			bulkActionStatus = failureCount === 0
+				? `${successCount} item(s) marked ${status === 'REVIEWED' ? 'reviewed' : 'kept original'}.`
+				: `${successCount} item(s) updated, ${failureCount} failed. Failed items remain selected.`;
+			await Promise.all([loadLibrary(), refreshManagedItemStore()]);
+		} catch (error) {
+			bulkActionStatus = error instanceof Error ? error.message : 'Bulk status update failed';
+		} finally {
+			bulkActionLoading = false;
+		}
+	}
+
+	async function runBulkCreateReview() {
+		if (selectedPaths.size === 0) return;
+		bulkActionLoading = true;
+		bulkActionStatus = '';
+		bulkActionFailedPaths = [];
+		rowActionError = '';
+		const paths = Array.from(selectedPaths);
+		try {
+			const results = await Promise.allSettled(paths.map((path) => createIntakeReview(path)));
+			const createdJobs = results
+				.filter((result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof createIntakeReview>>> => result.status === 'fulfilled')
+				.map((result) => result.value);
+			const successCount = createdJobs.length;
+			const failureCount = results.length - successCount;
+			const failedPaths = results.flatMap((result, index) => result.status === 'rejected' ? [paths[index]] : []);
+			bulkActionFailedPaths = failedPaths;
+			selectedPaths = new Set(failedPaths);
+			if (createdJobs.length > 0) {
+				const existingIds = new Set(createdJobs.map((job) => job.id));
+				jobStore.jobs = [...createdJobs, ...jobStore.jobs.filter((job) => !existingIds.has(job.id))];
+			}
+			bulkActionStatus = failureCount === 0
+				? `${successCount} AI review job(s) created.`
+				: `${successCount} AI review job(s) created, ${failureCount} failed. Failed items remain selected.`;
+			await Promise.all([loadLibrary(), refreshManagedItemStore()]);
+		} catch (error) {
+			bulkActionStatus = error instanceof Error ? error.message : 'Bulk review creation failed';
+		} finally {
+			bulkActionLoading = false;
+		}
+	}
+
+	async function createReview(item: LibraryEntry) {
+		rowActionBusy = { ...rowActionBusy, [item.relative_path]: 'review' };
+		rowActionError = '';
+		try {
+			const job = await createIntakeReview(item.relative_path);
+			jobStore.jobs = [job, ...jobStore.jobs.filter((existing) => existing.id !== job.id)];
+			await Promise.all([loadLibrary(), refreshManagedItemStore()]);
+		} catch (error) {
+			rowActionError = error instanceof Error ? error.message : 'Failed to create AI review';
+		} finally {
+			rowActionBusy = { ...rowActionBusy, [item.relative_path]: '' };
+		}
+	}
+
+	async function updateManagedStatus(item: LibraryEntry, status: 'REVIEWED' | 'KEPT_ORIGINAL') {
+		rowActionBusy = { ...rowActionBusy, [item.relative_path]: status };
+		rowActionError = '';
+		try {
+			await updateIntakeManagedStatus(item.relative_path, status);
+			await Promise.all([loadLibrary(), refreshManagedItemStore()]);
+		} catch (error) {
+			rowActionError = error instanceof Error ? error.message : 'Failed to update managed status';
+		} finally {
+			rowActionBusy = { ...rowActionBusy, [item.relative_path]: '' };
+		}
+	}
+
 	function scheduleLibraryLoad(resetOffset = false) {
 		if (resetOffset) offset = 0;
 		if (queryTimer) clearTimeout(queryTimer);
-		queryTimer = setTimeout(() => { void loadLibrary(); }, 220);
+		queryTimer = setTimeout(() => {
+			void syncLibraryUrl();
+			void loadLibrary();
+		}, 220);
 	}
 
 	function scheduleLibraryRefresh() {
@@ -347,20 +617,6 @@
 	function handleSearchInput(event: Event) {
 		query = (event.currentTarget as HTMLInputElement).value;
 		scheduleLibraryLoad(true);
-	}
-
-	function formatBytes(value: number): string {
-		if (!value) return '0 B';
-		const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-		let size = value;
-		let unitIndex = 0;
-		while (size >= 1024 && unitIndex < units.length - 1) { size /= 1024; unitIndex += 1; }
-		return `${size.toFixed(size >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
-	}
-
-	function formatTimestamp(value: number | null | undefined): string {
-		if (!value) return 'Unknown';
-		return new Date(value * 1000).toLocaleString();
 	}
 
 	function formatDuration(value: number | null | undefined): string {
@@ -380,22 +636,36 @@
 	function nextPage() {
 		if (offset + pageSize >= totalLibrary) return;
 		offset += pageSize;
+		void syncLibraryUrl();
 		void loadLibrary();
 	}
 
 	function previousPage() {
 		if (offset === 0) return;
 		offset = Math.max(0, offset - pageSize);
+		void syncLibraryUrl();
 		void loadLibrary();
 	}
 
-	const filteredLibrary = $derived(
-		typeFilter === 'all'
-			? library
-			: typeFilter === 'other'
-				? library.filter((i) => i.media_type !== 'video' && i.media_type !== 'audio')
-				: library.filter((i) => i.media_type === typeFilter)
-	);
+	const filteredLibrary = $derived.by(() => {
+		let items = library;
+		if (typeFilter !== 'all') {
+			items = typeFilter === 'other'
+				? items.filter((i) => i.media_type !== 'video' && i.media_type !== 'audio')
+				: items.filter((i) => i.media_type === typeFilter);
+		}
+		if (managedStatusFilter === 'all') return items;
+		if (managedStatusFilter === 'NO_SIDECAR') return items.filter((i) => !i.has_sidecar);
+		if (managedStatusFilter === 'MISSING_METADATA') {
+			return items.filter(
+				(i) => !i.has_selected_metadata && !['KEPT_ORIGINAL', 'PROCESSED'].includes(i.managed_status ?? 'UNPROCESSED')
+			);
+		}
+		if (managedStatusFilter === 'ORGANIZE_NEEDED') {
+			return items.filter((i) => i.organize_needed);
+		}
+		return items.filter((i) => (i.managed_status ?? 'UNPROCESSED') === managedStatusFilter);
+	});
 
 	const activeLibraryFolder = $derived(
 		activeLibraryId ? libraryFolders.find((l) => l.id === activeLibraryId) ?? null : null
@@ -425,7 +695,9 @@
 		(bulkMode ? 1 : 0) +
 		1 +
 		1 +
+		1 +
 		(!activeLibraryId && libraryFolders.length > 0 ? 1 : 0) +
+		1 +
 		1 +
 		1
 	);
@@ -437,6 +709,7 @@
 		selectedMetadata = null;
 		selectedPaths = new Set();
 		expandedShows = new Set();
+		void syncLibraryUrl();
 		void loadLibrary();
 	}
 
@@ -457,6 +730,61 @@
 	function clearSelection() {
 		selectedPaths = new Set();
 		bulkMode = false;
+		bulkActionFailedPaths = [];
+		bulkInternetFailedPaths = [];
+	}
+
+	async function syncLibraryUrl(view: LibraryShapingView | null = activeShapingView) {
+		const params = new URLSearchParams(page.url.searchParams);
+		if (query.trim()) params.set('q', query.trim());
+		else params.delete('q');
+
+		if (activeLibraryId) params.set('library', activeLibraryId);
+		else params.delete('library');
+
+		if (offset > 0) params.set('offset', String(offset));
+		else params.delete('offset');
+
+		if (view && view !== 'all') {
+			params.set('view', view);
+			params.delete('type');
+			params.delete('status');
+		} else {
+			params.delete('view');
+			if (typeFilter !== 'all') params.set('type', typeFilter);
+			else params.delete('type');
+			if (managedStatusFilter !== 'all') params.set('status', managedStatusFilter);
+			else params.delete('status');
+		}
+
+		const next = params.toString();
+		await goto(next ? `/library?${next}` : '/library', {
+			replaceState: true,
+			noScroll: true,
+			keepFocus: true
+		});
+	}
+
+	async function applyShapingView(view: LibraryShapingView) {
+		typeFilter = shapingViewFilters[view].typeFilter;
+		managedStatusFilter = shapingViewFilters[view].managedStatusFilter;
+		offset = 0;
+		selectedPaths = new Set();
+		await syncLibraryUrl(view);
+	}
+
+	function setTypeFilter(filter: LibraryMediaFilter) {
+		typeFilter = filter;
+		offset = 0;
+		selectedPaths = new Set();
+		void syncLibraryUrl(null);
+	}
+
+	function setManagedStatusFilter(filter: LibraryManagedFilter) {
+		managedStatusFilter = filter;
+		offset = 0;
+		selectedPaths = new Set();
+		void syncLibraryUrl(null);
 	}
 
 	function stripLibraryPrefix(relativePath: string, libraryPath: string): string {
@@ -482,6 +810,7 @@
 	function providerLabel(provider: string): string {
 		return provider.toUpperCase();
 	}
+
 </script>
 
 <!-- Library Folder Tabs -->
@@ -541,6 +870,17 @@
 	{/if}
 </section>
 
+<section class="mb-5 grid gap-3 lg:grid-cols-3 xl:grid-cols-6">
+	{#each shapingViewMeta as view (view.key)}
+		{@const isActive = activeShapingView === view.key}
+		<button class="rounded-[1rem] border px-4 py-4 text-left transition-colors {isActive ? 'border-[color:var(--accent)] bg-[color:rgba(164,79,45,0.08)]' : 'border-[color:var(--line)] bg-[color:var(--panel-strong)] hover:bg-[color:rgba(214,180,111,0.08)]'}" onclick={() => applyShapingView(view.key)}>
+			<div class="section-label">{view.label}</div>
+			<div class="mt-2 text-2xl font-semibold text-[color:var(--ink-strong)]">{view.count}</div>
+			<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{view.description}</div>
+		</button>
+	{/each}
+</section>
+
 <!-- Controls Bar -->
 <section class="mb-5 flex flex-wrap items-center gap-3">
 	<label class="flex flex-1 items-center gap-3 rounded-xl border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2.5">
@@ -548,8 +888,25 @@
 		<input class="min-w-0 flex-1 bg-transparent text-sm text-[color:var(--ink-strong)] outline-none placeholder:text-[color:var(--ink-muted)]" type="search" placeholder="Search paths, filenames, codecs…" value={query} oninput={handleSearchInput} />
 	</label>
 	<div class="flex gap-1.5 rounded-xl border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-1">
-		{#each ['all', 'video', 'audio', 'subtitle', 'other'] as t (t)}
-			<button class="rounded-lg px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {typeFilter === t ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => { typeFilter = t; }}>{t}</button>
+		{#each mediaFilters as t (t)}
+			<button class="rounded-lg px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {typeFilter === t ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => setTypeFilter(t)}>{t}</button>
+		{/each}
+	</div>
+	<div class="flex gap-1.5 rounded-xl border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-1">
+		{#each [
+			['all', 'All Statuses'],
+			['UNPROCESSED', 'Unprocessed'],
+			['REVIEWED', 'Reviewed'],
+			['AWAITING_APPROVAL', 'Awaiting Approval'],
+			['APPROVED', 'Approved'],
+			['PROCESSED', 'Processed'],
+			['FAILED', 'Failed'],
+			['KEPT_ORIGINAL', 'Kept Original'],
+			['MISSING_METADATA', 'Needs Metadata'],
+			['ORGANIZE_NEEDED', 'Organize Needed'],
+			['NO_SIDECAR', 'No Sidecar']
+		] as [value, label] (value)}
+			<button class="rounded-lg px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {managedStatusFilter === value ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => setManagedStatusFilter(value as LibraryManagedFilter)}>{label}</button>
 		{/each}
 	</div>
 	<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {bulkMode ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => { bulkMode = !bulkMode; if (!bulkMode) clearSelection(); }}>
@@ -560,16 +917,38 @@
 	</div>
 </section>
 
+{#if rowActionError}
+	<section class="mb-4 rounded-xl border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-4 py-3 text-sm text-[color:var(--danger)]">
+		{rowActionError}
+	</section>
+{/if}
+
 <!-- Bulk Actions Bar -->
 {#if bulkMode && selectedPaths.size > 0}
 	<section class="mb-4 flex items-center gap-3 rounded-xl border border-[color:var(--accent)]/30 bg-[color:var(--accent)]/5 px-4 py-2.5">
 		<span class="text-sm font-semibold text-[color:var(--ink-strong)]">{selectedPaths.size} selected</span>
 		<div class="flex gap-2">
+			<button class="rounded-lg bg-[color:var(--accent)] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50" onclick={runBulkCreateReview} disabled={bulkActionLoading || bulkInternetLoading}>{bulkActionLoading ? 'Working…' : 'Create Reviews'}</button>
+			<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => runBulkManagedStatus('REVIEWED')} disabled={bulkActionLoading || bulkInternetLoading}>{bulkActionLoading ? 'Working…' : 'Mark Reviewed'}</button>
+			<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => runBulkManagedStatus('KEPT_ORIGINAL')} disabled={bulkActionLoading || bulkInternetLoading}>{bulkActionLoading ? 'Working…' : 'Keep Original'}</button>
 			<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => runBulkInternetLookup(false)} disabled={bulkInternetLoading}>{bulkInternetLoading ? 'Working…' : 'Bulk Lookup Metadata'}</button>
 			<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => runBulkInternetLookup(true)} disabled={bulkInternetLoading}>{bulkInternetLoading ? 'Working…' : 'Auto-Select Top Match'}</button>
 		</div>
+		{#if bulkActionStatus}
+			<span class="text-xs text-[color:var(--ink-muted)]">{bulkActionStatus}</span>
+		{/if}
 		{#if bulkInternetStatus}
 			<span class="text-xs text-[color:var(--ink-muted)]">{bulkInternetStatus}</span>
+		{/if}
+		{#if bulkActionFailedPaths.length > 0}
+			<div class="max-w-full text-xs text-[color:var(--danger)]">
+				Failed action paths: {bulkActionFailedPaths.join(' • ')}
+			</div>
+		{/if}
+		{#if bulkInternetFailedPaths.length > 0}
+			<div class="max-w-full text-xs text-[color:var(--danger)]">
+				Metadata lookup needs follow-up for: {bulkInternetFailedPaths.join(' • ')}
+			</div>
 		{/if}
 		<button class="ml-auto text-xs font-semibold text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]" onclick={clearSelection}>Clear</button>
 	</section>
@@ -581,7 +960,7 @@
 	<div class="overflow-hidden rounded-[1rem] border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.72)]">
 		{#if activeLibraryFolder?.media_type === 'tv'}
 			<div class="border-b border-[color:var(--line)] bg-[color:rgba(234,223,201,0.6)] px-4 py-3 text-xs uppercase tracking-[0.18em] text-[color:var(--ink-muted)]">
-				TV Shows (Expandable)
+				TV Shows By Managed Status
 			</div>
 			{#if libraryLoading}
 				<div class="px-4 py-14 text-center text-[color:var(--ink-muted)]">Scanning library…</div>
@@ -590,11 +969,18 @@
 			{:else}
 				<div class="max-h-[38rem] overflow-y-auto">
 					{#each tvShowGroups as group (group.show)}
+						{@const showStatuses = group.items.map((item) => item.managed_status ?? 'UNPROCESSED')}
+						{@const showNeedsAttention = showStatuses.filter((status) => status === 'UNPROCESSED' || status === 'FAILED' || status === 'AWAITING_APPROVAL').length}
 						<div class="border-b border-[color:rgba(123,105,81,0.14)]">
 							<button class="flex w-full items-center justify-between px-4 py-3 text-left hover:bg-[color:rgba(214,180,111,0.08)]" onclick={() => toggleShow(group.show)}>
 								<div>
 									<div class="font-semibold text-[color:var(--ink-strong)]">{group.show}</div>
-									<div class="text-xs text-[color:var(--ink-muted)]">{group.items.length} episode file(s)</div>
+									<div class="mt-1 flex flex-wrap items-center gap-2 text-xs text-[color:var(--ink-muted)]">
+										<span>{group.items.length} episode file(s)</span>
+										{#if showNeedsAttention > 0}
+											<span class="status-chip failed">{showNeedsAttention} need attention</span>
+										{/if}
+									</div>
 								</div>
 								<span class="text-[color:var(--ink-muted)]">{expandedShows.has(group.show) ? '▾' : '▸'}</span>
 							</button>
@@ -602,7 +988,16 @@
 								<div class="bg-[color:rgba(244,236,223,0.5)]">
 									{#each group.items as item (item.relative_path)}
 										<button class="block w-full px-8 py-2.5 text-left text-sm hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''}" onclick={() => loadMetadata(item)}>
-											<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
+											<div class="flex flex-wrap items-center gap-2">
+												<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
+												<span class="status-chip {statusTone(item.managed_status ?? 'UNPROCESSED')}">{statusLabel(item.managed_status ?? 'UNPROCESSED')}</span>
+												{#if !item.has_selected_metadata && (item.managed_status ?? 'UNPROCESSED') !== 'KEPT_ORIGINAL' && (item.managed_status ?? 'UNPROCESSED') !== 'PROCESSED'}
+													<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">needs metadata</span>
+												{/if}
+												{#if item.has_sidecar}
+													<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">sidecar</span>
+												{/if}
+											</div>
 											<div class="mt-0.5 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
 										</button>
 									{/each}
@@ -623,11 +1018,13 @@
 						{/if}
 						<th class="px-4 py-3">Path</th>
 						<th class="px-4 py-3">Type</th>
+						<th class="px-4 py-3">Managed</th>
 						{#if !activeLibraryId && libraryFolders.length > 0}
 							<th class="px-4 py-3">Library</th>
 						{/if}
 						<th class="px-4 py-3">Size</th>
 						<th class="px-4 py-3">Modified</th>
+						<th class="px-4 py-3">Actions</th>
 					</tr>
 				</thead>
 				<tbody>
@@ -650,6 +1047,23 @@
 								<td class="px-4 py-3">
 									<span class="status-chip {item.media_type === 'video' ? 'processing' : item.media_type === 'audio' ? 'completed' : ''}">{item.media_type}</span>
 								</td>
+								<td class="px-4 py-3">
+									<div class="flex flex-wrap items-center gap-2">
+										<span class="status-chip {statusTone(item.managed_status ?? 'UNPROCESSED')}">{statusLabel(item.managed_status ?? 'UNPROCESSED')}</span>
+										{#if !item.has_selected_metadata && (item.managed_status ?? 'UNPROCESSED') !== 'KEPT_ORIGINAL' && (item.managed_status ?? 'UNPROCESSED') !== 'PROCESSED'}
+											<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">needs metadata</span>
+										{/if}
+										{#if item.organize_needed}
+											<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">organize needed</span>
+										{/if}
+										{#if item.organize_needed}
+											<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">organize needed</span>
+										{/if}
+										{#if item.has_sidecar}
+											<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">sidecar</span>
+										{/if}
+									</div>
+								</td>
 								{#if !activeLibraryId && libraryFolders.length > 0}
 									<td class="px-4 py-3">
 										{#if item.library_id}
@@ -664,6 +1078,30 @@
 								{/if}
 								<td class="px-4 py-3 text-[color:var(--ink-strong)]">{formatBytes(item.size_bytes)}</td>
 								<td class="px-4 py-3 text-[color:var(--ink-muted)]">{formatTimestamp(item.modified_at)}</td>
+								<td class="px-4 py-3" onclick={(e) => e.stopPropagation()}>
+									<div class="flex flex-wrap gap-2">
+										{#if (item.managed_status ?? 'UNPROCESSED') === 'UNPROCESSED'}
+											<button class="rounded-md bg-[color:var(--accent)] px-2.5 py-1.5 text-[10px] font-semibold text-white disabled:opacity-50" onclick={() => createReview(item)} disabled={!!rowActionBusy[item.relative_path]}>
+												{rowActionBusy[item.relative_path] === 'review' ? 'Building…' : 'Create Review'}
+											</button>
+											<button class="rounded-md border border-[color:var(--line)] px-2.5 py-1.5 text-[10px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => updateManagedStatus(item, 'REVIEWED')} disabled={!!rowActionBusy[item.relative_path]}>
+												{rowActionBusy[item.relative_path] === 'REVIEWED' ? 'Saving…' : 'Mark Reviewed'}
+											</button>
+											<button class="rounded-md border border-[color:var(--line)] px-2.5 py-1.5 text-[10px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => updateManagedStatus(item, 'KEPT_ORIGINAL')} disabled={!!rowActionBusy[item.relative_path]}>
+												{rowActionBusy[item.relative_path] === 'KEPT_ORIGINAL' ? 'Saving…' : 'Keep Original'}
+											</button>
+										{:else}
+											<button class="rounded-md border border-[color:var(--line)] px-2.5 py-1.5 text-[10px] font-semibold text-[color:var(--ink-strong)]" onclick={() => loadMetadata(item)}>
+												Inspect
+											</button>
+										{/if}
+										{#if item.library_id}
+											<a href={`/organize?library=${encodeURIComponent(item.library_id)}&path=${encodeURIComponent(item.relative_path)}`} class="rounded-md border border-[color:var(--line)] px-2.5 py-1.5 text-[10px] font-semibold text-[color:var(--ink-strong)] no-underline">
+												Organize
+											</a>
+										{/if}
+									</div>
+								</td>
 							</tr>
 						{/each}
 					{/if}
@@ -693,11 +1131,25 @@
 					<div>
 							<div class="flex flex-wrap items-center justify-between gap-2">
 								<h4 class="text-lg text-[color:var(--ink-strong)]">{selectedItem.file_name}</h4>
-								<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => loadInternetMetadata(selectedItem!)} disabled={internetMetadataLoading}>
-									{internetMetadataLoading ? 'Looking up…' : 'Lookup IMDb/TVDB'}
-								</button>
+									<div class="flex flex-wrap gap-2">
+										{#if selectedItem.library_id}
+											<a href={`/organize?library=${encodeURIComponent(selectedItem.library_id)}&path=${encodeURIComponent(selectedItem.relative_path)}`} class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] no-underline">
+												Open organize
+											</a>
+										{/if}
+										<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => loadInternetMetadata(selectedItem!)} disabled={internetMetadataLoading}>
+											{internetMetadataLoading ? 'Looking up…' : 'Lookup IMDb/TVDB'}
+										</button>
+									</div>
 							</div>
 						<p class="mt-0.5 break-all font-mono text-[11px] text-[color:var(--ink-muted)]">{selectedMetadata.relative_path}</p>
+						{#if selectedItem.organize_needed && selectedItem.organize_target_path}
+							<div class="mt-3 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs">
+								<div class="font-semibold uppercase tracking-[0.12em] text-[color:var(--accent-deep)]">Canonical Target</div>
+								<div class="mt-1 break-all font-mono text-[color:var(--ink-strong)]">{selectedItem.organize_target_path}</div>
+								<div class="mt-1 text-[color:var(--ink-muted)]">This file has metadata selected, but it is not yet placed at the canonical target.</div>
+							</div>
+						{/if}
 						<div class="mt-3 flex flex-wrap gap-2">
 							<input
 								class="min-w-[16rem] flex-1 rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]"

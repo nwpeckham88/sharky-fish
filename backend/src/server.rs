@@ -1,3 +1,5 @@
+use crate::actors::brain;
+use crate::actors::queue;
 use crate::config::{AppConfig, LibraryFolder, LlmConfig};
 use crate::db;
 use crate::internet_metadata;
@@ -5,9 +7,8 @@ use crate::library;
 use crate::library_index;
 use crate::managed_items;
 use crate::metadata;
-use crate::messages::{LibraryChange, SseEvent};
+use crate::messages::{IdentifiedMedia, LibraryChange, SseEvent};
 use crate::organizer;
-use crate::actors::brain;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -20,17 +21,26 @@ use axum::{
 };
 use futures::stream::Stream;
 use futures::StreamExt;
-use serde::Deserialize;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::convert::Infallible;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock, Semaphore};
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
 use tower_http::services::{ServeDir, ServeFile};
+
+#[derive(Deserialize)]
+struct CreateIntakeReviewRequest {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct UpdateManagedStatusRequest {
+    path: String,
+    status: String,
+}
 
 /// Shared application state injected into handlers.
 #[derive(Clone)]
@@ -45,10 +55,14 @@ pub struct AppState {
 
 pub fn build_router(state: AppState) -> Router {
     let mut app = Router::new()
+        .route("/api/backlog/summary", get(get_backlog_summary))
+        .route("/api/backlog/items", get(list_backlog_items))
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{id}/approve", axum::routing::post(approve_job))
         .route("/api/jobs/{id}/reject", axum::routing::post(reject_job))
         .route("/api/intake/unprocessed", get(list_unprocessed_intake_items))
+        .route("/api/intake/review", axum::routing::post(create_intake_review_job))
+        .route("/api/intake/status", axum::routing::post(update_intake_managed_status))
         .route("/api/library", get(list_library))
         .route("/api/library/rescan", axum::routing::post(trigger_library_rescan))
         .route("/api/library/events", get(list_library_events))
@@ -91,6 +105,13 @@ pub fn build_router(state: AppState) -> Router {
 
 #[derive(Deserialize)]
 struct Pagination {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct BacklogItemsQuery {
+    filter: Option<String>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -185,6 +206,55 @@ async fn list_jobs(
     }
 }
 
+async fn get_backlog_summary(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let config = { state.config.read().await.clone() };
+    match managed_items::summarize(&state.pool, &config).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn list_backlog_items(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<BacklogItemsQuery>,
+) -> impl IntoResponse {
+    let limit = params.limit.unwrap_or(50);
+    let offset = params.offset.unwrap_or(0);
+    let filter = params.filter.unwrap_or_else(|| "needs_attention".into());
+    let config = { state.config.read().await.clone() };
+
+    let (managed_status, missing_metadata_only, missing_sidecar_only, needs_attention_only, organize_needed_only) = match filter.as_str() {
+		"all" => (None, false, false, false, false),
+        "unprocessed" => (Some("UNPROCESSED"), false, false, false, false),
+        "failed" => (Some("FAILED"), false, false, false, false),
+        "awaiting_approval" => (Some("AWAITING_APPROVAL"), false, false, false, false),
+        "approved" => (Some("APPROVED"), false, false, false, false),
+        "reviewed" => (Some("REVIEWED"), false, false, false, false),
+        "missing_metadata" => (None, true, false, false, false),
+        "missing_sidecar" => (None, false, true, false, false),
+        "organize_needed" => (None, false, false, false, true),
+        "needs_attention" => (None, false, false, true, false),
+        _ => return (StatusCode::BAD_REQUEST, "invalid backlog filter").into_response(),
+    };
+
+    match managed_items::list_filtered(
+        &state.pool,
+        &config,
+        managed_status,
+        missing_metadata_only,
+        missing_sidecar_only,
+        needs_attention_only,
+        organize_needed_only,
+        limit,
+        offset,
+    )
+    .await
+    {
+        Ok(items) => Json(items).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
 async fn get_job(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<i64>,
@@ -268,15 +338,126 @@ async fn list_unprocessed_intake_items(
     }
 }
 
+async fn create_intake_review_job(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<CreateIntakeReviewRequest>,
+) -> impl IntoResponse {
+    let relative_path = request.path.trim();
+    if relative_path.is_empty() {
+        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+    }
+
+    let metadata = match metadata::get_or_probe_library_metadata(&state.pool, &state.library_path, relative_path).await {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    };
+
+    match db::fetch_active_job_for_path(&state.pool, &metadata.file_path).await {
+        Ok(Some(job)) => {
+            return (
+                StatusCode::CONFLICT,
+                format!("job {} is already active for this file", job.id),
+            )
+                .into_response();
+        }
+        Ok(None) => {}
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+
+    let config = {
+        let cfg = state.config.read().await;
+        cfg.clone()
+    };
+
+    let mut decision = match brain::create_processing_decision(
+        &config,
+        &IdentifiedMedia {
+            path: PathBuf::from(&metadata.file_path),
+            probe: metadata.probe.clone(),
+        },
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
+    };
+
+    let media = IdentifiedMedia {
+        path: PathBuf::from(&metadata.file_path),
+        probe: metadata.probe,
+    };
+
+    let job_id = match queue::enqueue_job(
+        &state.pool,
+        &state.sse_tx,
+        config.auto_approve_ai_jobs,
+        &media,
+        &mut decision,
+        Some("AWAITING_APPROVAL"),
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    };
+
+    if let Err(error) = managed_items::persist_processing_decision(
+        &state.pool,
+        &state.library_path,
+        relative_path,
+        "AWAITING_APPROVAL",
+        &decision,
+    )
+    .await
+    {
+        tracing::warn!(err = %error, path = relative_path, "failed to persist managed review state");
+    }
+
+    match db::fetch_job_with_analysis(&state.pool, job_id).await {
+        Ok(Some(job)) => Json(job).into_response(),
+        Ok(None) => StatusCode::ACCEPTED.into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn update_intake_managed_status(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<UpdateManagedStatusRequest>,
+) -> impl IntoResponse {
+    let relative_path = request.path.trim();
+    if relative_path.is_empty() {
+        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+    }
+
+    let normalized_status = request.status.trim().to_ascii_uppercase();
+    if !matches!(normalized_status.as_str(), "REVIEWED" | "KEPT_ORIGINAL") {
+        return (StatusCode::BAD_REQUEST, "status must be REVIEWED or KEPT_ORIGINAL").into_response();
+    }
+
+    match managed_items::update_managed_status(
+        &state.pool,
+        &state.library_path,
+        relative_path,
+        &normalized_status,
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
 async fn list_library(
     State(state): State<Arc<AppState>>,
     Query(params): Query<LibraryQuery>,
 ) -> impl IntoResponse {
     let limit = params.limit.unwrap_or(40).clamp(1, 200);
     let offset = params.offset.unwrap_or(0);
+    let config = { state.config.read().await.clone() };
 
     match library::list_from_index(
         &state.pool,
+        &config,
         state.library_path.display().to_string(),
         state.ingest_path.display().to_string(),
         params.q,
@@ -672,7 +853,21 @@ async fn organize_library_file(
     )
     .await
     {
-        Ok(result) => Json(result).into_response(),
+        Ok(result) => {
+            if result.applied && result.changed {
+                if let Err(error) = managed_items::reconcile_after_organize(
+                    &state.pool,
+                    &state.library_path,
+                    relative_path,
+                    &result.target_relative_path,
+                )
+                .await
+                {
+                    tracing::warn!(err = %error, from = relative_path, to = %result.target_relative_path, "failed to reconcile managed item after organize");
+                }
+            }
+            Json(result).into_response()
+        }
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
 }

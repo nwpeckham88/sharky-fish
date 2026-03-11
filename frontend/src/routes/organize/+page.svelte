@@ -1,9 +1,11 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
+	import { page } from '$app/state';
 	import {
 		fetchLibrary,
 		fetchLibraries,
 		fetchLibraryInternetMetadata,
+		fetchSelectedLibraryInternetMetadata,
 		saveSelectedLibraryInternetMetadata,
 		organizeLibraryFile,
 		type LibraryEntry,
@@ -28,11 +30,14 @@
 	let actionLoading = $state(false);
 	let actionError = $state('');
 	let status = $state('');
+	let requestedPath = $state<string | null>(null);
 
 	onMount(async () => {
 		libraries = await fetchLibraries().catch(() => []);
+		const urlLibrary = page.url.searchParams.get('library');
+		requestedPath = page.url.searchParams.get('path');
 		if (libraries.length > 0) {
-			activeLibraryId = libraries[0].id;
+			activeLibraryId = libraries.find((library) => library.id === urlLibrary)?.id ?? libraries[0].id;
 			await loadLibraryItems();
 		}
 	});
@@ -43,6 +48,14 @@
 		try {
 			const response = await fetchLibrary('', 400, 0, activeLibraryId);
 			items = response.items;
+			if (requestedPath) {
+				const match = response.items.find((item) => item.relative_path === requestedPath) ?? null;
+				if (match) {
+					selectItem(match);
+					await loadSavedSelection(match.relative_path);
+				}
+				requestedPath = null;
+			}
 		} finally {
 			loading = false;
 		}
@@ -58,6 +71,19 @@
 		status = '';
 		season = null;
 		episode = null;
+	}
+
+	async function loadSavedSelection(path: string) {
+		actionError = '';
+		try {
+			const selected = await fetchSelectedLibraryInternetMetadata(path);
+			chosenMatch = selected?.selected ?? null;
+			if (selected?.selected) {
+				status = 'Loaded saved metadata selection.';
+			}
+		} catch (error) {
+			actionError = error instanceof Error ? error.message : 'Failed to load saved selection';
+		}
 	}
 
 	async function lookupMetadata() {

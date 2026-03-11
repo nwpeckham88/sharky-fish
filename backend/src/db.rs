@@ -309,6 +309,10 @@ pub struct LibraryIndexRow {
     pub size_bytes: i64,
     pub modified_at: i64,
     pub library_id: Option<String>,
+    pub managed_status: Option<String>,
+    pub has_sidecar: bool,
+    pub has_selected_metadata: bool,
+    pub selected_metadata_json: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
@@ -342,6 +346,21 @@ pub struct LibraryScanStateRow {
     pub completed_at: Option<i64>,
     pub last_scan_at: Option<i64>,
     pub last_error: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
+pub struct ManagedItemsSummaryRow {
+    pub total_items: i64,
+    pub needs_attention_count: i64,
+    pub unprocessed_count: i64,
+    pub reviewed_count: i64,
+    pub kept_original_count: i64,
+    pub awaiting_approval_count: i64,
+    pub approved_count: i64,
+    pub processed_count: i64,
+    pub failed_count: i64,
+    pub missing_metadata_count: i64,
+    pub missing_sidecar_count: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
@@ -435,6 +454,22 @@ pub async fn fetch_job(pool: &SqlitePool, job_id: i64) -> Result<Option<Job>> {
         "SELECT id, file_path, status, created_at FROM jobs WHERE id = ?",
     )
     .bind(job_id)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
+}
+
+pub async fn fetch_active_job_for_path(pool: &SqlitePool, file_path: &str) -> Result<Option<Job>> {
+    let row = sqlx::query_as::<_, Job>(
+        "SELECT id, file_path, status, created_at
+         FROM jobs
+         WHERE file_path = ?
+           AND status IN ('AWAITING_APPROVAL', 'APPROVED', 'PROCESSING')
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(file_path)
     .fetch_optional(pool)
     .await?;
 
@@ -739,6 +774,24 @@ pub async fn find_related_selected_internet_metadata_paths(
     Ok(rows)
 }
 
+pub async fn rename_selected_internet_metadata(
+    pool: &SqlitePool,
+    current_relative_path: &str,
+    target_relative_path: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE selected_internet_metadata
+         SET relative_path = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE relative_path = ?",
+    )
+    .bind(target_relative_path)
+    .bind(current_relative_path)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 pub async fn upsert_library_index_entry(
     pool: &SqlitePool,
     relative_path: &str,
@@ -800,12 +853,17 @@ pub async fn list_library_index(
     offset: i64,
 ) -> Result<Vec<LibraryIndexRow>> {
     let rows = sqlx::query_as::<_, LibraryIndexRow>(
-        "SELECT relative_path, file_name, extension, media_type, size_bytes, modified_at, library_id
-         FROM library_index
-         WHERE (?1 IS NULL OR library_id = ?1)
-           AND (?2 IS NULL OR lower(relative_path) LIKE ?2)
-         ORDER BY modified_at DESC, relative_path ASC
-         LIMIT ?3 OFFSET ?4",
+                "SELECT l.relative_path, l.file_name, l.extension, l.media_type, l.size_bytes, l.modified_at, l.library_id,
+                                m.managed_status,
+                                CASE WHEN m.sidecar_path IS NULL THEN 0 ELSE 1 END AS has_sidecar,
+                                CASE WHEN m.selected_metadata_json IS NULL THEN 0 ELSE 1 END AS has_selected_metadata,
+                                m.selected_metadata_json
+                 FROM library_index l
+                 LEFT JOIN managed_items m ON m.relative_path = l.relative_path
+                 WHERE (?1 IS NULL OR l.library_id = ?1)
+                     AND (?2 IS NULL OR lower(l.relative_path) LIKE ?2)
+                 ORDER BY l.modified_at DESC, l.relative_path ASC
+                 LIMIT ?3 OFFSET ?4",
     )
     .bind(library_id)
     .bind(query_like)
@@ -1050,6 +1108,53 @@ pub async fn delete_stale_managed_items(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+pub async fn rename_managed_item_path(
+    pool: &SqlitePool,
+    current_relative_path: &str,
+    target_relative_path: &str,
+    file_path: &str,
+    file_name: &str,
+    sidecar_path: Option<&str>,
+    last_seen_at: u64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE managed_items
+         SET relative_path = ?, file_path = ?, file_name = ?, sidecar_path = ?,
+             last_seen_at = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE relative_path = ?",
+    )
+    .bind(target_relative_path)
+    .bind(file_path)
+    .bind(file_name)
+    .bind(sidecar_path)
+    .bind(last_seen_at as i64)
+    .bind(current_relative_path)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn update_managed_item_status(
+    pool: &SqlitePool,
+    relative_path: &str,
+    managed_status: &str,
+    last_seen_at: u64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE managed_items
+         SET managed_status = ?, last_seen_at = ?, updated_at = CURRENT_TIMESTAMP
+         WHERE relative_path = ?",
+    )
+    .bind(managed_status)
+    .bind(last_seen_at as i64)
+    .bind(relative_path)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 pub async fn list_unprocessed_managed_items(
     pool: &SqlitePool,
     limit: i64,
@@ -1070,4 +1175,79 @@ pub async fn list_unprocessed_managed_items(
     .await?;
 
     Ok(rows)
+}
+
+pub async fn list_managed_items_filtered(
+    pool: &SqlitePool,
+    managed_status: Option<&str>,
+    missing_metadata_only: bool,
+    missing_sidecar_only: bool,
+    needs_attention_only: bool,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<ManagedItemRow>> {
+    let rows = sqlx::query_as::<_, ManagedItemRow>(
+        "SELECT relative_path, file_path, file_name, media_type, size_bytes, modified_at,
+                library_id, managed_status, selected_metadata_json, last_decision_json,
+                sidecar_path, first_seen_at, last_seen_at, updated_at
+         FROM managed_items
+         WHERE (?1 IS NULL OR managed_status = ?1)
+           AND (?2 = 0 OR (selected_metadata_json IS NULL AND managed_status NOT IN ('KEPT_ORIGINAL', 'PROCESSED')))
+           AND (?3 = 0 OR sidecar_path IS NULL)
+           AND (?4 = 0 OR (
+               managed_status IN ('UNPROCESSED', 'FAILED', 'AWAITING_APPROVAL')
+               OR (selected_metadata_json IS NULL AND managed_status NOT IN ('KEPT_ORIGINAL', 'PROCESSED'))
+               OR sidecar_path IS NULL
+           ))
+         ORDER BY
+           CASE managed_status
+               WHEN 'FAILED' THEN 0
+               WHEN 'UNPROCESSED' THEN 1
+               WHEN 'AWAITING_APPROVAL' THEN 2
+               WHEN 'APPROVED' THEN 3
+               WHEN 'REVIEWED' THEN 4
+               WHEN 'KEPT_ORIGINAL' THEN 5
+               WHEN 'PROCESSED' THEN 6
+               ELSE 7
+           END,
+           modified_at DESC,
+           relative_path ASC
+         LIMIT ?5 OFFSET ?6",
+    )
+    .bind(managed_status)
+    .bind(if missing_metadata_only { 1 } else { 0 })
+    .bind(if missing_sidecar_only { 1 } else { 0 })
+    .bind(if needs_attention_only { 1 } else { 0 })
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+pub async fn summarize_managed_items(pool: &SqlitePool) -> Result<ManagedItemsSummaryRow> {
+    let row = sqlx::query_as::<_, ManagedItemsSummaryRow>(
+        "SELECT
+            COUNT(*) AS total_items,
+            COALESCE(SUM(CASE
+                WHEN managed_status IN ('UNPROCESSED', 'FAILED', 'AWAITING_APPROVAL')
+                    OR (selected_metadata_json IS NULL AND managed_status NOT IN ('KEPT_ORIGINAL', 'PROCESSED'))
+                    OR sidecar_path IS NULL
+                THEN 1 ELSE 0
+            END), 0) AS needs_attention_count,
+            COALESCE(SUM(CASE WHEN managed_status = 'UNPROCESSED' THEN 1 ELSE 0 END), 0) AS unprocessed_count,
+            COALESCE(SUM(CASE WHEN managed_status = 'REVIEWED' THEN 1 ELSE 0 END), 0) AS reviewed_count,
+            COALESCE(SUM(CASE WHEN managed_status = 'KEPT_ORIGINAL' THEN 1 ELSE 0 END), 0) AS kept_original_count,
+            COALESCE(SUM(CASE WHEN managed_status = 'AWAITING_APPROVAL' THEN 1 ELSE 0 END), 0) AS awaiting_approval_count,
+            COALESCE(SUM(CASE WHEN managed_status = 'APPROVED' THEN 1 ELSE 0 END), 0) AS approved_count,
+            COALESCE(SUM(CASE WHEN managed_status = 'PROCESSED' THEN 1 ELSE 0 END), 0) AS processed_count,
+            COALESCE(SUM(CASE WHEN managed_status = 'FAILED' THEN 1 ELSE 0 END), 0) AS failed_count,
+            COALESCE(SUM(CASE WHEN selected_metadata_json IS NULL AND managed_status NOT IN ('KEPT_ORIGINAL', 'PROCESSED') THEN 1 ELSE 0 END), 0) AS missing_metadata_count,
+            COALESCE(SUM(CASE WHEN sidecar_path IS NULL THEN 1 ELSE 0 END), 0) AS missing_sidecar_count
+         FROM managed_items",
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(row)
 }

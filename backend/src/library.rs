@@ -1,7 +1,10 @@
 use anyhow::Result;
 use serde::Serialize;
 
+use crate::config::AppConfig;
 use crate::db;
+use crate::internet_metadata::InternetMetadataMatch;
+use crate::organizer;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct LibraryRoots {
@@ -27,6 +30,11 @@ pub struct LibraryEntry {
     pub size_bytes: u64,
     pub modified_at: Option<u64>,
     pub library_id: Option<String>,
+    pub managed_status: Option<String>,
+    pub has_sidecar: bool,
+    pub has_selected_metadata: bool,
+    pub organize_target_path: Option<String>,
+    pub organize_needed: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,6 +61,7 @@ pub struct LibraryResponse {
 
 pub async fn list_from_index(
     pool: &sqlx::SqlitePool,
+    config: &AppConfig,
     library_root: String,
     ingest_root: String,
     query: Option<String>,
@@ -81,14 +90,39 @@ pub async fn list_from_index(
     Ok(LibraryResponse {
         items: rows
             .into_iter()
-            .map(|row| LibraryEntry {
-                relative_path: row.relative_path,
-                file_name: row.file_name,
-                extension: row.extension,
-                media_type: row.media_type,
-                size_bytes: row.size_bytes.max(0) as u64,
-                modified_at: Some(row.modified_at.max(0) as u64),
-                library_id: row.library_id,
+            .map(|row| {
+                let organize_target_path = row
+                    .selected_metadata_json
+                    .as_deref()
+                    .and_then(|value| serde_json::from_str::<InternetMetadataMatch>(value).ok())
+                    .and_then(|selected| {
+                        organizer::preview_target_relative_path(
+                            config,
+                            &row.relative_path,
+                            row.library_id.as_deref(),
+                            &selected,
+                        )
+                        .ok()
+                    });
+                let organize_needed = organize_target_path
+                    .as_deref()
+                    .map(|target| target != row.relative_path)
+                    .unwrap_or(false);
+
+                LibraryEntry {
+                    relative_path: row.relative_path,
+                    file_name: row.file_name,
+                    extension: row.extension,
+                    media_type: row.media_type,
+                    size_bytes: row.size_bytes.max(0) as u64,
+                    modified_at: Some(row.modified_at.max(0) as u64),
+                    library_id: row.library_id,
+                    managed_status: row.managed_status,
+                    has_sidecar: row.has_sidecar,
+                    has_selected_metadata: row.has_selected_metadata,
+                    organize_target_path,
+                    organize_needed,
+                }
             })
             .collect(),
         total_items: total_items.max(0) as usize,
