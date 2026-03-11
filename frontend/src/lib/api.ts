@@ -41,6 +41,7 @@ export interface IntakeManagedItem {
 	group_key: string | null;
 	group_label: string | null;
 	group_kind: string;
+	group_source: string;
 	member_paths: string[];
 	member_count: number;
 }

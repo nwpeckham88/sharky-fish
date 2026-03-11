@@ -17,6 +17,7 @@ pub struct JobGroup {
     pub key: String,
     pub label: String,
     pub kind: String,
+    pub source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -38,6 +39,7 @@ pub struct IntakeManagedItem {
     pub group_key: Option<String>,
     pub group_label: Option<String>,
     pub group_kind: String,
+    pub group_source: String,
     pub member_paths: Vec<String>,
     pub member_count: u64,
 }
@@ -388,6 +390,7 @@ pub async fn resolve_job_group(
         key: format!("file:{}", normalized_path.to_ascii_lowercase()),
         label,
         kind: "file".into(),
+        source: "file".into(),
     })
 }
 
@@ -417,6 +420,7 @@ fn job_group_from_selected_metadata(selected: InternetMetadataMatch) -> Option<J
         key,
         label: title.to_string(),
         kind: "tv_show".into(),
+        source: "metadata".into(),
     })
 }
 
@@ -455,6 +459,7 @@ fn derive_tv_group_from_library(
         key: format!("tv-path:{}:{}", library.id, show.to_ascii_lowercase()),
         label: show.to_string(),
         kind: "tv_show".into(),
+        source: "library".into(),
     })
 }
 
@@ -507,6 +512,88 @@ fn backlog_group_for_row(config: &AppConfig, row: &db::ManagedItemRow) -> Option
         .and_then(|json| serde_json::from_str::<InternetMetadataMatch>(json).ok())
         .and_then(job_group_from_selected_metadata)
         .or_else(|| derive_tv_group_from_library(config, &row.relative_path, row.library_id.as_deref()))
+        .or_else(|| derive_tv_group_from_path_heuristic(&row.relative_path))
+}
+
+fn derive_tv_group_from_path_heuristic(relative_path: &str) -> Option<JobGroup> {
+    let normalized = relative_path.replace('\\', "/");
+    let segments = normalized
+        .split('/')
+        .filter_map(|segment| {
+            let trimmed = segment.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        })
+        .collect::<Vec<_>>();
+
+    if segments.len() < 2 {
+        return None;
+    }
+
+    let has_episode_pattern = segments.iter().any(|segment| contains_episode_marker(segment));
+    let has_season_folder = segments.iter().any(|segment| is_season_segment(segment));
+    if !has_episode_pattern && !has_season_folder {
+        return None;
+    }
+
+    let root_tokens = ["tv", "television", "shows", "series", "tv-shows", "tvshows"];
+    let show_index = if root_tokens.contains(&segments[0].to_ascii_lowercase().as_str()) {
+        1
+    } else {
+        0
+    };
+
+    let show = segments.get(show_index)?.trim();
+    if show.is_empty() || is_season_segment(show) {
+        return None;
+    }
+
+    Some(JobGroup {
+        key: format!("tv-heuristic:{}", show.to_ascii_lowercase()),
+        label: show.to_string(),
+        kind: "tv_show".into(),
+        source: "path".into(),
+    })
+}
+
+fn contains_episode_marker(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() < 6 {
+        return false;
+    }
+
+    for window in bytes.windows(6) {
+        let first = window[0].to_ascii_lowercase();
+        if first != b's' {
+            continue;
+        }
+        if !window[1].is_ascii_digit() || !window[2].is_ascii_digit() {
+            continue;
+        }
+        let fourth = window[3].to_ascii_lowercase();
+        if fourth != b'e' {
+            continue;
+        }
+        if window[4].is_ascii_digit() && window[5].is_ascii_digit() {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_season_segment(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    if !normalized.starts_with("season") {
+        return false;
+    }
+
+    normalized[6..]
+        .chars()
+        .all(|ch| ch.is_ascii_whitespace() || ch.is_ascii_digit() || ch == '_' || ch == '-')
 }
 
 fn intake_item_from_group(
@@ -562,6 +649,7 @@ fn intake_item_from_group(
         group_key: Some(group.key),
         group_label: Some(group.label),
         group_kind: group.kind,
+        group_source: group.source,
         member_count: member_paths.len() as u64,
         member_paths,
     })
@@ -738,6 +826,7 @@ fn intake_item_from_row(config: &AppConfig, row: db::ManagedItemRow) -> Result<I
         group_key: None,
         group_label: None,
         group_kind: "file".into(),
+        group_source: "file".into(),
         member_paths: vec![row.relative_path],
         member_count: 1,
     })
@@ -852,6 +941,24 @@ mod tests {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].group_kind, "tv_show");
         assert_eq!(items[0].group_label.as_deref(), Some("Fallout"));
+        assert_eq!(items[0].member_count, 2);
+    }
+
+    #[test]
+    fn groups_tv_rows_by_path_heuristic_without_library_config() {
+        let config = AppConfig::default();
+        let items = aggregate_backlog_items(
+            &config,
+            vec![
+                row_with_library("tv/Will Trent/Season 04/Will Trent - S04E02.mkv", "unknown", "UNPROCESSED", None),
+                row_with_library("tv/Will Trent/Season 04/Will Trent - S04E03.mkv", "unknown", "UNPROCESSED", None),
+            ],
+        )
+        .expect("heuristic grouped backlog items");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].group_kind, "tv_show");
+        assert_eq!(items[0].group_label.as_deref(), Some("Will Trent"));
         assert_eq!(items[0].member_count, 2);
     }
 }

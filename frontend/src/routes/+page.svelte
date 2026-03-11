@@ -387,6 +387,9 @@
 								<div class="flex flex-wrap items-center gap-2">
 									<span class="status-chip {statusTone(item.managed_status)}">{statusLabel(item.managed_status)}</span>
 									<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">{item.group_kind === 'tv_show' ? 'tv show' : item.media_type}</span>
+									{#if item.group_source === 'path'}
+										<span class="rounded-full border border-[color:rgba(214,180,111,0.35)] bg-[color:rgba(214,180,111,0.12)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">path grouped</span>
+									{/if}
 									{#if item.library_id}
 										<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">{item.library_id}</span>
 									{/if}
@@ -404,9 +407,11 @@
 									{/if}
 								</div>
 								<h3 class="mt-3 truncate text-base font-semibold text-[color:var(--ink-strong)]">{item.group_label ?? item.file_name}</h3>
-								<p class="mt-1 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.group_kind === 'tv_show' ? 'Show-level backlog item' : item.relative_path}</p>
+								<p class="mt-1 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.group_kind === 'tv_show' ? item.group_source === 'path' ? 'Show-level backlog item inferred from path' : 'Show-level backlog item' : item.relative_path}</p>
 								<p class="mt-3 text-sm text-[color:var(--ink-muted)]">
-									{#if item.group_kind === 'tv_show' && item.managed_status === 'UNPROCESSED'}
+									{#if item.group_kind === 'tv_show' && item.group_source === 'path' && item.managed_status === 'UNPROCESSED'}
+										This show was grouped from its path pattern because it is not matched to a TV library or selected metadata yet.
+									{:else if item.group_kind === 'tv_show' && item.managed_status === 'UNPROCESSED'}
 										No durable sharky-fish context exists for this show yet. Create one review bundle for the full show or mark the show as intentionally left alone.
 									{:else if item.managed_status === 'UNPROCESSED'}
 										No durable sharky-fish context exists for this file yet. Choose whether to review it with AI or mark it as intentionally left alone.
