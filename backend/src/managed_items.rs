@@ -426,13 +426,10 @@ fn derive_tv_group_from_library(
     library_id: Option<&str>,
 ) -> Option<JobGroup> {
     let library = if let Some(id) = library_id {
-        config.libraries.iter().find(|candidate| {
-            if candidate.id != id || candidate.media_type != "tv" {
-                return false;
-            }
-            let prefix = normalize_library_prefix(&candidate.path);
-            relative_path == prefix || relative_path.starts_with(&format!("{prefix}/"))
-        })
+        config
+            .libraries
+            .iter()
+            .find(|candidate| candidate.id == id && candidate.media_type == "tv")
     } else {
         config
             .libraries
@@ -445,7 +442,7 @@ fn derive_tv_group_from_library(
     };
 
     let library = library.filter(|candidate| candidate.media_type == "tv")?;
-    let stripped = strip_library_prefix(relative_path, &library.path)?;
+    let stripped = strip_library_prefix(relative_path, &library.path).unwrap_or(relative_path);
     let show = stripped
         .split('/')
         .find(|segment| !segment.trim().is_empty())?
@@ -752,6 +749,15 @@ mod tests {
     use crate::config::LibraryFolder;
 
     fn row(relative_path: &str, status: &str, selected_metadata_json: Option<&str>) -> db::ManagedItemRow {
+        row_with_library(relative_path, "tv", status, selected_metadata_json)
+    }
+
+    fn row_with_library(
+        relative_path: &str,
+        library_id: &str,
+        status: &str,
+        selected_metadata_json: Option<&str>,
+    ) -> db::ManagedItemRow {
         db::ManagedItemRow {
             relative_path: relative_path.into(),
             file_path: format!("/data/{relative_path}"),
@@ -759,7 +765,7 @@ mod tests {
             media_type: "video".into(),
             size_bytes: 100,
             modified_at: 10,
-            library_id: Some("tv".into()),
+            library_id: Some(library_id.into()),
             managed_status: status.into(),
             selected_metadata_json: selected_metadata_json.map(str::to_string),
             last_decision_json: None,
@@ -822,13 +828,31 @@ mod tests {
         let config = config();
         let items = aggregate_backlog_items(
             &config,
-            vec![row("movies/Dune (2021).mkv", "UNPROCESSED", None)],
+            vec![row_with_library("movies/Dune (2021).mkv", "movies", "UNPROCESSED", None)],
         )
         .expect("backlog items");
 
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].group_kind, "file");
         assert_eq!(items[0].member_count, 1);
+    }
+
+    #[test]
+    fn groups_tv_rows_by_library_id_even_without_path_prefix() {
+        let config = config();
+        let items = aggregate_backlog_items(
+            &config,
+            vec![
+                row("Fallout/Season 01/Fallout - S01E01.mkv", "UNPROCESSED", None),
+                row("Fallout/Season 01/Fallout - S01E02.mkv", "UNPROCESSED", None),
+            ],
+        )
+        .expect("grouped backlog items");
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].group_kind, "tv_show");
+        assert_eq!(items[0].group_label.as_deref(), Some("Fallout"));
+        assert_eq!(items[0].member_count, 2);
     }
 }
 
