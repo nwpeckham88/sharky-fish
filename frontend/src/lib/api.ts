@@ -369,6 +369,7 @@ export interface ImprovePromptRequest {
 	current_prompt: string;
 	playback_context?: string;
 	golden_standards: GoldenStandards;
+	mode?: 'replace' | 'append_policy';
 }
 
 export interface ImprovePromptResponse {

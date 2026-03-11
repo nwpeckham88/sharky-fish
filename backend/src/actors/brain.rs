@@ -158,9 +158,15 @@ pub async fn improve_system_prompt(
     current_prompt: &str,
     playback_context: &str,
     standards: &GoldenStandards,
+    mode: &str,
 ) -> Result<String> {
     let client = reqwest::Client::new();
     let system_prompt = "You rewrite rough media-policy ideas into a precise system prompt for Sharky Fish. Return strict JSON exactly like {\"prompt\":\"...\"}. Do not use markdown fences, commentary, or extra keys.";
+    let mode_instructions = if mode == "append_policy" {
+        "Generate a standalone policy section that can be appended to an existing system prompt. Do not restate the entire prompt. Start directly with policy content that reads naturally when appended."
+    } else {
+        "Generate a full replacement system prompt."
+    };
     let user_prompt = format!(
         "Expand the operator's rough concept into a stronger system prompt for the Sharky Fish FFmpeg planning assistant.\n\n\
          Requirements:\n\
@@ -169,6 +175,7 @@ pub async fn improve_system_prompt(
          - Treat playback device notes as compatibility guidance, not as a rigid inventory schema.\n\
          - Keep the result concise enough to be practical as a saved system prompt.\n\
          - Return only a single prompt string inside the JSON object.\n\n\
+         Output mode:\n{}\n\n\
          Current prompt:\n{}\n\n\
          Operator concept:\n{}\n\n\
          Playback context:\n{}\n\n\
@@ -176,6 +183,7 @@ pub async fn improve_system_prompt(
          - Video: codec={}, max_bitrate={}Mbps, resolution_ceiling={}\n\
          - Audio: codec={}, target_lufs={}, target_true_peak={}, max_channels={}, keep_multiple_tracks={}, create_stereo_downmix={}\n\
          - Subtitles: mode={}, preferred_languages=[{}], keep_forced={}, keep_sdh={}",
+        mode_instructions,
         current_prompt.trim(),
         concept.trim(),
         playback_context_block(playback_context),

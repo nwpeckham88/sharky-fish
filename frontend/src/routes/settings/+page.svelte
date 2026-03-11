@@ -4,6 +4,7 @@
 		fetchConfig,
 		saveConfig,
 		testLlmConnection,
+		improveSystemPrompt,
 		fetchLibraries,
 		addLibrary,
 		updateLibrary,
@@ -17,8 +18,14 @@
 	let loading = $state(true);
 	let saving = $state(false);
 	let testingLlm = $state(false);
+	let improvingPrompt = $state(false);
 	let llmTestResult = $state<{ ok: boolean; message: string } | null>(null);
 	let toast = $state<{ msg: string; ok: boolean } | null>(null);
+	let promptIdea = $state('');
+	let improvedPromptDraft = $state('');
+	let promptImproveError = $state('');
+	let promptImproveMode = $state<'replace' | 'append_policy'>('replace');
+	let promptDraftMode = $state<'replace' | 'append_policy'>('replace');
 
 	// Library folder management
 	let libraries = $state<LibraryFolder[]>([]);
@@ -79,11 +86,95 @@
 		llmTestResult = null;
 	}
 
+	function applyRecommendedStandards() {
+		if (!config) return;
+		config.golden_standards.video.codec = 'h265';
+		config.golden_standards.audio.codec = 'opus';
+		config.golden_standards.audio.max_channels = '5.1';
+		config.golden_standards.audio.keep_multiple_tracks = true;
+		config.golden_standards.audio.create_stereo_downmix = true;
+	}
+
+	function buildRecommendedPrompt(playbackContext: string): string {
+		const normalizedContext = playbackContext.trim() || 'No player notes supplied yet. Favor broadly compatible outputs while still preferring modern codecs when device support is likely.';
+		return `You are Sharky Fish's FFmpeg planning engine. Your only job is to generate highly optimized, syntactically valid FFmpeg argument arrays based on library policy, source media characteristics, and playback compatibility.
+
+Return only strict JSON in the shape {"arguments": [...], "requires_two_pass": bool, "rationale": "..."}. Do not output markdown, prose, analysis, or the ffmpeg binary name.
+
+Planning rules:
+- Favor H.265 video unless the source, container, or playback compatibility notes clearly justify another choice.
+- Favor Opus audio by default.
+- Preserve a surround track up to 5.1 when useful and keep multiple retained tracks when they add value.
+- Ensure a stereo-compatible track exists for every deliverable, creating a downmix when the source lacks one.
+- Keep subtitle handling aligned with the configured subtitle policy.
+- Preserve high-value source characteristics such as HDR, strong detail, and worthwhile 4K masters when they remain compatible with the playback environment.
+- Optimize for the playback context below without inventing hardware that was not described.
+
+Playback context:
+${normalizedContext}`;
+	}
+
+	function loadRecommendedPrompt() {
+		if (!config) return;
+		config.system_prompt = buildRecommendedPrompt(config.playback_context);
+		improvedPromptDraft = '';
+		promptImproveError = '';
+	}
+
+	async function runPromptImprover() {
+		if (!config) return;
+		if (!promptIdea.trim()) {
+			promptImproveError = 'Enter a rough idea first.';
+			return;
+		}
+
+		improvingPrompt = true;
+		promptImproveError = '';
+		improvedPromptDraft = '';
+		try {
+			const result = await improveSystemPrompt({
+				llm: config.llm,
+				concept: promptIdea.trim(),
+				current_prompt: config.system_prompt,
+				playback_context: config.playback_context,
+				golden_standards: config.golden_standards,
+				mode: promptImproveMode
+			});
+			promptDraftMode = promptImproveMode;
+			improvedPromptDraft = result.prompt;
+		} catch (error) {
+			promptImproveError = error instanceof Error ? error.message : 'Failed to improve prompt';
+		} finally {
+			improvingPrompt = false;
+		}
+	}
+
+	function applyImprovedPrompt() {
+		if (!config || !improvedPromptDraft.trim()) return;
+		if (promptDraftMode === 'append_policy') {
+			const existing = config.system_prompt.trimEnd();
+			const separator = existing ? '\n\nAdditional Policy:\n' : '';
+			config.system_prompt = `${existing}${separator}${improvedPromptDraft}`.trim();
+			toaster('Improved policy appended to the prompt editor', true);
+		} else {
+			config.system_prompt = improvedPromptDraft;
+			toaster('Improved prompt loaded into the editor', true);
+		}
+	}
+
 	const CODECS = [
 		{ value: 'h264', label: 'H.264 (libx264 / nvenc)' },
 		{ value: 'h265', label: 'H.265 (libx265 / nvenc)' },
 		{ value: 'av1',  label: 'AV1 (libaom / svt-av1)' },
 		{ value: 'vp9',  label: 'VP9' },
+	];
+
+	const AUDIO_CODECS = [
+		{ value: 'opus', label: 'Opus' },
+		{ value: 'aac', label: 'AAC' },
+		{ value: 'ac3', label: 'AC-3' },
+		{ value: 'eac3', label: 'E-AC-3' },
+		{ value: 'copy', label: 'Copy Source Codec' }
 	];
 
 	const RESOLUTIONS = [
@@ -336,7 +427,10 @@
 
 {:else if activeTab === 'standards'}
 	<section class="surface-card p-6">
-		<h2 class="mb-4 text-xl text-[color:var(--ink-strong)]">Golden Standards</h2>
+		<div class="mb-4 flex flex-wrap items-center justify-between gap-3">
+			<h2 class="text-xl text-[color:var(--ink-strong)]">Golden Standards</h2>
+			<button onclick={applyRecommendedStandards} class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm font-semibold text-[color:var(--ink-strong)]">Apply H.265 + Opus Defaults</button>
+		</div>
 		<p class="mb-6 text-sm text-[color:var(--ink-muted)]">Define the target encoding profile that the LLM must respect. Files deviating from these standards will be flagged during library audits.</p>
 
 		<div class="grid gap-5 md:grid-cols-2">
@@ -372,6 +466,14 @@
 				<h3 class="section-label mb-4">Audio</h3>
 				<div class="space-y-4">
 					<label class="block">
+						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Target Codec</span>
+						<select bind:value={config.golden_standards.audio.codec} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]">
+							{#each AUDIO_CODECS as { value, label }}
+								<option {value}>{label}</option>
+							{/each}
+						</select>
+					</label>
+					<label class="block">
 						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Target Integrated Loudness (LUFS)</span>
 						<input type="range" min="-31" max="-14" bind:value={config.golden_standards.audio.target_lufs} class="w-full" />
 						<div class="mt-1 flex justify-between text-xs text-[color:var(--ink-muted)]"><span>-31 (cinematic)</span><span>{config.golden_standards.audio.target_lufs} LUFS</span><span>-14 (desktop)</span></div>
@@ -388,6 +490,22 @@
 							{/each}
 						</select>
 					</label>
+					<div class="grid gap-3">
+						<label class="flex items-center gap-2.5 cursor-pointer rounded-lg border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.45)] px-3 py-3">
+							<input type="checkbox" bind:checked={config.golden_standards.audio.keep_multiple_tracks} class="rounded border-[color:var(--line)] accent-[color:var(--accent)]" />
+							<div>
+								<span class="block text-sm font-semibold text-[color:var(--ink-strong)]">Keep Multiple Audio Tracks</span>
+								<span class="block text-xs text-[color:var(--ink-muted)]">Allow both surround and alternate retained tracks when they serve the library policy.</span>
+							</div>
+						</label>
+						<label class="flex items-center gap-2.5 cursor-pointer rounded-lg border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.45)] px-3 py-3">
+							<input type="checkbox" bind:checked={config.golden_standards.audio.create_stereo_downmix} class="rounded border-[color:var(--line)] accent-[color:var(--accent)]" />
+							<div>
+								<span class="block text-sm font-semibold text-[color:var(--ink-strong)]">Ensure Stereo Compatibility Track</span>
+								<span class="block text-xs text-[color:var(--ink-muted)]">Create or keep a stereo track so every file remains playable on simpler clients.</span>
+							</div>
+						</label>
+					</div>
 				</div>
 			</div>
 		</div>
@@ -473,7 +591,49 @@
 {:else if activeTab === 'prompt'}
 	<section class="surface-card p-6">
 		<h2 class="mb-4 text-xl text-[color:var(--ink-strong)]">Prompt Playground</h2>
-		<p class="mb-6 text-sm text-[color:var(--ink-muted)]">Define the system prompt sent to the LLM. Test it with sample media before applying to your library.</p>
+		<p class="mb-6 text-sm text-[color:var(--ink-muted)]">Define the system prompt sent to the LLM. Keep player details in Playback Context unless you truly need a dedicated device-management feature later.</p>
+
+		<div class="mb-5 grid gap-4 rounded-[1rem] border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.45)] p-4 xl:grid-cols-[minmax(0,1fr)_auto] xl:items-end">
+			<div>
+				<div class="section-label">Recommended Prompt</div>
+				<p class="mt-2 text-sm text-[color:var(--ink-muted)]">Start from a stricter house prompt tuned for H.265 video, Opus audio, 5.1 plus stereo compatibility, and the playback notes from your System Profile.</p>
+			</div>
+			<button onclick={loadRecommendedPrompt} class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm font-semibold text-[color:var(--ink-strong)]">Load Recommended Prompt</button>
+		</div>
+
+		<div class="mb-5 rounded-[1rem] border border-[color:var(--line)] p-5">
+			<div class="section-label mb-3">Improve Prompt With AI</div>
+			<p class="mb-3 text-sm text-[color:var(--ink-muted)]">Enter a rough idea like “Keep visually stunning or highly rated films in 4K HDR where it makes sense.” The model will expand it into a more precise saved prompt using your current standards and playback notes.</p>
+			<div class="mb-3 flex flex-wrap gap-1.5 rounded-xl border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-1 w-fit">
+				<button class="rounded-lg px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {promptImproveMode === 'replace' ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => { promptImproveMode = 'replace'; }}>
+					Replace Full Prompt
+				</button>
+				<button class="rounded-lg px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {promptImproveMode === 'append_policy' ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => { promptImproveMode = 'append_policy'; }}>
+					Append Policy Section
+				</button>
+			</div>
+			<p class="mb-3 text-xs text-[color:var(--ink-muted)]">
+				{promptImproveMode === 'replace'
+					? 'Replace mode asks the model for a complete new system prompt.'
+					: 'Append mode asks the model for a standalone policy block that can be appended to your current prompt.'}
+			</p>
+			<textarea bind:value={promptIdea} rows="4" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-3 text-sm text-[color:var(--ink-strong)]" placeholder="I want all the good looking or very highly rated movies in 4K HDR. Animated movies in 4K HDR where available."></textarea>
+			<div class="mt-3 flex flex-wrap items-center gap-2">
+				<button onclick={runPromptImprover} disabled={improvingPrompt} class="rounded-lg bg-[color:var(--accent)] px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">{improvingPrompt ? 'Improving…' : 'Improve Prompt With AI'}</button>
+				{#if improvedPromptDraft}
+					<button onclick={applyImprovedPrompt} class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm font-semibold text-[color:var(--ink-strong)]">{promptDraftMode === 'append_policy' ? 'Append Improved Policy' : 'Use Improved Prompt'}</button>
+				{/if}
+			</div>
+			{#if promptImproveError}
+				<div class="mt-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-4 py-2.5 text-sm text-[color:var(--danger)]">{promptImproveError}</div>
+			{/if}
+			{#if improvedPromptDraft}
+				<div class="mt-4">
+					<div class="mb-2 text-xs font-semibold uppercase tracking-[0.16em] text-[color:var(--ink-muted)]">AI Draft · {promptDraftMode === 'append_policy' ? 'Append Policy Section' : 'Replace Full Prompt'}</div>
+					<textarea readonly value={improvedPromptDraft} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--paper-deep)] p-4 font-mono text-sm leading-relaxed text-[color:var(--ink-strong)]" rows="10"></textarea>
+				</div>
+			{/if}
+		</div>
 
 		<div class="grid gap-5 xl:grid-cols-2">
 			<!-- System Prompt -->
@@ -524,6 +684,13 @@
 						<p class="mt-2">{config.auto_approve_ai_jobs ? 'AI decisions go straight to The Forge queue as APPROVED items.' : 'AI decisions pause in Intake as AWAITING_APPROVAL until an operator approves them.'}</p>
 					</div>
 				</div>
+			</div>
+
+			<div class="rounded-[1rem] border border-[color:var(--line)] p-5 md:col-span-2">
+				<h3 class="section-label mb-4">Playback Context</h3>
+				<p class="mb-3 text-sm text-[color:var(--ink-muted)]">This is the simpler alternative to a full player-endpoint feature for now. List the clients and constraints the AI should optimize for, such as Onn 4K Pro, Nvidia Shield, AVR support, 4K HDR, Dolby Vision, lossless-audio limits, or subtitle quirks.</p>
+				<textarea bind:value={config.playback_context} rows="5" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-3 text-sm text-[color:var(--ink-strong)]" placeholder="Living room: Nvidia Shield Pro into a 4K HDR TV and AVR, prefers direct play, can handle 4K HDR10 and 5.1. Bedroom: Onn 4K Pro on a stereo TV, needs a stereo-compatible track on everything."></textarea>
+				<p class="mt-2 text-xs text-[color:var(--ink-muted)]">This context is sent to the LLM with media planning requests and also feeds the prompt improver.</p>
 			</div>
 
 			<!-- LLM Configuration -->

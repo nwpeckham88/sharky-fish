@@ -277,6 +277,7 @@ struct ImproveSystemPromptRequest {
     current_prompt: String,
     playback_context: Option<String>,
     golden_standards: crate::config::GoldenStandards,
+    mode: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1446,6 +1447,7 @@ async fn improve_system_prompt(
         &request.current_prompt,
         request.playback_context.as_deref().unwrap_or_default(),
         &request.golden_standards,
+        request.mode.as_deref().unwrap_or("replace"),
     )
     .await
     {
