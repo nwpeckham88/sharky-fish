@@ -49,6 +49,24 @@ export interface BacklogSummary {
 	organize_needed_count: number;
 }
 
+export interface BulkFailure {
+	path: string;
+	error: string;
+}
+
+export interface BulkCreateReviewResponse {
+	jobs: Job[];
+	success_count: number;
+	failure_count: number;
+	failures: BulkFailure[];
+}
+
+export interface BulkManagedStatusResponse {
+	success_count: number;
+	failure_count: number;
+	failures: BulkFailure[];
+}
+
 export type BacklogFilter =
 	| 'all'
 	| 'needs_attention'
@@ -202,6 +220,12 @@ export interface InternetMetadataBulkResponse {
 	items: InternetMetadataBulkItem[];
 }
 
+export interface BulkInternetAutoSelectResponse {
+	success_count: number;
+	failure_count: number;
+	failures: BulkFailure[];
+}
+
 export interface SelectedInternetMetadataResponse {
 	path: string;
 	selected: InternetMetadataMatch;
@@ -349,6 +373,19 @@ export async function createIntakeReview(path: string): Promise<Job> {
 	return res.json();
 }
 
+export async function createBulkIntakeReviews(paths: string[]): Promise<BulkCreateReviewResponse> {
+	const res = await fetch(`${BASE}/intake/review/bulk`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ paths })
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to create bulk review jobs: ${res.status}`);
+	}
+	return res.json();
+}
+
 export async function updateIntakeManagedStatus(path: string, status: 'REVIEWED' | 'KEPT_ORIGINAL'): Promise<void> {
 	const res = await fetch(`${BASE}/intake/status`, {
 		method: 'POST',
@@ -359,6 +396,22 @@ export async function updateIntakeManagedStatus(path: string, status: 'REVIEWED'
 		const text = await res.text();
 		throw new Error(text || `Failed to update managed status: ${res.status}`);
 	}
+}
+
+export async function updateBulkIntakeManagedStatus(
+	paths: string[],
+	status: 'REVIEWED' | 'KEPT_ORIGINAL'
+): Promise<BulkManagedStatusResponse> {
+	const res = await fetch(`${BASE}/intake/status/bulk`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ paths, status })
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to update bulk managed status: ${res.status}`);
+	}
+	return res.json();
 }
 
 export async function fetchJob(id: number): Promise<{ job_id: number; tasks: Task[] }> {
@@ -434,6 +487,19 @@ export async function fetchLibraryInternetMetadataBulk(paths: string[]): Promise
 		body: JSON.stringify({ paths })
 	});
 	if (!res.ok) throw new Error(`Failed to fetch bulk internet metadata: ${res.status}`);
+	return res.json();
+}
+
+export async function autoSelectLibraryInternetMetadataBulk(paths: string[]): Promise<BulkInternetAutoSelectResponse> {
+	const res = await fetch(`${BASE}/library/internet/bulk/select`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ paths })
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to auto-select bulk internet metadata: ${res.status}`);
+	}
 	return res.json();
 }
 

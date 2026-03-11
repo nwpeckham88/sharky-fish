@@ -37,9 +37,53 @@ struct CreateIntakeReviewRequest {
 }
 
 #[derive(Deserialize)]
+struct BulkPathsRequest {
+
+#[derive(Serialize)]
+struct BulkInternetAutoSelectResponse {
+	success_count: usize,
+	failure_count: usize,
+	failures: Vec<BulkFailure>,
+}
+    paths: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct UpdateManagedStatusRequest {
     path: String,
     status: String,
+}
+
+#[derive(Deserialize)]
+struct BulkUpdateManagedStatusRequest {
+    paths: Vec<String>,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct BulkFailure {
+    path: String,
+    error: String,
+}
+
+#[derive(Serialize)]
+struct BulkCreateReviewResponse {
+    jobs: Vec<db::JobWithAnalysis>,
+    success_count: usize,
+    failure_count: usize,
+    failures: Vec<BulkFailure>,
+}
+
+#[derive(Serialize)]
+struct BulkManagedStatusResponse {
+    success_count: usize,
+    failure_count: usize,
+    failures: Vec<BulkFailure>,
+}
+
+struct HandlerError {
+    status: StatusCode,
+    message: String,
 }
 
 /// Shared application state injected into handlers.
@@ -62,7 +106,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/jobs/{id}/reject", axum::routing::post(reject_job))
         .route("/api/intake/unprocessed", get(list_unprocessed_intake_items))
         .route("/api/intake/review", axum::routing::post(create_intake_review_job))
+        .route("/api/intake/review/bulk", axum::routing::post(create_bulk_intake_review_jobs))
         .route("/api/intake/status", axum::routing::post(update_intake_managed_status))
+        .route("/api/intake/status/bulk", axum::routing::post(update_bulk_intake_managed_status))
         .route("/api/library", get(list_library))
         .route("/api/library/rescan", axum::routing::post(trigger_library_rescan))
         .route("/api/library/events", get(list_library_events))
@@ -72,6 +118,10 @@ pub fn build_router(state: AppState) -> Router {
             get(get_library_internet_metadata).post(save_selected_library_internet_metadata),
         )
         .route("/api/library/internet/bulk", axum::routing::post(get_library_internet_metadata_bulk))
+        .route(
+            "/api/library/internet/bulk/select",
+            axum::routing::post(auto_select_library_internet_metadata_bulk),
+        )
         .route("/api/library/internet/related", get(get_related_library_internet_metadata_paths))
         .route("/api/library/internet/selected", get(get_selected_library_internet_metadata))
         .route("/api/library/duplicates", get(list_library_duplicates))
@@ -342,34 +392,126 @@ async fn create_intake_review_job(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateIntakeReviewRequest>,
 ) -> impl IntoResponse {
-    let relative_path = request.path.trim();
-    if relative_path.is_empty() {
-        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+    match create_intake_review_job_for_path(&state, request.path.trim()).await {
+        Ok(job) => Json(job).into_response(),
+        Err(error) => (error.status, error.message).into_response(),
+    }
+}
+
+async fn create_bulk_intake_review_jobs(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<BulkPathsRequest>,
+) -> impl IntoResponse {
+    if request.paths.is_empty() {
+        return (StatusCode::BAD_REQUEST, "paths are required").into_response();
+    }
+    if request.paths.len() > 500 {
+        return (StatusCode::BAD_REQUEST, "too many paths").into_response();
     }
 
-    let metadata = match metadata::get_or_probe_library_metadata(&state.pool, &state.library_path, relative_path).await {
-        Ok(value) => value,
-        Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
-    };
+    let mut jobs = Vec::new();
+    let mut failures = Vec::new();
+
+    for path in request.paths {
+        let trimmed = path.trim().to_string();
+        match create_intake_review_job_for_path(&state, &trimmed).await {
+            Ok(job) => jobs.push(job),
+            Err(error) => failures.push(BulkFailure {
+                path: trimmed,
+                error: error.message,
+            }),
+        }
+    }
+
+    Json(BulkCreateReviewResponse {
+        success_count: jobs.len(),
+        failure_count: failures.len(),
+        jobs,
+        failures,
+    })
+    .into_response()
+}
+
+async fn update_intake_managed_status(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<UpdateManagedStatusRequest>,
+) -> impl IntoResponse {
+    match update_managed_status_for_path(&state, request.path.trim(), &request.status).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+async fn update_bulk_intake_managed_status(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<BulkUpdateManagedStatusRequest>,
+) -> impl IntoResponse {
+    if request.paths.is_empty() {
+        return (StatusCode::BAD_REQUEST, "paths are required").into_response();
+    }
+    if request.paths.len() > 500 {
+        return (StatusCode::BAD_REQUEST, "too many paths").into_response();
+    }
+
+    let mut success_count = 0;
+    let mut failures = Vec::new();
+
+    for path in request.paths {
+        let trimmed = path.trim().to_string();
+        match update_managed_status_for_path(&state, &trimmed, &request.status).await {
+            Ok(()) => success_count += 1,
+            Err(error) => failures.push(BulkFailure {
+                path: trimmed,
+                error: error,
+            }),
+        }
+    }
+
+    Json(BulkManagedStatusResponse {
+        success_count,
+        failure_count: failures.len(),
+        failures,
+    })
+    .into_response()
+}
+
+async fn create_intake_review_job_for_path(
+    state: &Arc<AppState>,
+    relative_path: &str,
+) -> Result<db::JobWithAnalysis, HandlerError> {
+    if relative_path.is_empty() {
+        return Err(HandlerError {
+            status: StatusCode::BAD_REQUEST,
+            message: "path is required".into(),
+        });
+    }
+
+    let metadata = metadata::get_or_probe_library_metadata(&state.pool, &state.library_path, relative_path)
+        .await
+        .map_err(|error| HandlerError {
+            status: StatusCode::BAD_REQUEST,
+            message: error.to_string(),
+        })?;
 
     match db::fetch_active_job_for_path(&state.pool, &metadata.file_path).await {
         Ok(Some(job)) => {
-            return (
-                StatusCode::CONFLICT,
-                format!("job {} is already active for this file", job.id),
-            )
-                .into_response();
+            return Err(HandlerError {
+                status: StatusCode::CONFLICT,
+                message: format!("job {} is already active for this file", job.id),
+            });
         }
         Ok(None) => {}
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            return Err(HandlerError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                message: error.to_string(),
+            });
+        }
     }
 
-    let config = {
-        let cfg = state.config.read().await;
-        cfg.clone()
-    };
+    let config = { state.config.read().await.clone() };
 
-    let mut decision = match brain::create_processing_decision(
+    let mut decision = brain::create_processing_decision(
         &config,
         &IdentifiedMedia {
             path: PathBuf::from(&metadata.file_path),
@@ -377,17 +519,17 @@ async fn create_intake_review_job(
         },
     )
     .await
-    {
-        Ok(value) => value,
-        Err(error) => return (StatusCode::BAD_GATEWAY, error.to_string()).into_response(),
-    };
+    .map_err(|error| HandlerError {
+        status: StatusCode::BAD_GATEWAY,
+        message: error.to_string(),
+    })?;
 
     let media = IdentifiedMedia {
         path: PathBuf::from(&metadata.file_path),
         probe: metadata.probe,
     };
 
-    let job_id = match queue::enqueue_job(
+    let job_id = queue::enqueue_job(
         &state.pool,
         &state.sse_tx,
         config.auto_approve_ai_jobs,
@@ -396,10 +538,10 @@ async fn create_intake_review_job(
         Some("AWAITING_APPROVAL"),
     )
     .await
-    {
-        Ok(value) => value,
-        Err(error) => return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
-    };
+    .map_err(|error| HandlerError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        message: error.to_string(),
+    })?;
 
     if let Err(error) = managed_items::persist_processing_decision(
         &state.pool,
@@ -413,38 +555,53 @@ async fn create_intake_review_job(
         tracing::warn!(err = %error, path = relative_path, "failed to persist managed review state");
     }
 
-    match db::fetch_job_with_analysis(&state.pool, job_id).await {
-        Ok(Some(job)) => Json(job).into_response(),
-        Ok(None) => StatusCode::ACCEPTED.into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    if let Ok(Some(job)) = db::fetch_job_with_analysis(&state.pool, job_id).await {
+        return Ok(job);
     }
+
+    let fallback = db::fetch_job(&state.pool, job_id)
+        .await
+        .map_err(|error| HandlerError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: error.to_string(),
+        })?
+        .ok_or_else(|| HandlerError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: format!("job {} created but could not be loaded", job_id),
+        })?;
+
+    Ok(db::JobWithAnalysis {
+        id: fallback.id,
+        file_path: fallback.file_path,
+        status: fallback.status,
+        created_at: fallback.created_at,
+        probe: None,
+        decision: None,
+    })
 }
 
-async fn update_intake_managed_status(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<UpdateManagedStatusRequest>,
-) -> impl IntoResponse {
-    let relative_path = request.path.trim();
+async fn update_managed_status_for_path(
+    state: &Arc<AppState>,
+    relative_path: &str,
+    status: &str,
+) -> Result<(), String> {
     if relative_path.is_empty() {
-        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+        return Err("path is required".into());
     }
 
-    let normalized_status = request.status.trim().to_ascii_uppercase();
+    let normalized_status = status.trim().to_ascii_uppercase();
     if !matches!(normalized_status.as_str(), "REVIEWED" | "KEPT_ORIGINAL") {
-        return (StatusCode::BAD_REQUEST, "status must be REVIEWED or KEPT_ORIGINAL").into_response();
+        return Err("status must be REVIEWED or KEPT_ORIGINAL".into());
     }
 
-    match managed_items::update_managed_status(
+    managed_items::update_managed_status(
         &state.pool,
         &state.library_path,
         relative_path,
         &normalized_status,
     )
     .await
-    {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
-    }
+    .map_err(|error| error.to_string())
 }
 
 async fn list_library(
@@ -734,31 +891,124 @@ async fn save_selected_library_internet_metadata(
     State(state): State<Arc<AppState>>,
     Json(request): Json<SaveSelectedInternetMetadataRequest>,
 ) -> impl IntoResponse {
-    if request.path.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+    match save_selected_library_internet_metadata_for_path(&state, request.path.trim(), &request.selected).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (error.status, error.message).into_response(),
+    }
+}
+
+async fn auto_select_library_internet_metadata_bulk(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<LibraryInternetMetadataBulkRequest>,
+) -> impl IntoResponse {
+    if request.paths.is_empty() {
+        return Json(BulkInternetAutoSelectResponse {
+            success_count: 0,
+            failure_count: 0,
+            failures: Vec::new(),
+        })
+        .into_response();
     }
 
-    match db::upsert_selected_internet_metadata(&state.pool, request.path.trim(), &request.selected).await {
-        Ok(()) => {
-            if let Err(error) = managed_items::persist_selected_metadata(
-                &state.pool,
-                &state.library_path,
-                request.path.trim(),
-                &request.selected,
+    if request.paths.len() > 500 {
+        return (StatusCode::BAD_REQUEST, "paths length must be <= 500").into_response();
+    }
+
+    let _request_permit = match state.bulk_metadata_request_limiter.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                "too many concurrent bulk metadata requests",
             )
-            .await
-            {
-                tracing::warn!(err = %error, path = request.path.trim(), "failed to persist managed item sidecar");
-            }
-
-            Json(SelectedInternetMetadataResponse {
-                path: request.path.trim().to_string(),
-                selected: request.selected,
-            })
-            .into_response()
+                .into_response();
         }
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    };
+
+    let config = { state.config.read().await.clone() };
+    let mut success_count = 0;
+    let mut failures = Vec::new();
+
+    for path in request.paths {
+        let trimmed = path.trim().to_string();
+        if trimmed.is_empty() {
+            failures.push(BulkFailure {
+                path,
+                error: "path is required".into(),
+            });
+            continue;
+        }
+
+        let lookup = match internet_metadata::lookup_for_library_path(&config, &trimmed).await {
+            Ok(result) => result,
+            Err(error) => {
+                failures.push(BulkFailure {
+                    path: trimmed,
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+
+        let Some(first_match) = lookup.matches.first() else {
+            failures.push(BulkFailure {
+                path: trimmed,
+                error: "no metadata matches found".into(),
+            });
+            continue;
+        };
+
+        match save_selected_library_internet_metadata_for_path(&state, &trimmed, first_match).await {
+            Ok(_) => success_count += 1,
+            Err(error) => failures.push(BulkFailure {
+                path: trimmed,
+                error: error.message,
+            }),
+        }
     }
+
+    Json(BulkInternetAutoSelectResponse {
+        success_count,
+        failure_count: failures.len(),
+        failures,
+    })
+    .into_response()
+}
+
+async fn save_selected_library_internet_metadata_for_path(
+    state: &Arc<AppState>,
+    path: &str,
+    selected: &internet_metadata::InternetMetadataMatch,
+) -> Result<SelectedInternetMetadataResponse, HandlerError> {
+    if path.trim().is_empty() {
+        return Err(HandlerError {
+            status: StatusCode::BAD_REQUEST,
+            message: "path is required".into(),
+        });
+    }
+
+    db::upsert_selected_internet_metadata(&state.pool, path.trim(), selected)
+        .await
+        .map_err(|error| HandlerError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: error.to_string(),
+        })?;
+
+    if let Err(error) = managed_items::persist_selected_metadata(
+        &state.pool,
+        &state.library_path,
+        path.trim(),
+        selected,
+    )
+    .await
+    {
+        tracing::warn!(err = %error, path = path.trim(), "failed to persist managed item sidecar");
+    }
+
+    Ok(SelectedInternetMetadataResponse {
+        path: path.trim().to_string(),
+        selected: selected.clone(),
+    })
 }
 
 async fn get_selected_library_internet_metadata(

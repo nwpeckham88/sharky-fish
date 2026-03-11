@@ -3,6 +3,8 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { page } from '$app/state';
 	import {
+		autoSelectLibraryInternetMetadataBulk,
+		createBulkIntakeReviews,
 		createIntakeReview,
 		fetchLibrary,
 		triggerLibraryRescan,
@@ -16,6 +18,7 @@
 		organizeLibraryFile,
 		fetchLibraryEvents,
 		fetchLibraries,
+		updateBulkIntakeManagedStatus,
 		updateIntakeManagedStatus,
 		type BacklogFilter,
 		type LibraryEntry,
@@ -474,39 +477,28 @@
 		internetSaveError = '';
 		try {
 			const paths = Array.from(selectedPaths);
-			const response = await fetchLibraryInternetMetadataBulk(paths);
-			const withMatches = response.items.filter((item) => item.result.matches.length > 0);
-			const withWarnings = response.items.filter((item) => item.result.warnings.length > 0);
-			const withoutMatches = response.items
-				.filter((item) => item.result.matches.length === 0)
-				.map((item) => item.path);
-
-			let autoSelected = 0;
-			const autoSelectFailures: string[] = [];
 			if (autoSelectTop) {
-				for (const item of withMatches) {
-					const first = item.result.matches[0];
-					if (!first) continue;
-					try {
-						await saveSelectedLibraryInternetMetadata(item.path, first);
-						autoSelected += 1;
-					} catch {
-						autoSelectFailures.push(item.path);
-					}
-				}
+				const response = await autoSelectLibraryInternetMetadataBulk(paths);
+				bulkInternetFailedPaths = response.failures.map((failure) => failure.path);
+				bulkInternetStatus = response.failure_count === 0
+					? `Auto-selected metadata for ${response.success_count} file(s).`
+					: `Auto-selected metadata for ${response.success_count} file(s), ${response.failure_count} need follow-up.`;
+				await Promise.all([loadLibrary(), refreshManagedItemStore()]);
 				if (selectedItem) {
 					const refreshed = await fetchSelectedLibraryInternetMetadata(selectedItem.relative_path).catch(() => null);
 					selectedInternetMatch = refreshed?.selected ?? selectedInternetMatch;
 				}
+			} else {
+				const response = await fetchLibraryInternetMetadataBulk(paths);
+				const withMatches = response.items.filter((item) => item.result.matches.length > 0);
+				const withWarnings = response.items.filter((item) => item.result.warnings.length > 0);
+				const withoutMatches = response.items
+					.filter((item) => item.result.matches.length === 0)
+					.map((item) => item.path);
+
+				bulkInternetFailedPaths = withoutMatches;
+				bulkInternetStatus = `Looked up ${response.items.length} file(s), found matches for ${withMatches.length}, warnings on ${withWarnings.length}.`;
 			}
-
-			bulkInternetFailedPaths = autoSelectTop
-				? [...withoutMatches, ...autoSelectFailures]
-				: withoutMatches;
-
-			bulkInternetStatus = autoSelectTop
-				? `Looked up ${response.items.length} file(s), found matches for ${withMatches.length}, auto-selected ${autoSelected}.`
-				: `Looked up ${response.items.length} file(s), found matches for ${withMatches.length}, warnings on ${withWarnings.length}.`;
 		} catch (error) {
 			bulkInternetStatus = error instanceof Error ? error.message : 'Bulk internet lookup failed';
 		} finally {
@@ -522,17 +514,13 @@
 		rowActionError = '';
 		const paths = Array.from(selectedPaths);
 		try {
-			const results = await Promise.allSettled(
-				paths.map((path) => updateIntakeManagedStatus(path, status))
-			);
-			const successCount = results.filter((result) => result.status === 'fulfilled').length;
-			const failureCount = results.length - successCount;
-			const failedPaths = results.flatMap((result, index) => result.status === 'rejected' ? [paths[index]] : []);
+			const response = await updateBulkIntakeManagedStatus(paths, status);
+			const failedPaths = response.failures.map((failure) => failure.path);
 			bulkActionFailedPaths = failedPaths;
 			selectedPaths = new Set(failedPaths);
-			bulkActionStatus = failureCount === 0
-				? `${successCount} item(s) marked ${status === 'REVIEWED' ? 'reviewed' : 'kept original'}.`
-				: `${successCount} item(s) updated, ${failureCount} failed. Failed items remain selected.`;
+			bulkActionStatus = response.failure_count === 0
+				? `${response.success_count} item(s) marked ${status === 'REVIEWED' ? 'reviewed' : 'kept original'}.`
+				: `${response.success_count} item(s) updated, ${response.failure_count} failed. Failed items remain selected.`;
 			await Promise.all([loadLibrary(), refreshManagedItemStore()]);
 		} catch (error) {
 			bulkActionStatus = error instanceof Error ? error.message : 'Bulk status update failed';
@@ -549,22 +537,18 @@
 		rowActionError = '';
 		const paths = Array.from(selectedPaths);
 		try {
-			const results = await Promise.allSettled(paths.map((path) => createIntakeReview(path)));
-			const createdJobs = results
-				.filter((result): result is PromiseFulfilledResult<Awaited<ReturnType<typeof createIntakeReview>>> => result.status === 'fulfilled')
-				.map((result) => result.value);
-			const successCount = createdJobs.length;
-			const failureCount = results.length - successCount;
-			const failedPaths = results.flatMap((result, index) => result.status === 'rejected' ? [paths[index]] : []);
+			const response = await createBulkIntakeReviews(paths);
+			const createdJobs = response.jobs;
+			const failedPaths = response.failures.map((failure) => failure.path);
 			bulkActionFailedPaths = failedPaths;
 			selectedPaths = new Set(failedPaths);
 			if (createdJobs.length > 0) {
 				const existingIds = new Set(createdJobs.map((job) => job.id));
 				jobStore.jobs = [...createdJobs, ...jobStore.jobs.filter((job) => !existingIds.has(job.id))];
 			}
-			bulkActionStatus = failureCount === 0
-				? `${successCount} AI review job(s) created.`
-				: `${successCount} AI review job(s) created, ${failureCount} failed. Failed items remain selected.`;
+			bulkActionStatus = response.failure_count === 0
+				? `${response.success_count} AI review job(s) created.`
+				: `${response.success_count} AI review job(s) created, ${response.failure_count} failed. Failed items remain selected.`;
 			await Promise.all([loadLibrary(), refreshManagedItemStore()]);
 		} catch (error) {
 			bulkActionStatus = error instanceof Error ? error.message : 'Bulk review creation failed';
