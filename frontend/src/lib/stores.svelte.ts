@@ -49,7 +49,8 @@ export const managedItemStore = $state<{
 	loading: true
 });
 
-export const reviewStore = $derived.by(() => {
+
+export function getReviewState() {
 	const awaitingApproval = jobStore.jobs.filter((job) => job.status === 'AWAITING_APPROVAL');
 
 	return {
@@ -58,9 +59,9 @@ export const reviewStore = $derived.by(() => {
 			awaitingApproval: awaitingApproval.length
 		}
 	};
-});
+}
 
-export const executionStore = $derived.by(() => {
+export function getExecutionState() {
 	const approved = jobStore.jobs.filter((job) => job.status === 'APPROVED');
 	const processing = jobStore.jobs.filter((job) => job.status === 'PROCESSING');
 	const completed = jobStore.jobs.filter((job) => job.status === 'COMPLETED');
@@ -82,7 +83,7 @@ export const executionStore = $derived.by(() => {
 			failed: failed.length
 		}
 	};
-});
+}
 
 // Library change signals from SSE (used by dashboard + library pages)
 export const libraryState = $state<{

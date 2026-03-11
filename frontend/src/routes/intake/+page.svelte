@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { approveJob, rejectJob, type Job, type MediaProbe } from '$lib/api';
-	import { executionStore, jobStore, reviewStore } from '$lib/stores.svelte';
+	import { getExecutionState, jobStore, getReviewState } from '$lib/stores.svelte';
 	import { fileName } from '$lib/status';
 
 	let actionBusy = $state<Record<number, 'approve' | 'reject' | null>>({});
@@ -69,8 +69,8 @@
 	const jobs = $derived(jobStore.jobs);
 	const loading = $derived(jobStore.loading);
 
-	const reviewJobs = $derived(reviewStore.awaitingApproval);
-	const executionCounts = $derived(executionStore.counts);
+	const reviewJobs = $derived(getReviewState().awaitingApproval);
+	const executionCounts = $derived(getExecutionState().counts);
 </script>
 
 <section class="mb-6 grid gap-4 lg:grid-cols-[minmax(0,1.15fr)_minmax(18rem,0.85fr)]">

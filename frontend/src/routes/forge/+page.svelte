@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { fetchJob, type Task } from '$lib/api';
-	import { executionStore, jobStore, progressStore } from '$lib/stores.svelte';
+	import { getExecutionState, jobStore, progressStore } from '$lib/stores.svelte';
 	import { fileName, statusTone } from '$lib/status';
 
 	let selectedJobId = $state<number | null>(null);
@@ -25,13 +25,14 @@
 	const jobs = $derived(jobStore.jobs);
 	const loading = $derived(jobStore.loading);
 	const progress = progressStore;
+	const executionState = $derived(getExecutionState());
 
 	const activeProgress = $derived(Object.values(progress));
 	const filteredJobs = $derived(
-		statusFilter === 'all' ? executionStore.jobs : executionStore.jobs.filter((job) => job.status === statusFilter)
+		statusFilter === 'all' ? executionState.jobs : executionState.jobs.filter((job) => job.status === statusFilter)
 	);
-	const jobCounts = $derived(executionStore.counts);
-	const failedJobs = $derived(executionStore.failed.slice(0, 5));
+	const jobCounts = $derived(executionState.counts);
+	const failedJobs = $derived(executionState.failed.slice(0, 5));
 </script>
 
 <div class="mb-5">

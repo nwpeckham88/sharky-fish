@@ -15,12 +15,12 @@
 		type LibrarySummary
 	} from '$lib/api';
 	import {
-		executionStore,
+		getExecutionState,
 		jobStore,
 		libraryState,
 		managedItemStore,
 		refreshManagedItemStore,
-		reviewStore
+		getReviewState
 	} from '$lib/stores.svelte';
 	import { fileName, formatBytes, formatTimestamp, statusLabel, statusTone } from '$lib/status';
 
@@ -61,9 +61,9 @@
 	let statusBusy = $state<Record<string, boolean>>({});
 	let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
-	const reviewJobs = $derived(reviewStore.awaitingApproval);
-	const executionCounts = $derived(executionStore.counts);
-	const failedJobs = $derived(executionStore.failed);
+	const reviewJobs = $derived(getReviewState().awaitingApproval);
+	const executionCounts = $derived(getExecutionState().counts);
+	const failedJobs = $derived(getExecutionState().failed);
 
 	onMount(async () => {
 		await Promise.all([
