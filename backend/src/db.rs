@@ -1,6 +1,7 @@
 use crate::internet_metadata::InternetMetadataMatch;
+use crate::filesystem_audit::FileSystemFacts;
 use crate::library::{LibrarySortBy, LibrarySortDirection};
-use crate::messages::{MediaProbe, ProcessingDecision};
+use crate::messages::{MediaProbe, ProcessingDecision, ReviewProposal};
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{FromRow, Row, SqlitePool};
@@ -64,6 +65,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+
+    ensure_column(pool, "job_analysis", "proposal_json", "TEXT").await?;
+    ensure_column(pool, "managed_items", "review_note", "TEXT").await?;
+    ensure_column(pool, "managed_items", "review_updated_at", "INTEGER").await?;
 
     // Composite index for queue polling.
     sqlx::query(
@@ -162,6 +167,10 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
+    ensure_column(pool, "library_index", "device_id", "INTEGER NOT NULL DEFAULT 0").await?;
+    ensure_column(pool, "library_index", "inode", "INTEGER NOT NULL DEFAULT 0").await?;
+    ensure_column(pool, "library_index", "link_count", "INTEGER NOT NULL DEFAULT 1").await?;
+
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_library_index_modified
          ON library_index (modified_at DESC, relative_path ASC)",
@@ -201,6 +210,8 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             modified_at             INTEGER NOT NULL,
             library_id              TEXT,
             managed_status          TEXT NOT NULL DEFAULT 'UNPROCESSED',
+            review_note             TEXT,
+            review_updated_at       INTEGER,
             selected_metadata_json  TEXT,
             last_decision_json      TEXT,
             sidecar_path            TEXT,
@@ -276,6 +287,8 @@ pub struct JobWithAnalysis {
     pub created_at: String,
     pub probe: Option<MediaProbe>,
     pub decision: Option<ProcessingDecision>,
+    pub proposal: Option<ReviewProposal>,
+    pub filesystem: Option<FileSystemFacts>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
@@ -341,9 +354,14 @@ pub struct LibraryIndexRow {
     pub modified_at: i64,
     pub library_id: Option<String>,
     pub managed_status: Option<String>,
+    pub review_note: Option<String>,
+    pub review_updated_at: Option<i64>,
     pub has_sidecar: bool,
     pub has_selected_metadata: bool,
     pub selected_metadata_json: Option<String>,
+    pub device_id: i64,
+    pub inode: i64,
+    pub link_count: i64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
@@ -389,12 +407,22 @@ pub struct ManagedItemRow {
     pub modified_at: i64,
     pub library_id: Option<String>,
     pub managed_status: String,
+    pub review_note: Option<String>,
+    pub review_updated_at: Option<i64>,
     pub selected_metadata_json: Option<String>,
     pub last_decision_json: Option<String>,
     pub sidecar_path: Option<String>,
     pub first_seen_at: i64,
     pub last_seen_at: i64,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
+pub struct LibraryInodeRecord {
+    pub relative_path: String,
+    pub file_name: String,
+    pub device_id: i64,
+    pub inode: i64,
 }
 
 /// Insert a new job and return its id.
@@ -425,21 +453,25 @@ pub async fn upsert_job_analysis(
     job_id: i64,
     probe: &MediaProbe,
     decision: &ProcessingDecision,
+    proposal: Option<&ReviewProposal>,
 ) -> Result<()> {
     let probe_json = serde_json::to_string(probe)?;
     let decision_json = serde_json::to_string(decision)?;
+    let proposal_json = proposal.map(serde_json::to_string).transpose()?;
 
     sqlx::query(
-        "INSERT INTO job_analysis (job_id, probe_json, decision_json, updated_at)
-         VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+        "INSERT INTO job_analysis (job_id, probe_json, decision_json, proposal_json, updated_at)
+         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
          ON CONFLICT(job_id) DO UPDATE SET
             probe_json = excluded.probe_json,
             decision_json = excluded.decision_json,
+            proposal_json = excluded.proposal_json,
             updated_at = CURRENT_TIMESTAMP",
     )
     .bind(job_id)
     .bind(probe_json)
     .bind(decision_json)
+    .bind(proposal_json)
     .execute(pool)
     .await?;
 
@@ -471,6 +503,15 @@ pub async fn insert_task(
 pub async fn update_job_status(pool: &SqlitePool, job_id: i64, status: &str) -> Result<()> {
     sqlx::query("UPDATE jobs SET status = ? WHERE id = ?")
         .bind(status)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn update_job_file_path(pool: &SqlitePool, job_id: i64, file_path: &str) -> Result<()> {
+    sqlx::query("UPDATE jobs SET file_path = ? WHERE id = ?")
+        .bind(file_path)
         .bind(job_id)
         .execute(pool)
         .await?;
@@ -523,7 +564,7 @@ pub async fn fetch_job_with_analysis(
     job_id: i64,
 ) -> Result<Option<JobWithAnalysis>> {
     let row = sqlx::query(
-        "SELECT j.id, j.file_path, j.status, j.group_key, j.group_label, COALESCE(j.group_kind, 'file') AS group_kind, j.created_at, a.probe_json, a.decision_json
+        "SELECT j.id, j.file_path, j.status, j.group_key, j.group_label, COALESCE(j.group_kind, 'file') AS group_kind, j.created_at, a.probe_json, a.decision_json, a.proposal_json
          FROM jobs j
          LEFT JOIN job_analysis a ON a.job_id = j.id
          WHERE j.id = ?",
@@ -544,6 +585,10 @@ pub async fn fetch_job_with_analysis(
         .try_get::<Option<String>, _>("decision_json")?
         .map(|json| serde_json::from_str::<ProcessingDecision>(&json))
         .transpose()?;
+    let proposal = row
+        .try_get::<Option<String>, _>("proposal_json")?
+        .map(|json| serde_json::from_str::<ReviewProposal>(&json))
+        .transpose()?;
 
     Ok(Some(JobWithAnalysis {
         id: row.try_get("id")?,
@@ -555,6 +600,8 @@ pub async fn fetch_job_with_analysis(
         created_at: row.try_get("created_at")?,
         probe,
         decision,
+        proposal,
+        filesystem: None,
     }))
 }
 
@@ -609,7 +656,7 @@ pub async fn fetch_resumable_jobs(pool: &SqlitePool) -> Result<Vec<Job>> {
 /// List jobs with pagination.
 pub async fn list_jobs(pool: &SqlitePool, limit: i64, offset: i64) -> Result<Vec<JobWithAnalysis>> {
     let rows = sqlx::query(
-        "SELECT j.id, j.file_path, j.status, j.group_key, j.group_label, COALESCE(j.group_kind, 'file') AS group_kind, j.created_at, a.probe_json, a.decision_json
+        "SELECT j.id, j.file_path, j.status, j.group_key, j.group_label, COALESCE(j.group_kind, 'file') AS group_kind, j.created_at, a.probe_json, a.decision_json, a.proposal_json
          FROM jobs j
          LEFT JOIN job_analysis a ON a.job_id = j.id
          ORDER BY j.created_at DESC
@@ -630,6 +677,10 @@ pub async fn list_jobs(pool: &SqlitePool, limit: i64, offset: i64) -> Result<Vec
             .try_get::<Option<String>, _>("decision_json")?
             .map(|json| serde_json::from_str::<ProcessingDecision>(&json))
             .transpose()?;
+        let proposal = row
+            .try_get::<Option<String>, _>("proposal_json")?
+            .map(|json| serde_json::from_str::<ReviewProposal>(&json))
+            .transpose()?;
 
         jobs.push(JobWithAnalysis {
             id: row.try_get("id")?,
@@ -641,6 +692,8 @@ pub async fn list_jobs(pool: &SqlitePool, limit: i64, offset: i64) -> Result<Vec
             created_at: row.try_get("created_at")?,
             probe,
             decision,
+            proposal,
+            filesystem: None,
         });
     }
 
@@ -865,13 +918,16 @@ pub async fn upsert_library_index_entry(
     media_type: &str,
     size_bytes: u64,
     modified_at: u64,
+    device_id: u64,
+    inode: u64,
+    link_count: u64,
     library_id: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO library_index (
             relative_path, file_path, file_name, extension, media_type,
-            size_bytes, modified_at, library_id, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            size_bytes, modified_at, device_id, inode, link_count, library_id, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
          ON CONFLICT(relative_path) DO UPDATE SET
             file_path = excluded.file_path,
             file_name = excluded.file_name,
@@ -879,6 +935,9 @@ pub async fn upsert_library_index_entry(
             media_type = excluded.media_type,
             size_bytes = excluded.size_bytes,
             modified_at = excluded.modified_at,
+            device_id = excluded.device_id,
+            inode = excluded.inode,
+            link_count = excluded.link_count,
             library_id = excluded.library_id,
             updated_at = CURRENT_TIMESTAMP",
     )
@@ -889,6 +948,9 @@ pub async fn upsert_library_index_entry(
     .bind(media_type)
     .bind(size_bytes as i64)
     .bind(modified_at as i64)
+    .bind(device_id as i64)
+    .bind(inode as i64)
+    .bind(link_count as i64)
     .bind(library_id)
     .execute(pool)
     .await?;
@@ -926,9 +988,14 @@ pub async fn list_library_index(
     let query = format!(
         "SELECT l.relative_path, l.file_name, l.extension, l.media_type, l.size_bytes, l.modified_at, l.library_id,
                         m.managed_status,
+                        m.review_note,
+                        m.review_updated_at,
                         CASE WHEN m.sidecar_path IS NULL THEN 0 ELSE 1 END AS has_sidecar,
                         CASE WHEN m.selected_metadata_json IS NULL THEN 0 ELSE 1 END AS has_selected_metadata,
-                        m.selected_metadata_json
+                        m.selected_metadata_json,
+                        l.device_id,
+                        l.inode,
+                        l.link_count
          FROM library_index l
          LEFT JOIN managed_items m ON m.relative_path = l.relative_path
          WHERE (?1 IS NULL OR l.library_id = ?1)
@@ -1006,9 +1073,14 @@ pub async fn list_library_index_candidates(
     let rows = sqlx::query_as::<_, LibraryIndexRow>(
         "SELECT l.relative_path, l.file_name, l.extension, l.media_type, l.size_bytes, l.modified_at, l.library_id,
                         m.managed_status,
+                        m.review_note,
+                        m.review_updated_at,
                         CASE WHEN m.sidecar_path IS NULL THEN 0 ELSE 1 END AS has_sidecar,
                         CASE WHEN m.selected_metadata_json IS NULL THEN 0 ELSE 1 END AS has_selected_metadata,
-                        m.selected_metadata_json
+                        m.selected_metadata_json,
+                        l.device_id,
+                        l.inode,
+                        l.link_count
          FROM library_index l
          LEFT JOIN managed_items m ON m.relative_path = l.relative_path
          WHERE (?1 IS NULL OR l.library_id = ?1)
@@ -1031,6 +1103,17 @@ pub async fn list_library_index_candidates(
     Ok(rows)
 }
 
+pub async fn list_library_inode_records(pool: &SqlitePool) -> Result<Vec<LibraryInodeRecord>> {
+    let rows = sqlx::query_as::<_, LibraryInodeRecord>(
+        "SELECT relative_path, file_name, device_id, inode
+         FROM library_index
+         WHERE device_id > 0 AND inode > 0",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
 fn library_index_order_clause(sort_by: LibrarySortBy, sort_direction: LibrarySortDirection) -> &'static str {
     match (sort_by, sort_direction) {
         (LibrarySortBy::ModifiedAt, LibrarySortDirection::Asc) => "l.modified_at ASC, l.relative_path ASC",
@@ -1187,7 +1270,7 @@ pub async fn fetch_managed_item(
 ) -> Result<Option<ManagedItemRow>> {
     let row = sqlx::query_as::<_, ManagedItemRow>(
         "SELECT relative_path, file_path, file_name, media_type, size_bytes, modified_at,
-                library_id, managed_status, selected_metadata_json, last_decision_json,
+            library_id, managed_status, review_note, review_updated_at, selected_metadata_json, last_decision_json,
                 sidecar_path, first_seen_at, last_seen_at, updated_at
          FROM managed_items
          WHERE relative_path = ?",
@@ -1209,6 +1292,8 @@ pub async fn upsert_managed_item(
     modified_at: u64,
     library_id: Option<&str>,
     managed_status: &str,
+    review_note: Option<&str>,
+    review_updated_at: Option<u64>,
     selected_metadata_json: Option<&str>,
     last_decision_json: Option<&str>,
     sidecar_path: Option<&str>,
@@ -1218,9 +1303,9 @@ pub async fn upsert_managed_item(
     sqlx::query(
         "INSERT INTO managed_items (
             relative_path, file_path, file_name, media_type, size_bytes, modified_at,
-            library_id, managed_status, selected_metadata_json, last_decision_json,
+                library_id, managed_status, review_note, review_updated_at, selected_metadata_json, last_decision_json,
             sidecar_path, first_seen_at, last_seen_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
          ON CONFLICT(relative_path) DO UPDATE SET
             file_path = excluded.file_path,
             file_name = excluded.file_name,
@@ -1229,6 +1314,8 @@ pub async fn upsert_managed_item(
             modified_at = excluded.modified_at,
             library_id = excluded.library_id,
             managed_status = excluded.managed_status,
+            review_note = excluded.review_note,
+            review_updated_at = excluded.review_updated_at,
             selected_metadata_json = excluded.selected_metadata_json,
             last_decision_json = excluded.last_decision_json,
             sidecar_path = excluded.sidecar_path,
@@ -1244,6 +1331,8 @@ pub async fn upsert_managed_item(
     .bind(modified_at as i64)
     .bind(library_id)
     .bind(managed_status)
+    .bind(review_note)
+    .bind(review_updated_at.map(|value| value as i64))
     .bind(selected_metadata_json)
     .bind(last_decision_json)
     .bind(sidecar_path)
@@ -1304,14 +1393,17 @@ pub async fn update_managed_item_status(
     pool: &SqlitePool,
     relative_path: &str,
     managed_status: &str,
+    review_updated_at: Option<u64>,
     last_seen_at: u64,
 ) -> Result<()> {
     sqlx::query(
         "UPDATE managed_items
-         SET managed_status = ?, last_seen_at = ?, updated_at = CURRENT_TIMESTAMP
+         SET managed_status = ?, review_updated_at = COALESCE(?, review_updated_at),
+             last_seen_at = ?, updated_at = CURRENT_TIMESTAMP
          WHERE relative_path = ?",
     )
     .bind(managed_status)
+    .bind(review_updated_at.map(|value| value as i64))
     .bind(last_seen_at as i64)
     .bind(relative_path)
     .execute(pool)
@@ -1331,7 +1423,7 @@ pub async fn list_managed_items_filtered(
 ) -> Result<Vec<ManagedItemRow>> {
     let rows = sqlx::query_as::<_, ManagedItemRow>(
         "SELECT relative_path, file_path, file_name, media_type, size_bytes, modified_at,
-                library_id, managed_status, selected_metadata_json, last_decision_json,
+            library_id, managed_status, review_note, review_updated_at, selected_metadata_json, last_decision_json,
                 sidecar_path, first_seen_at, last_seen_at, updated_at
          FROM managed_items
          WHERE (?1 IS NULL OR managed_status = ?1)
@@ -1349,9 +1441,10 @@ pub async fn list_managed_items_filtered(
                WHEN 'AWAITING_APPROVAL' THEN 2
                WHEN 'APPROVED' THEN 3
                WHEN 'REVIEWED' THEN 4
-               WHEN 'KEPT_ORIGINAL' THEN 5
-               WHEN 'PROCESSED' THEN 6
-               ELSE 7
+               WHEN 'RE_SOURCE' THEN 5
+               WHEN 'KEPT_ORIGINAL' THEN 6
+               WHEN 'PROCESSED' THEN 7
+               ELSE 8
            END,
            modified_at DESC,
            relative_path ASC

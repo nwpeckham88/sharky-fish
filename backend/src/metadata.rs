@@ -1,4 +1,5 @@
 use crate::db::{self, CachedMediaMetadata};
+use crate::filesystem_audit::{self, FileSystemFacts};
 use crate::messages::{MediaProbe, StreamDisposition, StreamInfo};
 use anyhow::{Context, Result};
 use futures::stream::{self, StreamExt};
@@ -27,6 +28,7 @@ pub struct LibraryMetadataResponse {
     pub subtitle_languages: Vec<String>,
     pub probe: MediaProbe,
     pub cached: bool,
+    pub filesystem: FileSystemFacts,
 }
 
 pub async fn probe_media(path: &Path) -> Result<MediaProbe> {
@@ -124,10 +126,11 @@ pub async fn get_or_probe_library_metadata(
         .unwrap_or(0);
 
     let file_path = full_path.display().to_string();
+    let filesystem = filesystem_audit::file_system_facts(&fs_metadata);
 
     if let Some(cached) = db::fetch_media_metadata(pool, &file_path).await? {
         if cached.size_bytes as u64 == size_bytes && cached.modified_at as u64 == modified_at {
-            return from_cached(&sanitized, size_bytes, modified_at, cached, true);
+            return from_cached(&sanitized, size_bytes, modified_at, cached, true, filesystem);
         }
     }
 
@@ -141,6 +144,7 @@ pub async fn get_or_probe_library_metadata(
         modified_at,
         probe,
         false,
+        filesystem,
     ))
 }
 
@@ -236,6 +240,7 @@ fn from_cached(
     modified_at: u64,
     cached: CachedMediaMetadata,
     is_cached: bool,
+    filesystem: FileSystemFacts,
 ) -> Result<LibraryMetadataResponse> {
     let probe: MediaProbe = serde_json::from_str(&cached.probe_json)
         .context("failed to decode cached probe metadata")?;
@@ -246,6 +251,7 @@ fn from_cached(
         modified_at,
         probe,
         is_cached,
+        filesystem,
     ))
 }
 
@@ -256,6 +262,7 @@ fn from_probe(
     modified_at: u64,
     probe: MediaProbe,
     cached: bool,
+    filesystem: FileSystemFacts,
 ) -> LibraryMetadataResponse {
     let video_stream = probe
         .streams
@@ -294,6 +301,7 @@ fn from_probe(
         subtitle_languages,
         probe,
         cached,
+        filesystem,
     }
 }
 

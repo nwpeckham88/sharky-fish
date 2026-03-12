@@ -45,6 +45,7 @@
 		| 'unprocessed'
 		| 'awaiting_approval'
 		| 'failed'
+		| 're_source'
 		| 'missing_metadata'
 		| 'organize_needed'
 		| 'missing_sidecar'
@@ -64,6 +65,7 @@
 		'all',
 		'UNPROCESSED',
 		'REVIEWED',
+		'RE_SOURCE',
 		'AWAITING_APPROVAL',
 		'APPROVED',
 		'PROCESSED',
@@ -78,6 +80,7 @@
 		'unprocessed',
 		'awaiting_approval',
 		'failed',
+		're_source',
 		'missing_metadata',
 		'organize_needed',
 		'missing_sidecar',
@@ -89,6 +92,7 @@
 		unprocessed: { typeFilter: 'all', managedStatusFilter: 'UNPROCESSED' },
 		awaiting_approval: { typeFilter: 'all', managedStatusFilter: 'AWAITING_APPROVAL' },
 		failed: { typeFilter: 'all', managedStatusFilter: 'FAILED' },
+		re_source: { typeFilter: 'all', managedStatusFilter: 'RE_SOURCE' },
 		missing_metadata: { typeFilter: 'all', managedStatusFilter: 'MISSING_METADATA' },
 		organize_needed: { typeFilter: 'all', managedStatusFilter: 'ORGANIZE_NEEDED' },
 		missing_sidecar: { typeFilter: 'all', managedStatusFilter: 'NO_SIDECAR' },
@@ -135,6 +139,41 @@
 		return value === 'asc' ? 'asc' : 'desc';
 	}
 
+	function reviewOutcomePriority(item: LibraryEntry): number {
+		switch (item.managed_status ?? 'UNPROCESSED') {
+			case 'RE_SOURCE':
+				return 5;
+			case 'KEPT_ORIGINAL':
+				return 4;
+			case 'FAILED':
+				return 3;
+			case 'AWAITING_APPROVAL':
+				return 2;
+			case 'REVIEWED':
+				return 1;
+			default:
+				return 0;
+		}
+	}
+
+	function preferredOutcomeNote(items: LibraryEntry[]): LibraryEntry | null {
+		const notedItems = items.filter((item) => !!item.review_note);
+		if (notedItems.length === 0) return null;
+
+		return [...notedItems].sort((left, right) => {
+			const priorityDiff = reviewOutcomePriority(right) - reviewOutcomePriority(left);
+			if (priorityDiff !== 0) return priorityDiff;
+
+			const reviewDiff = (right.review_updated_at ?? 0) - (left.review_updated_at ?? 0);
+			if (reviewDiff !== 0) return reviewDiff;
+
+			const modifiedDiff = (right.modified_at ?? 0) - (left.modified_at ?? 0);
+			if (modifiedDiff !== 0) return modifiedDiff;
+
+			return left.file_name.localeCompare(right.file_name);
+		})[0];
+	}
+
 	let library = $state<LibraryEntry[]>([]);
 	let librarySummary = $state<LibrarySummary>({
 		total_items: 0, total_bytes: 0, video_items: 0, audio_items: 0, other_items: 0
@@ -152,6 +191,7 @@
 	let relatedPaths = $state<string[]>([]);
 	let internetSaveLoading = $state(false);
 	let internetSaveError = $state('');
+	let internetSaveWarning = $state('');
 	let organizePreview = $state<import('$lib/api').OrganizeLibraryResult | null>(null);
 	let organizeLoading = $state(false);
 	let organizeError = $state('');
@@ -220,6 +260,12 @@
 			label: 'Failed',
 			count: managedItemStore.summary.failed_count,
 			description: 'Execution exceptions needing follow-up'
+		},
+		{
+			key: 're_source' as const,
+			label: 'Re-source',
+			count: managedItemStore.summary.re_source_count,
+			description: 'Items deferred until a better source is available'
 		},
 		{
 			key: 'missing_metadata' as const,
@@ -391,6 +437,7 @@
 		selectedInternetMatch = null;
 		relatedPaths = [];
 		internetSaveError = '';
+		internetSaveWarning = '';
 		organizePreview = null;
 		organizeError = '';
 		organizeStatus = '';
@@ -423,6 +470,7 @@
 		internetMetadataLoading = true;
 		internetMetadataError = '';
 		internetSaveError = '';
+		internetSaveWarning = '';
 		organizePreview = null;
 		organizeError = '';
 		internetMetadata = null;
@@ -465,6 +513,12 @@
 			selectedInternetMatch = saved.selected;
 			const related = await fetchRelatedLibraryInternetMetadataPaths(selectedItem.relative_path).catch(() => ({ paths: [] }));
 			relatedPaths = related.paths;
+			internetSaveWarning = saved.metadata_sidecar_warning ?? '';
+			organizeStatus = saved.metadata_sidecar_warning
+				? 'Selected metadata saved.'
+				: saved.metadata_sidecar_written
+					? 'Selected metadata saved and Jellyfin .nfo updated.'
+					: 'Selected metadata saved.';
 		} catch (error) {
 			internetSaveError = error instanceof Error ? error.message : 'Failed to save selected match';
 		} finally {
@@ -662,6 +716,10 @@
 		if (h > 0) return `${h}h ${m}m ${s}s`;
 		if (m > 0) return `${m}m ${s}s`;
 		return `${s}s`;
+	}
+
+	function hardLinkSummary(linkCount: number): string {
+		return `${linkCount} hard links share this inode`;
 	}
 
 	function pageRangeLabel(): string {
@@ -961,6 +1019,7 @@
 			['all', 'All Statuses'],
 			['UNPROCESSED', 'Unprocessed'],
 			['REVIEWED', 'Reviewed'],
+			['RE_SOURCE', 'Re-source'],
 			['AWAITING_APPROVAL', 'Awaiting Approval'],
 			['APPROVED', 'Approved'],
 			['PROCESSED', 'Processed'],
@@ -1070,6 +1129,10 @@
 						{@const showMissingMetadata = group.items.filter((item) => !item.has_selected_metadata && (item.managed_status ?? 'UNPROCESSED') !== 'KEPT_ORIGINAL' && (item.managed_status ?? 'UNPROCESSED') !== 'PROCESSED').length}
 						{@const showMissingNfo = group.items.filter((item) => !item.has_sidecar).length}
 						{@const showOrganizeNeeded = group.items.filter((item) => item.organize_needed).length}
+						{@const showReSourceCount = group.items.filter((item) => (item.managed_status ?? 'UNPROCESSED') === 'RE_SOURCE').length}
+						{@const showKeptOriginalCount = group.items.filter((item) => (item.managed_status ?? 'UNPROCESSED') === 'KEPT_ORIGINAL').length}
+						{@const showNotes = group.items.filter((item) => !!item.review_note)}
+						{@const showPreviewNote = preferredOutcomeNote(group.items)}
 						<div class="border-b border-[color:rgba(123,105,81,0.14)]">
 							<button class="flex w-full items-center justify-between px-4 py-3 text-left hover:bg-[color:rgba(214,180,111,0.08)]" onclick={() => toggleShow(group.show)}>
 								<div>
@@ -1088,7 +1151,25 @@
 										{#if showOrganizeNeeded > 0}
 											<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">{showOrganizeNeeded} organize needed</span>
 										{/if}
+										{#if showReSourceCount > 0}
+											<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">{showReSourceCount} re-source</span>
+										{/if}
+										{#if showKeptOriginalCount > 0}
+											<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">{showKeptOriginalCount} kept original</span>
+										{/if}
+										{#if showNotes.length > 0}
+											<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">{showNotes.length} noted</span>
+										{/if}
 									</div>
+									{#if showPreviewNote}
+										<div class="mt-2 max-w-3xl rounded-lg border border-[color:rgba(106,142,72,0.2)] bg-[color:rgba(106,142,72,0.08)] px-3 py-2 text-xs text-[color:var(--olive)]">
+											<span class="font-semibold">Outcome highlight:</span>
+											 {showPreviewNote.file_name}: {showPreviewNote.review_note}
+											{#if showPreviewNote.review_updated_at}
+												<div class="mt-1 text-[11px] text-[color:var(--ink-muted)]">Reviewed {formatTimestamp(showPreviewNote.review_updated_at)}</div>
+											{/if}
+										</div>
+									{/if}
 								</div>
 								<div class="flex items-center gap-3">
 									<a href={showDetailHref(group.show, group.items[0])} class="rounded-md border border-[color:var(--line)] px-2.5 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)] no-underline" onclick={(event) => event.stopPropagation()}>Open show page</a>
@@ -1117,6 +1198,14 @@
 												{/if}
 											</div>
 											<div class="mt-0.5 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
+											{#if item.review_note}
+												<div class="mt-2 rounded-lg border border-[color:rgba(106,142,72,0.2)] bg-[color:rgba(106,142,72,0.08)] px-3 py-2 text-xs text-[color:var(--olive)]">
+													{#if item.review_updated_at}
+														<div class="mb-1 text-[11px] text-[color:var(--ink-muted)]">Reviewed {formatTimestamp(item.review_updated_at)}</div>
+													{/if}
+													{item.review_note}
+												</div>
+											{/if}
 										</button>
 									{/each}
 								</div>
@@ -1262,11 +1351,30 @@
 									</div>
 							</div>
 						<p class="mt-0.5 break-all font-mono text-[11px] text-[color:var(--ink-muted)]">{selectedMetadata.relative_path}</p>
+						{#if selectedMetadata.filesystem.is_hard_linked}
+							<div class="mt-2 inline-flex rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-[color:var(--accent-deep)]">
+								{hardLinkSummary(selectedMetadata.filesystem.link_count)}
+							</div>
+						{/if}
 						{#if selectedItem.organize_needed && selectedItem.organize_target_path}
 							<div class="mt-3 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs">
 								<div class="font-semibold uppercase tracking-[0.12em] text-[color:var(--accent-deep)]">Canonical Target</div>
 								<div class="mt-1 break-all font-mono text-[color:var(--ink-strong)]">{selectedItem.organize_target_path}</div>
 								<div class="mt-1 text-[color:var(--ink-muted)]">This file has metadata selected, but it is not yet placed at the canonical target.</div>
+							</div>
+						{/if}
+						{#if selectedItem.review_note}
+							<div class="mt-3 rounded-lg border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-3 py-2 text-xs text-[color:var(--olive)]">
+								<div class="font-semibold uppercase tracking-[0.12em]">Review Outcome</div>
+								{#if selectedItem.review_updated_at}
+									<div class="mt-1 text-[11px] text-[color:var(--ink-muted)]">Reviewed {formatTimestamp(selectedItem.review_updated_at)}</div>
+								{/if}
+								<div class="mt-1">{selectedItem.review_note}</div>
+							</div>
+						{/if}
+						{#if selectedMetadata.filesystem.is_hard_linked}
+							<div class="mt-3 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">
+								This item is hard-linked. Organize-only changes keep the same inode and preserve the shared storage relationship.
 							</div>
 						{/if}
 						<div class="mt-3 flex flex-wrap gap-2">
@@ -1301,6 +1409,16 @@
 							<div class="mt-0.5 font-semibold text-[color:var(--ink-strong)]">{selectedMetadata.audio_codec ?? 'None'}</div>
 							<div class="mt-0.5 text-xs text-[color:var(--ink-muted)]">{selectedMetadata.audio_channels ? `${selectedMetadata.audio_channels} channels` : 'No channels'}</div>
 						</div>
+							<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
+								<div class="section-label">Inode</div>
+								<div class="mt-0.5 font-semibold text-[color:var(--ink-strong)]">{selectedMetadata.filesystem.inode || 'Unknown'}</div>
+								<div class="mt-0.5 text-xs text-[color:var(--ink-muted)]">Device {selectedMetadata.filesystem.device_id || 0}</div>
+							</div>
+							<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
+								<div class="section-label">Link Count</div>
+								<div class="mt-0.5 font-semibold text-[color:var(--ink-strong)]">{selectedMetadata.filesystem.link_count}</div>
+								<div class="mt-0.5 text-xs text-[color:var(--ink-muted)]">{selectedMetadata.filesystem.is_hard_linked ? 'Shared storage is currently active' : 'Single directory entry'}</div>
+							</div>
 					</div>
 
 					<!-- Subtitle Summary -->
@@ -1389,6 +1507,9 @@
 						{#if internetSaveError}
 							<div class="mb-2 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{internetSaveError}</div>
 						{/if}
+						{#if internetSaveWarning}
+							<div class="mb-2 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">{internetSaveWarning}</div>
+						{/if}
 						{#if internetMetadataError}
 							<div class="rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{internetMetadataError}</div>
 						{:else if internetMetadataLoading}
@@ -1476,6 +1597,11 @@
 										<div class="break-all font-mono text-[color:var(--ink-strong)]">{organizePreview.current_relative_path}</div>
 										<div class="mt-2 text-[color:var(--ink-muted)]">Target</div>
 										<div class="break-all font-mono text-[color:var(--ink-strong)]">{organizePreview.target_relative_path}</div>
+										{#if organizePreview.hard_link_warning}
+											<div class="mt-2 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2.5 py-2 text-[color:var(--accent-deep)]">
+												{organizePreview.hard_link_warning}
+											</div>
+										{/if}
 										{#if organizePreview.target_exists}
 											<div class="mt-2 text-[color:var(--danger)]">A file already exists at the canonical target. This usually means the same movie already exists in another folder.</div>
 										{/if}

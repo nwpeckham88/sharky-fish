@@ -1,4 +1,5 @@
 use crate::config::{AppConfig, LibraryFolder};
+use crate::filesystem_audit::{self, FileSystemFacts};
 use crate::internet_metadata::InternetMetadataMatch;
 use crate::sidecar;
 
@@ -30,6 +31,9 @@ pub struct OrganizeResult {
     pub conflict_path: Option<String>,
     pub metadata_sidecar_path: Option<String>,
     pub metadata_sidecar_written: bool,
+    pub filesystem: FileSystemFacts,
+    pub organize_preserves_hard_links: bool,
+    pub hard_link_warning: Option<String>,
 }
 
 pub async fn preview_or_apply(
@@ -40,6 +44,11 @@ pub async fn preview_or_apply(
 ) -> Result<OrganizeResult> {
     let current_relative = sanitize_relative_path(&request.relative_path)?;
     let current_relative_str = current_relative.to_string_lossy().replace('\\', "/");
+    let source_abs = library_root.join(&current_relative);
+    let source_metadata = tokio::fs::metadata(&source_abs)
+        .await
+        .with_context(|| format!("failed to read metadata for {}", source_abs.display()))?;
+    let filesystem = filesystem_audit::file_system_facts(&source_metadata);
     let scope = request.scope.as_deref().unwrap_or("file");
 
     let library_folder =
@@ -112,8 +121,6 @@ pub async fn preview_or_apply(
         };
 
     if apply && changed {
-        let source_abs = library_root.join(&current_relative);
-
         if scope == "movie_folder" && library_folder.media_type == "movie" {
             apply_movie_folder_organization(
                 library_root,
@@ -181,6 +188,16 @@ pub async fn preview_or_apply(
         conflict_path,
         metadata_sidecar_path,
         metadata_sidecar_written,
+        filesystem: filesystem.clone(),
+        organize_preserves_hard_links: true,
+        hard_link_warning: if filesystem.is_hard_linked {
+            Some(
+                "This item is hard-linked. Organize-only changes keep the same inode and preserve the shared storage relationship."
+                    .into(),
+            )
+        } else {
+            None
+        },
     })
 }
 
@@ -551,6 +568,10 @@ fn infer_or_validate_episode_numbers(
     }
 
     anyhow::bail!("season/episode required for TV files when not inferable from filename")
+}
+
+pub fn infer_episode_numbers(relative_path: &str) -> Option<(u32, u32)> {
+	parse_sxxexx(relative_path)
 }
 
 fn parse_sxxexx(input: &str) -> Option<(u32, u32)> {

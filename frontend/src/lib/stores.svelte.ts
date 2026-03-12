@@ -18,6 +18,7 @@ const EMPTY_BACKLOG_SUMMARY: BacklogSummary = {
 	needs_attention_count: 0,
 	unprocessed_count: 0,
 	reviewed_count: 0,
+	re_source_count: 0,
 	kept_original_count: 0,
 	awaiting_approval_count: 0,
 	approved_count: 0,
@@ -140,7 +141,9 @@ export function handleSseEvent(event: SseEvent) {
 				group_kind: event.group_kind,
 				created_at: new Date().toISOString(),
 				probe: null,
-				decision: null
+				decision: null,
+				filesystem: null,
+				proposal: null
 			},
 			...jobStore.jobs.filter((job) => job.id !== event.job_id)
 		];

@@ -31,6 +31,7 @@
 	let previewResult = $state<OrganizeLibraryResult | null>(null);
 	let actionLoading = $state(false);
 	let actionError = $state('');
+	let actionWarning = $state('');
 	let status = $state('');
 	let requestedPath = $state<string | null>(null);
 
@@ -70,6 +71,7 @@
 		chosenMatch = null;
 		previewResult = null;
 		actionError = '';
+		actionWarning = '';
 		status = '';
 		season = null;
 		episode = null;
@@ -79,6 +81,7 @@
 
 	async function loadSavedSelection(path: string) {
 		actionError = '';
+		actionWarning = '';
 		try {
 			const selected = await fetchSelectedLibraryInternetMetadata(path);
 			chosenMatch = selected?.selected ?? null;
@@ -107,10 +110,16 @@
 		if (!selected) return;
 		actionLoading = true;
 		actionError = '';
+		actionWarning = '';
 		try {
-			await saveSelectedLibraryInternetMetadata(selected.relative_path, match);
+			const response = await saveSelectedLibraryInternetMetadata(selected.relative_path, match);
 			chosenMatch = match;
-			status = 'Selected metadata saved.';
+			actionWarning = response.metadata_sidecar_warning ?? '';
+			status = response.metadata_sidecar_warning
+				? 'Selected metadata saved.'
+				: response.metadata_sidecar_written
+					? 'Selected metadata saved and Jellyfin .nfo updated.'
+					: 'Selected metadata saved.';
 		} catch (error) {
 			actionError = error instanceof Error ? error.message : 'Failed to save match';
 		} finally {
@@ -174,6 +183,10 @@
 	function activeLibrary(): LibraryFolder | null {
 		return libraries.find((l) => l.id === activeLibraryId) ?? null;
 	}
+
+	function hardLinkSummary(linkCount: number): string {
+		return `${linkCount} hard links share this inode`;
+	}
 </script>
 
 <section class="mb-5">
@@ -225,7 +238,18 @@
 					<div>
 						<div class="font-semibold text-[color:var(--ink-strong)]">{selected.file_name}</div>
 						<div class="mt-1 break-all font-mono text-[11px] text-[color:var(--ink-muted)]">{selected.relative_path}</div>
+						{#if selected.filesystem.is_hard_linked}
+							<div class="mt-2 inline-flex rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2.5 py-1 text-[10px] font-bold uppercase tracking-[0.12em] text-[color:var(--accent-deep)]">
+								{hardLinkSummary(selected.filesystem.link_count)}
+							</div>
+						{/if}
 					</div>
+
+					{#if selected.filesystem.is_hard_linked}
+						<div class="rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">
+							This item is hard-linked. Organize-only changes keep the same inode and preserve the shared storage relationship.
+						</div>
+					{/if}
 
 					<div class="flex flex-wrap gap-2">
 						<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={lookupMetadata} disabled={metadataLoading}>
@@ -299,6 +323,11 @@
 							<div class="font-mono text-[color:var(--ink-strong)]">{previewResult.current_relative_path}</div>
 							<div class="mt-2 text-[color:var(--ink-muted)]">Target (Jellyfin naming)</div>
 							<div class="font-mono text-[color:var(--ink-strong)]">{previewResult.target_relative_path}</div>
+							{#if previewResult.hard_link_warning}
+								<div class="mt-2 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2.5 py-2 text-[color:var(--accent-deep)]">
+									{previewResult.hard_link_warning}
+								</div>
+							{/if}
 							{#if previewResult.metadata_sidecar_path}
 								<div class="mt-2 text-[color:var(--ink-muted)]">Metadata Sidecar</div>
 								<div class="font-mono text-[color:var(--ink-strong)]">{previewResult.metadata_sidecar_path}</div>
@@ -308,6 +337,9 @@
 
 					{#if actionError}
 						<div class="rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{actionError}</div>
+					{/if}
+					{#if actionWarning}
+						<div class="rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">{actionWarning}</div>
 					{/if}
 					{#if status}
 						<div class="rounded-lg border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-3 py-2 text-xs text-[color:var(--olive)]">{status}</div>

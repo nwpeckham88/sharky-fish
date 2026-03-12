@@ -30,6 +30,8 @@ pub struct IntakeManagedItem {
     pub modified_at: u64,
     pub library_id: Option<String>,
     pub managed_status: String,
+    pub review_note: Option<String>,
+    pub review_updated_at: Option<u64>,
     pub has_sidecar: bool,
     pub missing_metadata: bool,
     pub missing_sidecar: bool,
@@ -50,6 +52,7 @@ pub struct BacklogSummary {
     pub needs_attention_count: u64,
     pub unprocessed_count: u64,
     pub reviewed_count: u64,
+    pub re_source_count: u64,
     pub kept_original_count: u64,
     pub awaiting_approval_count: u64,
     pub approved_count: u64,
@@ -58,6 +61,12 @@ pub struct BacklogSummary {
     pub missing_metadata_count: u64,
     pub missing_sidecar_count: u64,
     pub organize_needed_count: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SelectedMetadataPersistOutcome {
+    pub metadata_sidecar_written: bool,
+    pub metadata_sidecar_warning: Option<String>,
 }
 
 pub async fn sync_library_file(
@@ -104,6 +113,18 @@ pub async fn sync_library_file(
             .as_ref()
             .and_then(|value| value.last_decision_json.clone()),
     };
+    let review_note = sidecar_doc
+        .as_ref()
+        .and_then(|value| value.review_note.clone())
+        .or_else(|| existing.as_ref().and_then(|value| value.review_note.clone()));
+    let review_updated_at = sidecar_doc
+        .as_ref()
+        .and_then(|value| value.review_updated_at)
+        .or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|value| value.review_updated_at.map(|value| value.max(0) as u64))
+        });
 
     let first_seen_at = existing
         .as_ref()
@@ -123,6 +144,8 @@ pub async fn sync_library_file(
         modified_at,
         library_id,
         &managed_status,
+        review_note.as_deref(),
+        review_updated_at,
         selected_metadata_json.as_deref(),
         last_decision_json.as_deref(),
         sidecar_path.as_deref(),
@@ -143,7 +166,7 @@ pub async fn persist_selected_metadata(
     library_root: &Path,
     relative_path: &str,
     selected: &InternetMetadataMatch,
-) -> Result<()> {
+) -> Result<SelectedMetadataPersistOutcome> {
     let row = db::fetch_managed_item(pool, relative_path)
         .await?
         .with_context(|| format!("managed item not found for {}", relative_path))?;
@@ -155,6 +178,34 @@ pub async fn persist_selected_metadata(
     };
 
     let selected_json = serde_json::to_string(selected)?;
+    let mut metadata_sidecar_written = false;
+    let mut metadata_sidecar_warning = None;
+    let nfo_sidecar_path = match selected.media_kind.trim().to_ascii_lowercase().as_str() {
+        "series" => {
+            if let Some((season, episode)) = organizer::infer_episode_numbers(relative_path) {
+                let written_path = sidecar::write_jellyfin_nfo(
+                    library_root,
+                    relative_path,
+                    selected,
+                    Some(season),
+                    Some(episode),
+                )
+                .await?;
+                metadata_sidecar_written = written_path.is_some();
+                written_path
+            } else {
+                metadata_sidecar_warning = Some(
+                    "Metadata was saved, but the Jellyfin .nfo was not written because season/episode numbers could not be inferred from the filename. Organize the file or rename it to include SxxEyy first.".into(),
+                );
+                sidecar::find_metadata_sidecar_relative_path(library_root, relative_path).await?
+            }
+        }
+        _ => {
+            let written_path = sidecar::write_jellyfin_nfo(library_root, relative_path, selected, None, None).await?;
+            metadata_sidecar_written = written_path.is_some();
+            written_path
+        }
+    };
 
     db::upsert_managed_item(
         pool,
@@ -166,9 +217,11 @@ pub async fn persist_selected_metadata(
         row.modified_at.max(0) as u64,
         row.library_id.as_deref(),
         managed_status,
+        row.review_note.as_deref(),
+        row.review_updated_at.map(|value| value.max(0) as u64),
         Some(&selected_json),
         row.last_decision_json.as_deref(),
-        row.sidecar_path.as_deref(),
+        nfo_sidecar_path.as_deref().or(row.sidecar_path.as_deref()),
         row.first_seen_at.max(0) as u64,
         unix_now(),
     )
@@ -177,7 +230,11 @@ pub async fn persist_selected_metadata(
     let updated_row = db::fetch_managed_item(pool, relative_path)
         .await?
         .with_context(|| format!("managed item disappeared for {}", relative_path))?;
-    write_sidecar_from_row(library_root, &updated_row).await
+    write_sidecar_from_row(library_root, &updated_row).await?;
+    Ok(SelectedMetadataPersistOutcome {
+        metadata_sidecar_written,
+        metadata_sidecar_warning,
+    })
 }
 
 pub async fn persist_processing_decision(
@@ -186,6 +243,8 @@ pub async fn persist_processing_decision(
     relative_path: &str,
     managed_status: &str,
     decision: &ProcessingDecision,
+    review_note: Option<&str>,
+    review_updated_at: Option<u64>,
 ) -> Result<()> {
     let Some(row) = db::fetch_managed_item(pool, relative_path).await? else {
         return Ok(());
@@ -203,6 +262,8 @@ pub async fn persist_processing_decision(
         row.modified_at.max(0) as u64,
         row.library_id.as_deref(),
         managed_status,
+        review_note.or(row.review_note.as_deref()),
+        review_updated_at.or_else(|| row.review_updated_at.map(|value| value.max(0) as u64)),
         row.selected_metadata_json.as_deref(),
         Some(&decision_json),
         row.sidecar_path.as_deref(),
@@ -290,6 +351,7 @@ pub async fn summarize(pool: &SqlitePool, config: &AppConfig) -> Result<BacklogS
         needs_attention_count: items.iter().filter(|item| item_needs_attention(item)).count() as u64,
         unprocessed_count: items.iter().filter(|item| item.managed_status == "UNPROCESSED").count() as u64,
         reviewed_count: items.iter().filter(|item| item.managed_status == "REVIEWED").count() as u64,
+        re_source_count: items.iter().filter(|item| item.managed_status == "RE_SOURCE").count() as u64,
         kept_original_count: items.iter().filter(|item| item.managed_status == "KEPT_ORIGINAL").count() as u64,
         awaiting_approval_count: items.iter().filter(|item| item.managed_status == "AWAITING_APPROVAL").count() as u64,
         approved_count: items.iter().filter(|item| item.managed_status == "APPROVED").count() as u64,
@@ -334,12 +396,13 @@ pub async fn update_managed_status(
     library_root: &Path,
     relative_path: &str,
     managed_status: &str,
+    review_updated_at: Option<u64>,
 ) -> Result<()> {
     let row = db::fetch_managed_item(pool, relative_path)
         .await?
         .with_context(|| format!("managed item not found for {}", relative_path))?;
 
-    db::update_managed_item_status(pool, relative_path, managed_status, unix_now()).await?;
+    db::update_managed_item_status(pool, relative_path, managed_status, review_updated_at, unix_now()).await?;
 
     let updated_row = db::fetch_managed_item(pool, relative_path)
         .await?
@@ -347,8 +410,10 @@ pub async fn update_managed_status(
 
     if updated_row.selected_metadata_json.is_none()
         && updated_row.last_decision_json.is_none()
+        && updated_row.review_note.is_none()
         && row.selected_metadata_json.is_none()
         && row.last_decision_json.is_none()
+        && row.review_note.is_none()
         && updated_row.sidecar_path.is_none()
     {
         return Ok(());
@@ -640,6 +705,8 @@ fn intake_item_from_group(
             .unwrap_or(0),
         library_id: lead.library_id,
         managed_status: lead.managed_status,
+        review_note: lead.review_note,
+        review_updated_at: lead.review_updated_at.map(|value| value.max(0) as u64),
         has_sidecar: !missing_sidecar,
         missing_metadata,
         missing_sidecar,
@@ -677,9 +744,10 @@ fn status_priority(status: &str) -> u8 {
         "AWAITING_APPROVAL" => 2,
         "APPROVED" => 3,
         "REVIEWED" => 4,
-        "KEPT_ORIGINAL" => 5,
-        "PROCESSED" => 6,
-        _ => 7,
+        "RE_SOURCE" => 5,
+        "KEPT_ORIGINAL" => 6,
+        "PROCESSED" => 7,
+        _ => 8,
     }
 }
 
@@ -782,6 +850,8 @@ async fn write_sidecar_from_row(library_root: &Path, row: &db::ManagedItemRow) -
         media_type: row.media_type.clone(),
         library_id: row.library_id.clone(),
         managed_status: row.managed_status.clone(),
+        review_note: row.review_note.clone(),
+        review_updated_at: row.review_updated_at.map(|value| value.max(0) as u64),
         size_bytes: row.size_bytes.max(0) as u64,
         modified_at: row.modified_at.max(0) as u64,
         first_seen_at: Some(row.first_seen_at.max(0) as u64),
@@ -817,6 +887,8 @@ fn intake_item_from_row(config: &AppConfig, row: db::ManagedItemRow) -> Result<I
         modified_at: row.modified_at.max(0) as u64,
         library_id: row.library_id,
         managed_status: row.managed_status.clone(),
+        review_note: row.review_note.clone(),
+        review_updated_at: row.review_updated_at.map(|value| value.max(0) as u64),
         has_sidecar: row.sidecar_path.is_some(),
         missing_metadata,
         missing_sidecar,
@@ -856,6 +928,8 @@ mod tests {
             modified_at: 10,
             library_id: Some(library_id.into()),
             managed_status: status.into(),
+            review_note: None,
+            review_updated_at: None,
             selected_metadata_json: selected_metadata_json.map(str::to_string),
             last_decision_json: None,
             sidecar_path: Some(format!("{relative_path}.json")),

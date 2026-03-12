@@ -9,6 +9,7 @@ export function statusLabel(status: string | null | undefined): string {
 export function statusTone(status: string | null | undefined): string {
 	switch (status) {
 		case 'REVIEWED':
+		case 'RE_SOURCE':
 		case 'AWAITING_APPROVAL':
 		case 'APPROVED':
 		case 'PROCESSING':

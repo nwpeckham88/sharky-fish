@@ -26,6 +26,7 @@
 		{ href: '/', label: 'Backlog', icon: 'dashboard', badge: 'backlog' },
 		{ href: '/intake', label: 'Review', icon: 'intake', badge: 'review' },
 		{ href: '/library', label: 'Library', icon: 'library' },
+		{ href: '/downloads', label: 'Downloads', icon: 'downloads' },
 		{ href: '/forge', label: 'Execution', icon: 'forge' },
 		{ href: '/settings', label: 'Settings', icon: 'settings' }
 	] as const;
@@ -91,6 +92,7 @@
 		if (pathname === '/') return 'Backlog';
 		if (pathname.startsWith('/intake')) return 'Review';
 		if (pathname.startsWith('/library')) return 'Library';
+		if (pathname.startsWith('/downloads')) return 'Downloads';
 		if (pathname.startsWith('/organize')) return 'Organize';
 		if (pathname.startsWith('/forge')) return 'Execution';
 		if (pathname.startsWith('/settings')) return 'Settings';
@@ -101,6 +103,7 @@
 		if (pathname === '/') return 'Shape the library backlog, not the queue.';
 		if (pathname.startsWith('/intake')) return 'Approve or reject AI-generated plans before they enter execution.';
 		if (pathname.startsWith('/library')) return 'Audit managed state, sidecars, metadata, and organization.';
+		if (pathname.startsWith('/downloads')) return 'Audit linked imports, orphans, and download-folder cleanup risk.';
 		if (pathname.startsWith('/organize')) return 'Rename files into the canonical library structure.';
 		if (pathname.startsWith('/forge')) return 'Monitor approved, running, completed, and failed work.';
 		if (pathname.startsWith('/settings')) return 'Configure standards, prompts, and system policy.';
@@ -154,6 +157,8 @@
 							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>
 						{:else if item.icon === 'library'}
 							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 19.5A2.5 2.5 0 016.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/></svg>
+						{:else if item.icon === 'downloads'}
+							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v10"/><path d="m8 9 4 4 4-4"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
 						{:else if item.icon === 'forge'}
 							<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
 						{:else if item.icon === 'settings'}

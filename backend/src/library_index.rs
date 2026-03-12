@@ -1,5 +1,6 @@
 use crate::config::LibraryFolder;
 use crate::db;
+use crate::filesystem_audit;
 use crate::managed_items;
 use crate::messages::{LibraryIndexScanProgress, SseEvent};
 
@@ -23,6 +24,9 @@ pub struct IndexCandidate {
     pub media_type: String,
     pub size_bytes: u64,
     pub modified_at: u64,
+    pub device_id: u64,
+    pub inode: u64,
+    pub link_count: u64,
     pub library_id: Option<String>,
 }
 
@@ -115,6 +119,7 @@ pub async fn run_full_rescan(
                     .and_then(|value| value.to_str())
                     .unwrap_or_default()
                     .to_ascii_lowercase();
+                let facts = filesystem_audit::file_system_facts(&metadata);
 
                 producer_total.fetch_add(1, Ordering::Relaxed);
                 let candidate = IndexCandidate {
@@ -125,6 +130,9 @@ pub async fn run_full_rescan(
                     media_type: media_type.to_string(),
                     size_bytes: metadata.len(),
                     modified_at,
+                    device_id: facts.device_id,
+                    inode: facts.inode,
+                    link_count: facts.link_count,
                     library_id: match_library_id(&relative_path, &producer_libraries),
                 };
 
@@ -150,6 +158,9 @@ pub async fn run_full_rescan(
                         &candidate.media_type,
                         candidate.size_bytes,
                         candidate.modified_at,
+                        candidate.device_id,
+                        candidate.inode,
+                        candidate.link_count,
                         candidate.library_id.as_deref(),
                     )
                     .await?;
@@ -301,6 +312,7 @@ pub async fn apply_library_path_change(
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    let facts = filesystem_audit::file_system_facts(&metadata);
 
     let library_id = match_library_id(&relative_path, libraries);
     db::upsert_library_index_entry(
@@ -312,6 +324,9 @@ pub async fn apply_library_path_change(
         media_type,
         metadata.len(),
         modified_at,
+        facts.device_id,
+        facts.inode,
+        facts.link_count,
         library_id.as_deref(),
     )
     .await?;
@@ -383,6 +398,7 @@ async fn refresh_media_for_metadata_sidecar(
             .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
             .map(|value| value.as_secs())
             .unwrap_or(0);
+        let facts = filesystem_audit::file_system_facts(&metadata);
         let library_id = match_library_id(&relative_path, libraries);
 
         db::upsert_library_index_entry(
@@ -394,6 +410,9 @@ async fn refresh_media_for_metadata_sidecar(
             media_type,
             metadata.len(),
             modified_at,
+            facts.device_id,
+            facts.inode,
+            facts.link_count,
             library_id.as_deref(),
         )
         .await?;

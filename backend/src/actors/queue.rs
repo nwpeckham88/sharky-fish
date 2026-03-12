@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use crate::db;
 use crate::managed_items;
 use crate::messages::IdentifiedMedia;
-use crate::messages::{QueueMsg, QueuedJob};
+use crate::messages::{QueueMsg, QueuedJob, ReviewProposal};
 use anyhow::Result;
 use sqlx::SqlitePool;
 use std::path::PathBuf;
@@ -18,6 +18,7 @@ pub async fn enqueue_job(
     auto_approve: bool,
     media: &IdentifiedMedia,
     decision: &mut crate::messages::ProcessingDecision,
+    proposal: Option<&ReviewProposal>,
     initial_status_override: Option<&str>,
     group_key: Option<&str>,
     group_label: Option<&str>,
@@ -40,7 +41,7 @@ pub async fn enqueue_job(
     )
     .await?;
     decision.job_id = job_id;
-    db::upsert_job_analysis(pool, job_id, &media.probe, decision).await?;
+    db::upsert_job_analysis(pool, job_id, &media.probe, decision, proposal).await?;
 
     if decision.requires_two_pass {
         db::insert_task(pool, job_id, 1, "AUDIO_SCAN", None).await?;
@@ -172,6 +173,7 @@ impl QueueActor {
             media,
             decision,
             None,
+            None,
             group.as_ref().map(|value| value.key.as_str()),
             group.as_ref().map(|value| value.label.as_str()),
             group
@@ -211,6 +213,8 @@ impl QueueActor {
             &relative_path,
             next_status,
             &decision,
+            None,
+            None,
         )
         .await
         {

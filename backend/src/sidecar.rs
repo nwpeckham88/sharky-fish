@@ -22,6 +22,8 @@ pub struct ManagedItemSidecar {
     pub media_type: String,
     pub library_id: Option<String>,
     pub managed_status: String,
+    pub review_note: Option<String>,
+    pub review_updated_at: Option<u64>,
     pub size_bytes: u64,
     pub modified_at: u64,
     pub first_seen_at: Option<u64>,

@@ -1,9 +1,33 @@
 <script lang="ts">
-	import { approveJob, approveJobGroup, rejectJob, rejectJobGroup, type Job, type MediaProbe } from '$lib/api';
+	import {
+		approveJobMode,
+		approveJobGroupMode,
+		markJobGroupKeepOriginal,
+		markJobGroupReSource,
+		markJobKeepOriginal,
+		markJobReSource,
+		rejectJob,
+		rejectJobGroup,
+		type Job,
+		type MediaProbe,
+		type ReviewExecutionMode,
+		type ReviewProposal
+	} from '$lib/api';
 	import { getExecutionState, jobStore, getReviewState } from '$lib/stores.svelte';
 	import { fileName } from '$lib/status';
 
-	type ReviewAction = 'approve' | 'reject' | 'approve_group' | 'reject_group' | null;
+	type ReviewAction =
+		| ReviewExecutionMode
+		| 'keep_original'
+		| 're_source'
+		| 'reject'
+		| 'group:full_plan'
+		| 'group:organize_only'
+		| 'group:process_only'
+		| 'keep_original_group'
+		| 're_source_group'
+		| 'reject_group'
+		| null;
 
 	let actionBusy = $state<Record<number, ReviewAction>>({});
 	let actionErrors = $state<Record<number, string>>({});
@@ -34,7 +58,77 @@
 	}
 
 	function formatCommand(job: Job): string {
-		return job.decision?.arguments.join(' ') ?? 'No AI command generated yet.';
+		return (
+			job.proposal?.processing?.arguments.join(' ') ??
+			job.decision?.arguments.join(' ') ??
+			'No processing command generated for this review.'
+		);
+	}
+
+	function hardLinkWarning(job: Job): string | null {
+		if (!job.filesystem?.is_hard_linked) return null;
+		return 'Processing this item will create a new file and break the current hard-link relationship.';
+	}
+
+	function proposalWarnings(job: Job): string[] {
+		return job.proposal?.warnings ?? [];
+	}
+
+	function allowedModes(job: Job): ReviewExecutionMode[] {
+		const modes = job.proposal?.allowed_modes;
+		return modes && modes.length > 0 ? modes : ['process_only'];
+	}
+
+	function commonGroupModes(group: Job[]): ReviewExecutionMode[] {
+		const [first, ...rest] = group;
+		if (!first) return [];
+		return allowedModes(first).filter((mode) => rest.every((job) => allowedModes(job).includes(mode)));
+	}
+
+	function recommendationMode(proposal: ReviewProposal | null): ReviewExecutionMode | null {
+		if (!proposal) return null;
+		if (proposal.recommendation === 'full_plan') return 'full_plan';
+		if (proposal.recommendation === 'organize') return 'organize_only';
+		if (proposal.recommendation === 'process') return 'process_only';
+		return null;
+	}
+
+	function recommendationLabel(proposal: ReviewProposal | null): string {
+		if (!proposal) return 'none';
+		if (proposal.recommendation === 're_source') return 're-source';
+		return proposal.recommendation.replaceAll('_', ' ');
+	}
+
+	function canMarkReSource(job: Job): boolean {
+		return job.proposal?.recommendation === 're_source';
+	}
+
+	function canMarkGroupReSource(group: Job[]): boolean {
+		return group.length > 0 && group.every((job) => canMarkReSource(job));
+	}
+
+	function modeLabel(mode: ReviewExecutionMode): string {
+		if (mode === 'full_plan') return 'Approve Full Plan';
+		if (mode === 'organize_only') return 'Approve Organize Only';
+		return 'Approve Process Only';
+	}
+
+	function busyLabel(mode: ReviewExecutionMode): string {
+		if (mode === 'full_plan') return 'Approving Full Plan…';
+		if (mode === 'organize_only') return 'Approving Organize Only…';
+		return 'Approving Process Only…';
+	}
+
+	function groupBusyLabel(mode: ReviewExecutionMode): string {
+		if (mode === 'full_plan') return 'Approving Bundle…';
+		if (mode === 'organize_only') return 'Organizing Bundle…';
+		return 'Approving Processing…';
+	}
+
+	function formatScope(scope: string | null | undefined): string {
+		if (!scope) return 'file';
+		if (scope === 'movie_folder') return 'movie folder';
+		return scope.replaceAll('_', ' ');
 	}
 
 	function formatBytes(bytes: number): string {
@@ -49,14 +143,18 @@
 		return `${value >= 10 || index === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[index]}`;
 	}
 
-	async function runAction(jobId: number, action: 'approve' | 'reject') {
+	async function runAction(jobId: number, action: ReviewExecutionMode | 'reject' | 're_source' | 'keep_original') {
 		actionBusy = { ...actionBusy, [jobId]: action };
 		actionErrors = { ...actionErrors, [jobId]: '' };
 		try {
-			if (action === 'approve') {
-				await approveJob(jobId);
-			} else {
+			if (action === 'reject') {
 				await rejectJob(jobId);
+			} else if (action === 'keep_original') {
+				await markJobKeepOriginal(jobId);
+			} else if (action === 're_source') {
+				await markJobReSource(jobId);
+			} else {
+				await approveJobMode(jobId, action);
 			}
 		} catch (error) {
 			actionErrors = {
@@ -68,7 +166,10 @@
 		}
 	}
 
-	async function runGroupAction(group: Job[], action: 'approve_group' | 'reject_group') {
+	async function runGroupAction(
+		group: Job[],
+		action: `group:${ReviewExecutionMode}` | 'reject_group' | 're_source_group' | 'keep_original_group'
+	) {
 		if (group.length === 0) return;
 		const lead = group[0];
 		const nextBusy = { ...actionBusy };
@@ -81,10 +182,14 @@
 		actionErrors = nextErrors;
 
 		try {
-			if (action === 'approve_group') {
-				await approveJobGroup(lead.id);
-			} else {
+			if (action === 'reject_group') {
 				await rejectJobGroup(lead.id);
+			} else if (action === 'keep_original_group') {
+				await markJobGroupKeepOriginal(lead.id);
+			} else if (action === 're_source_group') {
+				await markJobGroupReSource(lead.id);
+			} else {
+				await approveJobGroupMode(lead.id, action.replace('group:', '') as ReviewExecutionMode);
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : 'Group action failed';
@@ -110,6 +215,10 @@
 			if (actionErrors[job.id]) return actionErrors[job.id];
 		}
 		return '';
+	}
+
+	function actionMatches(jobId: number, action: ReviewAction): boolean {
+		return actionBusy[jobId] === action;
 	}
 
 	const jobs = $derived(jobStore.jobs);
@@ -219,11 +328,36 @@
 
 								<div class="mb-4 rounded-lg border-l-[3px] border-[color:var(--accent-soft)] bg-[color:rgba(214,180,111,0.08)] px-3 py-2">
 									<p class="mb-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-[color:var(--accent-deep)]">Representative AI rationale</p>
-									<p class="text-xs text-[color:var(--ink-muted)]">{lead.decision?.rationale ?? 'No AI rationale available.'}</p>
+									<p class="text-xs text-[color:var(--ink-muted)]">{lead.proposal?.processing?.rationale ?? lead.decision?.rationale ?? 'No AI rationale available.'}</p>
 								</div>
 
+								{#if lead.proposal}
+									<div class="mb-4 rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.5)] p-3 text-xs text-[color:var(--ink-muted)]">
+										<div class="section-label mb-2">Representative Review Proposal</div>
+										<p>Scope: <span class="font-semibold text-[color:var(--ink-strong)]">{formatScope(lead.proposal.organization.scope)}</span></p>
+										<p class="mt-2">Recommendation: <span class="font-semibold text-[color:var(--ink-strong)]">{recommendationLabel(lead.proposal)}</span></p>
+										{#if lead.proposal.organization.organize_needed}
+											<p class="mt-2">Organize target: <span class="font-mono text-[11px] text-[color:var(--ink-strong)]">{lead.proposal.organization.target_relative_path}</span></p>
+										{/if}
+										{#if lead.proposal.recommendation_reason}
+											<p class="mt-2 text-[color:var(--accent-deep)]">{lead.proposal.recommendation_reason}</p>
+										{/if}
+									</div>
+								{/if}
+
+								{#each proposalWarnings(lead) as warning (warning)}
+									<div class="mb-3 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">
+										{warning}
+									</div>
+								{/each}
+								{#if proposalWarnings(lead).length === 0 && hardLinkWarning(lead)}
+									<div class="mb-4 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">
+										{hardLinkWarning(lead)}
+									</div>
+								{/if}
+
 								<details class="mb-4 rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.5)] px-3 py-2">
-									<summary class="cursor-pointer text-xs font-semibold uppercase tracking-[0.14em] text-[color:var(--ink-muted)]">Representative FFmpeg plan</summary>
+									<summary class="cursor-pointer text-xs font-semibold uppercase tracking-[0.14em] text-[color:var(--ink-muted)]">Representative Processing Plan</summary>
 									<pre class="mt-2 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-[color:var(--ink-strong)]">{formatCommand(lead)}</pre>
 								</details>
 
@@ -231,12 +365,26 @@
 									<p class="mb-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{groupError(group)}</p>
 								{/if}
 
-								<div class="flex gap-2">
-									<button class="flex-1 rounded-lg bg-[color:var(--accent)] px-3 py-2 text-xs font-semibold text-white disabled:opacity-60" onclick={() => runGroupAction(group, 'approve_group')} disabled={groupBusy(group)}>
-										{actionBusy[lead.id] === 'approve_group' ? 'Approving Show…' : 'Approve Show'}
+								<div class="flex flex-wrap gap-2">
+									<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-60" onclick={() => runGroupAction(group, 'keep_original_group')} disabled={groupBusy(group)}>
+										{actionMatches(lead.id, 'keep_original_group') ? 'Keeping Original…' : 'Keep Original'}
 									</button>
+									{#if canMarkGroupReSource(group)}
+										<button class="rounded-lg bg-[color:var(--olive)] px-3 py-2 text-xs font-semibold text-white disabled:opacity-60" onclick={() => runGroupAction(group, 're_source_group')} disabled={groupBusy(group)}>
+											{actionMatches(lead.id, 're_source_group') ? 'Marking Re-source…' : 'Mark Bundle Re-source'}
+										</button>
+									{/if}
+									{#each commonGroupModes(group) as mode (mode)}
+										<button
+											class={`rounded-lg px-3 py-2 text-xs font-semibold text-white disabled:opacity-60 ${recommendationMode(lead.proposal) === mode ? 'bg-[color:var(--accent)]' : 'bg-[color:var(--accent-deep)]'}`}
+											onclick={() => runGroupAction(group, `group:${mode}`)}
+											disabled={groupBusy(group)}
+										>
+											{actionMatches(lead.id, `group:${mode}`) ? groupBusyLabel(mode) : modeLabel(mode)}
+										</button>
+									{/each}
 									<button class="rounded-lg border border-[color:var(--line)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-muted)] disabled:opacity-60" onclick={() => runGroupAction(group, 'reject_group')} disabled={groupBusy(group)}>
-										{actionBusy[lead.id] === 'reject_group' ? 'Rejecting Show…' : 'Reject Show'}
+										{actionBusy[lead.id] === 'reject_group' ? 'Rejecting Plan…' : 'Reject Plan'}
 									</button>
 								</div>
 							</div>
@@ -276,11 +424,37 @@
 
 								<div class="mb-4 rounded-lg border-l-[3px] border-[color:var(--accent-soft)] bg-[color:rgba(214,180,111,0.08)] px-3 py-2">
 									<p class="mb-1 text-[11px] font-semibold uppercase tracking-[0.16em] text-[color:var(--accent-deep)]">AI rationale</p>
-									<p class="text-xs text-[color:var(--ink-muted)]">{job.decision?.rationale ?? 'No AI rationale available.'}</p>
+									<p class="text-xs text-[color:var(--ink-muted)]">{job.proposal?.processing?.rationale ?? job.decision?.rationale ?? 'No AI rationale available.'}</p>
 								</div>
 
+								{#if job.proposal}
+									<div class="mb-4 rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.5)] p-3 text-xs text-[color:var(--ink-muted)]">
+										<div class="section-label mb-2">Review Proposal</div>
+										<p>Scope: <span class="font-semibold text-[color:var(--ink-strong)]">{formatScope(job.proposal.organization.scope)}</span></p>
+										<p class="mt-2">Recommendation: <span class="font-semibold text-[color:var(--ink-strong)]">{recommendationLabel(job.proposal)}</span></p>
+										{#if job.proposal.organization.organize_needed}
+											<p class="mt-2">Organize target: <span class="font-mono text-[11px] text-[color:var(--ink-strong)]">{job.proposal.organization.target_relative_path}</span></p>
+										{/if}
+										{#if job.proposal.recommendation_reason}
+											<p class="mt-2 text-[color:var(--accent-deep)]">{job.proposal.recommendation_reason}</p>
+										{/if}
+										<p class="mt-2">Allowed modes: <span class="font-semibold text-[color:var(--ink-strong)]">{job.proposal.allowed_modes.map((mode) => mode.replaceAll('_', ' ')).join(', ')}</span></p>
+									</div>
+								{/if}
+
+								{#each proposalWarnings(job) as warning (warning)}
+									<div class="mb-3 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">
+										{warning}
+									</div>
+								{/each}
+								{#if proposalWarnings(job).length === 0 && hardLinkWarning(job)}
+									<div class="mb-4 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">
+										{hardLinkWarning(job)}
+									</div>
+								{/if}
+
 								<details class="mb-4 rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.5)] px-3 py-2">
-									<summary class="cursor-pointer text-xs font-semibold uppercase tracking-[0.14em] text-[color:var(--ink-muted)]">Generated FFmpeg plan</summary>
+									<summary class="cursor-pointer text-xs font-semibold uppercase tracking-[0.14em] text-[color:var(--ink-muted)]">Generated Processing Plan</summary>
 									<pre class="mt-2 overflow-auto whitespace-pre-wrap break-all font-mono text-[11px] text-[color:var(--ink-strong)]">{formatCommand(job)}</pre>
 								</details>
 
@@ -288,12 +462,26 @@
 									<p class="mb-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{actionErrors[job.id]}</p>
 								{/if}
 
-								<div class="flex gap-2">
-									<button class="flex-1 rounded-lg bg-[color:var(--accent)] px-3 py-2 text-xs font-semibold text-white disabled:opacity-60" onclick={() => runAction(job.id, 'approve')} disabled={actionBusy[job.id] !== null && actionBusy[job.id] !== undefined}>
-										{actionBusy[job.id] === 'approve' ? 'Approving…' : 'Approve'}
+								<div class="flex flex-wrap gap-2">
+									<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-60" onclick={() => runAction(job.id, 'keep_original')} disabled={actionBusy[job.id] !== null && actionBusy[job.id] !== undefined}>
+										{actionMatches(job.id, 'keep_original') ? 'Keeping Original…' : 'Keep Original'}
 									</button>
+									{#if canMarkReSource(job)}
+										<button class="rounded-lg bg-[color:var(--olive)] px-3 py-2 text-xs font-semibold text-white disabled:opacity-60" onclick={() => runAction(job.id, 're_source')} disabled={actionBusy[job.id] !== null && actionBusy[job.id] !== undefined}>
+											{actionMatches(job.id, 're_source') ? 'Marking Re-source…' : 'Mark Re-source'}
+										</button>
+									{/if}
+									{#each allowedModes(job) as mode (mode)}
+										<button
+											class={`rounded-lg px-3 py-2 text-xs font-semibold text-white disabled:opacity-60 ${recommendationMode(job.proposal) === mode ? 'bg-[color:var(--accent)]' : 'bg-[color:var(--accent-deep)]'}`}
+											onclick={() => runAction(job.id, mode)}
+											disabled={actionBusy[job.id] !== null && actionBusy[job.id] !== undefined}
+										>
+											{actionMatches(job.id, mode) ? busyLabel(mode) : modeLabel(mode)}
+										</button>
+									{/each}
 									<button class="rounded-lg border border-[color:var(--line)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-muted)] disabled:opacity-60" onclick={() => runAction(job.id, 'reject')} disabled={actionBusy[job.id] !== null && actionBusy[job.id] !== undefined}>
-										{actionBusy[job.id] === 'reject' ? 'Rejecting…' : 'Reject'}
+										{actionBusy[job.id] === 'reject' ? 'Rejecting Plan…' : 'Reject Plan'}
 									</button>
 								</div>
 							</div>

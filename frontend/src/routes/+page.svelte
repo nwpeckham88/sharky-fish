@@ -34,6 +34,7 @@
 		'awaiting_approval',
 		'approved',
 		'reviewed',
+		're_source',
 		'missing_metadata',
 		'missing_sidecar',
 		'organize_needed'
@@ -308,6 +309,12 @@
 			description: 'Execution exceptions needing follow-up'
 		},
 		{
+			key: 're_source' as const,
+			label: 'Re-source',
+			count: managedItemStore.summary.re_source_count,
+			description: 'Items intentionally deferred for a better source instead of another transcode'
+		},
+		{
 			key: 'missing_metadata' as const,
 			label: 'Needs Metadata',
 			count: managedItemStore.summary.missing_metadata_count,
@@ -505,6 +512,14 @@
 										This {item.group_kind === 'tv_show' ? 'show' : 'item'} still needs library shaping follow-up based on metadata or persistence state.
 									{/if}
 								</p>
+								{#if item.review_note}
+									<div class="mt-3 rounded-lg border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-3 py-2 text-xs text-[color:var(--olive)]">
+										{#if item.review_updated_at}
+											<div class="mb-1 text-[11px] text-[color:var(--ink-muted)]">Reviewed {formatTimestamp(item.review_updated_at)}</div>
+										{/if}
+										{item.review_note}
+									</div>
+								{/if}
 							</div>
 							<div class="min-w-[10rem] text-right text-xs text-[color:var(--ink-muted)]">
 								<div>{formatBytes(item.size_bytes)}</div>

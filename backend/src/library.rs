@@ -4,6 +4,7 @@ use std::cmp::Ordering;
 
 use crate::config::AppConfig;
 use crate::db;
+use crate::filesystem_audit::FileSystemFacts;
 use crate::internet_metadata::InternetMetadataMatch;
 use crate::organizer;
 
@@ -32,10 +33,13 @@ pub struct LibraryEntry {
     pub modified_at: Option<u64>,
     pub library_id: Option<String>,
     pub managed_status: Option<String>,
+    pub review_note: Option<String>,
+    pub review_updated_at: Option<u64>,
     pub has_sidecar: bool,
     pub has_selected_metadata: bool,
     pub organize_target_path: Option<String>,
     pub organize_needed: bool,
+    pub filesystem: FileSystemFacts,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -287,10 +291,20 @@ fn map_library_entry(config: &AppConfig, row: db::LibraryIndexRow) -> Result<Lib
         modified_at: Some(row.modified_at.max(0) as u64),
         library_id: row.library_id,
         managed_status: row.managed_status,
+        review_note: row.review_note,
+        review_updated_at: row.review_updated_at.map(|value| value.max(0) as u64),
         has_sidecar: row.has_sidecar,
         has_selected_metadata: row.has_selected_metadata,
         organize_target_path,
         organize_needed,
+        filesystem: FileSystemFacts {
+            device_id: row.device_id.max(0) as u64,
+            inode: row.inode.max(0) as u64,
+            link_count: row.link_count.max(0) as u64,
+            size_bytes: row.size_bytes.max(0) as u64,
+            modified_at: row.modified_at.max(0) as u64,
+            is_hard_linked: row.link_count > 1,
+        },
     })
 }
 

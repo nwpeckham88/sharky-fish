@@ -1,6 +1,8 @@
 mod actors;
 mod config;
 mod db;
+mod downloads;
+mod filesystem_audit;
 mod internet_metadata;
 mod library;
 mod library_index;
@@ -8,6 +10,7 @@ mod managed_items;
 mod messages;
 mod metadata;
 mod organizer;
+mod review;
 mod server;
 mod sidecar;
 

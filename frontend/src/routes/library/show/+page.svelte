@@ -31,6 +31,7 @@
 	let manualQuery = $state('');
 	let saveLoading = $state(false);
 	let saveStatus = $state('');
+	let saveWarnings = $state<string[]>([]);
 	let batchLoading = $state(false);
 	let batchError = $state('');
 	let batchStatus = $state('');
@@ -65,6 +66,19 @@
 			selectedMatch.imdb_id === match.imdb_id &&
 			selectedMatch.tvdb_id === match.tvdb_id
 		);
+	}
+
+	function seasonKeyForItem(item: LibraryEntry): string {
+		const normalized = item.relative_path.replaceAll('\\', '/');
+		const seasonFolder = normalized.match(/\/Season[ _-]?(\d{1,2})\//i);
+		if (seasonFolder) {
+			return `Season ${seasonFolder[1].padStart(2, '0')}`;
+		}
+		const episodePattern = normalized.match(/S(\d{2})E\d{2}/i);
+		if (episodePattern) {
+			return `Season ${episodePattern[1]}`;
+		}
+		return 'Unknown Season';
 	}
 
 	async function loadShow() {
@@ -125,13 +139,21 @@
 		if (episodes.length === 0) return;
 		saveLoading = true;
 		saveStatus = '';
+		saveWarnings = [];
 		metadataError = '';
 		try {
+			const warnings: string[] = [];
 			for (const episode of episodes) {
-				await saveSelectedLibraryInternetMetadata(episode.relative_path, match);
+				const response = await saveSelectedLibraryInternetMetadata(episode.relative_path, match);
+				if (response.metadata_sidecar_warning) {
+					warnings.push(`${episode.file_name}: ${response.metadata_sidecar_warning}`);
+				}
 			}
 			selectedMatch = match;
-			saveStatus = `Saved show metadata across ${episodes.length} episode file${episodes.length === 1 ? '' : 's'}.`;
+			saveWarnings = warnings;
+			saveStatus = warnings.length > 0
+				? `Saved show metadata across ${episodes.length} episode file${episodes.length === 1 ? '' : 's'}, but ${warnings.length} file${warnings.length === 1 ? '' : 's'} still need season and episode numbers in the filename before Jellyfin .nfo files can be written.`
+				: `Saved show metadata across ${episodes.length} episode file${episodes.length === 1 ? '' : 's'} and updated Jellyfin .nfo files.`;
 			await loadShow();
 		} catch (err) {
 			metadataError = err instanceof Error ? err.message : 'Failed to save selected metadata';
@@ -206,6 +228,53 @@
 		}
 		await loadShow();
 	});
+
+		const seasonSummaries = $derived.by(() => {
+			const groups = new Map<string, LibraryEntry[]>();
+			for (const item of episodes) {
+				const key = seasonKeyForItem(item);
+				const existing = groups.get(key) ?? [];
+				existing.push(item);
+				groups.set(key, existing);
+			}
+
+			return Array.from(groups.entries())
+				.map(([season, items]) => ({
+					season,
+					count: items.length,
+					totalBytes: items.reduce((sum, item) => sum + item.size_bytes, 0),
+					needsMetadata: items.filter((item) => !item.has_selected_metadata && (item.managed_status ?? 'UNPROCESSED') !== 'KEPT_ORIGINAL' && (item.managed_status ?? 'UNPROCESSED') !== 'PROCESSED').length,
+					missingNfo: items.filter((item) => !item.has_sidecar).length,
+					organizeNeeded: items.filter((item) => item.organize_needed).length,
+					attentionCount: items.filter((item) => ['UNPROCESSED', 'FAILED', 'AWAITING_APPROVAL'].includes(item.managed_status ?? 'UNPROCESSED')).length,
+					reSourceCount: items.filter((item) => (item.managed_status ?? 'UNPROCESSED') === 'RE_SOURCE').length,
+					keptOriginalCount: items.filter((item) => (item.managed_status ?? 'UNPROCESSED') === 'KEPT_ORIGINAL').length,
+					notedCount: items.filter((item) => !!item.review_note).length
+				}))
+				.sort((left, right) => left.season.localeCompare(right.season));
+		});
+
+		const outcomeSummary = $derived.by(() => {
+			const notedEpisodes = [...episodes.filter((item) => !!item.review_note)].sort((left, right) => {
+				const reviewDiff = (right.review_updated_at ?? 0) - (left.review_updated_at ?? 0);
+				if (reviewDiff !== 0) return reviewDiff;
+
+				const modifiedDiff = (right.modified_at ?? 0) - (left.modified_at ?? 0);
+				if (modifiedDiff !== 0) return modifiedDiff;
+
+				return left.file_name.localeCompare(right.file_name);
+			});
+			return {
+				notedCount: notedEpisodes.length,
+				reSourceCount: episodes.filter((item) => (item.managed_status ?? 'UNPROCESSED') === 'RE_SOURCE').length,
+				keptOriginalCount: episodes.filter((item) => (item.managed_status ?? 'UNPROCESSED') === 'KEPT_ORIGINAL').length,
+				recentNotes: notedEpisodes.slice(0, 4).map((item) => ({
+					fileName: item.file_name,
+					note: item.review_note ?? '',
+					reviewedAt: item.review_updated_at
+				}))
+			};
+		});
 </script>
 
 <section class="mb-6 flex flex-wrap items-start justify-between gap-4">
@@ -229,6 +298,78 @@
 {:else}
 	<section class="mb-5 grid gap-4 lg:grid-cols-[minmax(0,1.05fr)_minmax(22rem,0.95fr)]">
 		<div class="surface-card p-5">
+			<div class="mb-5">
+				<p class="section-label mb-3">Season Summary</p>
+				<div class="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+					{#each seasonSummaries as season (season.season)}
+						<div class="rounded-[1rem] border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.6)] p-4">
+							<div class="flex items-start justify-between gap-3">
+								<div>
+									<div class="font-semibold text-[color:var(--ink-strong)]">{season.season}</div>
+									<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{season.count} episode file{season.count === 1 ? '' : 's'} · {formatBytes(season.totalBytes)}</div>
+								</div>
+								{#if season.attentionCount > 0}
+									<span class="status-chip failed">{season.attentionCount} attention</span>
+								{/if}
+							</div>
+							<div class="mt-3 flex flex-wrap gap-2">
+								{#if season.needsMetadata > 0}
+									<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">{season.needsMetadata} need metadata</span>
+								{/if}
+								{#if season.missingNfo > 0}
+									<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">{season.missingNfo} missing nfo</span>
+								{/if}
+								{#if season.organizeNeeded > 0}
+									<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">{season.organizeNeeded} organize needed</span>
+								{/if}
+								{#if season.reSourceCount > 0}
+									<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">{season.reSourceCount} re-source</span>
+								{/if}
+								{#if season.keptOriginalCount > 0}
+									<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">{season.keptOriginalCount} kept original</span>
+								{/if}
+								{#if season.notedCount > 0}
+									<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">{season.notedCount} noted</span>
+								{/if}
+								{#if season.needsMetadata === 0 && season.missingNfo === 0 && season.organizeNeeded === 0}
+									<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">consistent</span>
+								{/if}
+							</div>
+						</div>
+					{/each}
+				</div>
+			</div>
+
+			{#if outcomeSummary.notedCount > 0}
+				<div class="mb-5 rounded-[1rem] border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] p-4">
+					<div class="flex flex-wrap items-start justify-between gap-3">
+						<div>
+							<p class="section-label">Review Outcomes</p>
+							<p class="mt-1 text-sm text-[color:var(--ink-strong)]">{outcomeSummary.notedCount} episode file{outcomeSummary.notedCount === 1 ? '' : 's'} have an operator outcome note.</p>
+						</div>
+						<div class="flex flex-wrap gap-2 text-[10px] font-bold uppercase tracking-[0.1em]">
+							{#if outcomeSummary.reSourceCount > 0}
+								<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-white/50 px-2 py-0.5 text-[color:var(--olive)]">{outcomeSummary.reSourceCount} re-source</span>
+							{/if}
+							{#if outcomeSummary.keptOriginalCount > 0}
+								<span class="rounded-full border border-[color:var(--line)] bg-white/50 px-2 py-0.5 text-[color:var(--ink-muted)]">{outcomeSummary.keptOriginalCount} kept original</span>
+							{/if}
+						</div>
+					</div>
+					<div class="mt-3 space-y-2">
+						{#each outcomeSummary.recentNotes as item (`${item.fileName}-${item.note}`)}
+							<div class="rounded-lg border border-[color:rgba(106,142,72,0.2)] bg-white/40 px-3 py-2 text-xs">
+								<div class="font-semibold text-[color:var(--ink-strong)]">{item.fileName}</div>
+								{#if item.reviewedAt}
+									<div class="mt-1 text-[11px] text-[color:var(--ink-muted)]">Reviewed {formatTimestamp(item.reviewedAt)}</div>
+								{/if}
+								<div class="mt-1 text-[color:var(--olive)]">{item.note}</div>
+							</div>
+						{/each}
+					</div>
+				</div>
+			{/if}
+
 			<div class="mb-4 flex flex-wrap items-center justify-between gap-3">
 				<div>
 					<p class="section-label">Episode Files</p>
@@ -261,6 +402,14 @@
 									{/if}
 								</div>
 								<div class="mt-1 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
+								{#if item.review_note}
+									<div class="mt-2 rounded-lg border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-3 py-2 text-xs text-[color:var(--olive)]">
+										{#if item.review_updated_at}
+											<div class="mb-1 text-[11px] text-[color:var(--ink-muted)]">Reviewed {formatTimestamp(item.review_updated_at)}</div>
+										{/if}
+										{item.review_note}
+									</div>
+								{/if}
 							</div>
 							<div class="text-right text-xs text-[color:var(--ink-muted)]">
 								<div>{formatBytes(item.size_bytes)}</div>
@@ -295,6 +444,17 @@
 				{/if}
 				{#if saveStatus}
 					<div class="mt-3 rounded-lg border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-3 py-2 text-xs text-[color:var(--olive)]">{saveStatus}</div>
+				{/if}
+				{#if saveWarnings.length > 0}
+					<div class="mt-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">
+						<div class="mb-1 font-semibold uppercase tracking-[0.12em]">NFO Warnings</div>
+						{#each saveWarnings.slice(0, 6) as warning (warning)}
+							<div>{warning}</div>
+						{/each}
+						{#if saveWarnings.length > 6}
+							<div class="mt-1 text-[color:var(--ink-muted)]">+{saveWarnings.length - 6} more</div>
+						{/if}
+					</div>
 				{/if}
 				{#if metadataError}
 					<div class="mt-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{metadataError}</div>

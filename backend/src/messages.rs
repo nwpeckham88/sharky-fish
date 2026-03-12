@@ -1,3 +1,5 @@
+use crate::filesystem_audit::FileSystemFacts;
+
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use tokio::sync::oneshot;
@@ -64,6 +66,41 @@ pub struct ProcessingDecision {
     pub arguments: Vec<String>,
     pub requires_two_pass: bool,
     pub rationale: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewExecutionMode {
+    FullPlan,
+    OrganizeOnly,
+    ProcessOnly,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewOrganizationProposal {
+    pub current_relative_path: String,
+    pub target_relative_path: Option<String>,
+    pub organize_needed: bool,
+    pub scope: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewProcessingProposal {
+    pub arguments: Vec<String>,
+    pub requires_two_pass: bool,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReviewProposal {
+    pub relative_path: String,
+    pub filesystem: FileSystemFacts,
+    pub organization: ReviewOrganizationProposal,
+    pub processing: Option<ReviewProcessingProposal>,
+    pub recommendation: String,
+    pub recommendation_reason: Option<String>,
+    pub warnings: Vec<String>,
+    pub allowed_modes: Vec<ReviewExecutionMode>,
 }
 
 /// Message sent to the Queue actor.

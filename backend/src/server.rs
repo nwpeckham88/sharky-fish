@@ -2,13 +2,16 @@ use crate::actors::brain;
 use crate::actors::queue;
 use crate::config::{AppConfig, LibraryFolder, LlmConfig};
 use crate::db;
+use crate::downloads;
+use crate::filesystem_audit;
 use crate::internet_metadata;
 use crate::library;
 use crate::library_index;
 use crate::managed_items;
-use crate::messages::{IdentifiedMedia, LibraryChange, SseEvent};
+use crate::messages::{IdentifiedMedia, LibraryChange, ReviewExecutionMode, SseEvent};
 use crate::metadata;
 use crate::organizer;
+use crate::review;
 use crate::library::{LibraryListOptions, LibraryManagedStatusFilter, LibrarySortBy, LibrarySortDirection};
 use axum::{
     Router,
@@ -27,6 +30,7 @@ use sqlx::SqlitePool;
 use std::convert::Infallible;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, Semaphore, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 use tower_http::cors::CorsLayer;
@@ -82,6 +86,11 @@ struct BulkManagedStatusResponse {
     failures: Vec<BulkFailure>,
 }
 
+#[derive(Deserialize)]
+struct ApproveModeRequest {
+    mode: ReviewExecutionMode,
+}
+
 struct HandlerError {
     status: StatusCode,
     message: String,
@@ -105,8 +114,32 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/jobs", get(list_jobs))
         .route("/api/jobs/{id}/approve", axum::routing::post(approve_job))
         .route(
+            "/api/jobs/{id}/approve-mode",
+            axum::routing::post(approve_job_mode),
+        )
+        .route(
+            "/api/jobs/{id}/mark-re-source",
+            axum::routing::post(mark_job_re_source),
+        )
+        .route(
+            "/api/jobs/{id}/mark-keep-original",
+            axum::routing::post(mark_job_keep_original),
+        )
+        .route(
             "/api/jobs/{id}/approve-group",
             axum::routing::post(approve_job_group),
+        )
+        .route(
+            "/api/jobs/{id}/approve-group-mode",
+            axum::routing::post(approve_job_group_mode),
+        )
+        .route(
+            "/api/jobs/{id}/mark-re-source-group",
+            axum::routing::post(mark_job_group_re_source),
+        )
+        .route(
+            "/api/jobs/{id}/mark-keep-original-group",
+            axum::routing::post(mark_job_group_keep_original),
         )
         .route("/api/jobs/{id}/reject", axum::routing::post(reject_job))
         .route(
@@ -140,6 +173,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/library/events", get(list_library_events))
         .route("/api/library/metadata", get(get_library_metadata))
+        .route("/api/downloads/summary", get(get_downloads_summary))
+        .route("/api/downloads/items", get(list_download_items))
+        .route("/api/downloads/linked-paths", get(get_download_linked_paths))
+        .route("/api/downloads/delete", axum::routing::post(delete_download_item))
         .route(
             "/api/library/internet",
             get(get_library_internet_metadata).post(save_selected_library_internet_metadata),
@@ -235,6 +272,20 @@ struct LibraryEventsQuery {
 }
 
 #[derive(Deserialize)]
+struct DownloadsQuery {
+    q: Option<String>,
+    classification: Option<String>,
+    limit: Option<usize>,
+    offset: Option<usize>,
+    path: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeleteDownloadRequest {
+    path: String,
+}
+
+#[derive(Deserialize)]
 struct LibraryInternetMetadataQuery {
     path: String,
     query: Option<String>,
@@ -309,6 +360,8 @@ struct OrganizeLibraryFileRequest {
 struct SelectedInternetMetadataResponse {
     path: String,
     selected: internet_metadata::InternetMetadataMatch,
+	metadata_sidecar_written: bool,
+	metadata_sidecar_warning: Option<String>,
 }
 
 async fn list_jobs(
@@ -318,7 +371,7 @@ async fn list_jobs(
     let limit = params.limit.unwrap_or(50);
     let offset = params.offset.unwrap_or(0);
     match db::list_jobs(&state.pool, limit, offset).await {
-        Ok(jobs) => Json(jobs).into_response(),
+        Ok(jobs) => Json(enrich_jobs_with_filesystem(jobs).await).into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -366,6 +419,7 @@ async fn list_backlog_items(
         "awaiting_approval" => (Some("AWAITING_APPROVAL"), false, false, false, false),
         "approved" => (Some("APPROVED"), false, false, false, false),
         "reviewed" => (Some("REVIEWED"), false, false, false, false),
+        "re_source" => (Some("RE_SOURCE"), false, false, false, false),
         "missing_metadata" => (None, true, false, false, false),
         "missing_sidecar" => (None, false, true, false, false),
         "organize_needed" => (None, false, false, false, true),
@@ -405,33 +459,206 @@ async fn approve_job(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> impl IntoResponse {
-    transition_job_status(state, id, "APPROVED").await
+    transition_job_status(state, id, Some(ReviewExecutionMode::ProcessOnly), "APPROVED").await
+}
+
+async fn approve_job_mode(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    Json(request): Json<ApproveModeRequest>,
+) -> impl IntoResponse {
+    let next_status = if request.mode == ReviewExecutionMode::OrganizeOnly {
+        "COMPLETED"
+    } else {
+        "APPROVED"
+    };
+    transition_job_status(state, id, Some(request.mode), next_status).await
 }
 
 async fn approve_job_group(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> impl IntoResponse {
-    transition_job_group_status(state, id, "APPROVED").await
+    transition_job_group_status(state, id, Some(ReviewExecutionMode::ProcessOnly), "APPROVED").await
+}
+
+async fn approve_job_group_mode(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+    Json(request): Json<ApproveModeRequest>,
+) -> impl IntoResponse {
+    let next_status = if request.mode == ReviewExecutionMode::OrganizeOnly {
+        "COMPLETED"
+    } else {
+        "APPROVED"
+    };
+    transition_job_group_status(state, id, Some(request.mode), next_status).await
 }
 
 async fn reject_job(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> impl IntoResponse {
-    transition_job_status(state, id, "REJECTED").await
+    transition_job_status(state, id, None, "REJECTED").await
+}
+
+async fn mark_job_re_source(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    let Some(job) = (match db::fetch_job(&state.pool, id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    }) else {
+        return (StatusCode::NOT_FOUND, format!("job {} not found", id)).into_response();
+    };
+
+    match complete_review_jobs(&state, vec![job], "RE_SOURCE", "REJECTED").await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err((status, message)) => (status, message).into_response(),
+    }
+}
+
+async fn mark_job_keep_original(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    let Some(job) = (match db::fetch_job(&state.pool, id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    }) else {
+        return (StatusCode::NOT_FOUND, format!("job {} not found", id)).into_response();
+    };
+
+    match complete_review_jobs(&state, vec![job], "KEPT_ORIGINAL", "REJECTED").await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err((status, message)) => (status, message).into_response(),
+    }
 }
 
 async fn reject_job_group(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> impl IntoResponse {
-    transition_job_group_status(state, id, "REJECTED").await
+    transition_job_group_status(state, id, None, "REJECTED").await
+}
+
+async fn mark_job_group_re_source(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    let Some(job) = (match db::fetch_job(&state.pool, id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    }) else {
+        return (StatusCode::NOT_FOUND, format!("job {} not found", id)).into_response();
+    };
+
+    let Some(group_key) = job.group_key.as_ref().filter(|value| !value.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "job is not part of a TV show group").into_response();
+    };
+
+    let pending_jobs = match db::list_jobs(&state.pool, 500, 0).await {
+        Ok(jobs) => jobs
+            .into_iter()
+            .filter(|candidate| {
+                candidate.group_key.as_deref() == Some(group_key.as_str())
+                    && candidate.group_kind == "tv_show"
+                    && candidate.status == "AWAITING_APPROVAL"
+            })
+            .map(|candidate| db::Job {
+                id: candidate.id,
+                file_path: candidate.file_path,
+                status: candidate.status,
+                group_key: candidate.group_key,
+                group_label: candidate.group_label,
+                group_kind: candidate.group_kind,
+                created_at: candidate.created_at,
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+
+    if pending_jobs.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            "no awaiting-approval jobs remain in this TV show group",
+        )
+            .into_response();
+    }
+
+    match complete_review_jobs(&state, pending_jobs, "RE_SOURCE", "REJECTED").await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err((status, message)) => (status, message).into_response(),
+    }
+}
+
+async fn mark_job_group_keep_original(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(id): axum::extract::Path<i64>,
+) -> impl IntoResponse {
+    let Some(job) = (match db::fetch_job(&state.pool, id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    }) else {
+        return (StatusCode::NOT_FOUND, format!("job {} not found", id)).into_response();
+    };
+
+    let Some(group_key) = job.group_key.as_ref().filter(|value| !value.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "job is not part of a TV show group").into_response();
+    };
+
+    let pending_jobs = match db::list_jobs(&state.pool, 500, 0).await {
+        Ok(jobs) => jobs
+            .into_iter()
+            .filter(|candidate| {
+                candidate.group_key.as_deref() == Some(group_key.as_str())
+                    && candidate.group_kind == "tv_show"
+                    && candidate.status == "AWAITING_APPROVAL"
+            })
+            .map(|candidate| db::Job {
+                id: candidate.id,
+                file_path: candidate.file_path,
+                status: candidate.status,
+                group_key: candidate.group_key,
+                group_label: candidate.group_label,
+                group_kind: candidate.group_kind,
+                created_at: candidate.created_at,
+            })
+            .collect::<Vec<_>>(),
+        Err(error) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
+
+    if pending_jobs.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            "no awaiting-approval jobs remain in this TV show group",
+        )
+            .into_response();
+    }
+
+    match complete_review_jobs(&state, pending_jobs, "KEPT_ORIGINAL", "REJECTED").await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err((status, message)) => (status, message).into_response(),
+    }
 }
 
 async fn transition_job_status(
     state: Arc<AppState>,
     id: i64,
+    mode: Option<ReviewExecutionMode>,
     next_status: &str,
 ) -> axum::response::Response {
     let Some(job) = (match db::fetch_job(&state.pool, id).await {
@@ -451,7 +678,7 @@ async fn transition_job_status(
             .into_response();
     }
 
-    match transition_jobs(&state, vec![job], next_status).await {
+    match transition_jobs(&state, vec![job], mode, next_status).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err((status, message)) => (status, message).into_response(),
     }
@@ -460,6 +687,7 @@ async fn transition_job_status(
 async fn transition_job_group_status(
     state: Arc<AppState>,
     id: i64,
+    mode: Option<ReviewExecutionMode>,
     next_status: &str,
 ) -> axum::response::Response {
     let Some(job) = (match db::fetch_job(&state.pool, id).await {
@@ -503,7 +731,7 @@ async fn transition_job_group_status(
             .into_response();
     }
 
-    match transition_jobs(&state, pending_jobs, next_status).await {
+    match transition_jobs(&state, pending_jobs, mode, next_status).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err((status, message)) => (status, message).into_response(),
     }
@@ -512,8 +740,11 @@ async fn transition_job_group_status(
 async fn transition_jobs(
     state: &Arc<AppState>,
     jobs: Vec<db::Job>,
+    mode: Option<ReviewExecutionMode>,
     next_status: &str,
 ) -> Result<(), (StatusCode, String)> {
+    let review_updated_at = unix_now();
+
     for job in &jobs {
         if matches!(job.status.as_str(), "PROCESSING" | "COMPLETED") {
             return Err((
@@ -526,23 +757,267 @@ async fn transition_jobs(
         }
     }
 
-    for job in jobs {
+    for mut job in jobs {
+        let execution_mode = mode.unwrap_or(ReviewExecutionMode::ProcessOnly);
+        let updated_relative_path = if next_status != "REJECTED" {
+            apply_review_mode(state, &job, execution_mode).await?
+        } else {
+            None
+        };
+
+        if let Some(relative_path) = updated_relative_path.as_deref() {
+            let updated_file_path = state.library_path.join(relative_path).display().to_string();
+            db::update_job_file_path(&state.pool, job.id, &updated_file_path)
+                .await
+                .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+            job.file_path = updated_file_path;
+        }
+
         db::update_job_status(&state.pool, job.id, next_status)
             .await
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
 
-        persist_job_transition(state, &job, next_status).await;
+        if execution_mode == ReviewExecutionMode::OrganizeOnly {
+            if let Some(relative_path) = updated_relative_path.as_deref() {
+                let _ = managed_items::update_managed_status(
+                    &state.pool,
+                    &state.library_path,
+                    relative_path,
+                    "REVIEWED",
+                    Some(review_updated_at),
+                )
+                .await;
+            }
+        } else {
+            persist_job_transition(state, &job, next_status, Some(review_updated_at)).await;
+        }
 
         let _ = state.sse_tx.send(SseEvent::JobStatus {
             job_id: job.id,
             status: next_status.into(),
+        });
+
+        if execution_mode == ReviewExecutionMode::OrganizeOnly {
+            let _ = state.sse_tx.send(SseEvent::JobCompleted {
+                job_id: job.id,
+                success: true,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+async fn complete_review_jobs(
+    state: &Arc<AppState>,
+    jobs: Vec<db::Job>,
+    managed_status: &str,
+    next_job_status: &str,
+) -> Result<(), (StatusCode, String)> {
+    let review_updated_at = unix_now();
+
+    for job in &jobs {
+        if matches!(job.status.as_str(), "PROCESSING" | "COMPLETED") {
+            return Err((
+                StatusCode::CONFLICT,
+                format!("job {} can no longer be changed from {}", job.id, job.status),
+            ));
+        }
+    }
+
+    for job in jobs {
+        let analysis = db::fetch_job_with_analysis(&state.pool, job.id)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        let relative_path = job_relative_path(&state.library_path, &job.file_path).ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("job {} is not rooted in the managed library", job.id),
+            )
+        })?;
+
+        let review_note = analysis.as_ref().and_then(|item| match managed_status {
+            "RE_SOURCE" => item
+                .proposal
+                .as_ref()
+                .and_then(|proposal| proposal.recommendation_reason.clone())
+                .or_else(|| {
+                    Some(
+                        "Operator deferred this item until a better source is available instead of accepting the current processing plan.".into(),
+                    )
+                }),
+            "KEPT_ORIGINAL" => Some(
+                "Operator kept the original media instead of executing the reviewed plan.".into(),
+            ),
+            _ => None,
+        });
+
+        if let Some(decision) = analysis.and_then(|item| item.decision) {
+            managed_items::persist_processing_decision(
+                &state.pool,
+                &state.library_path,
+                &relative_path,
+                managed_status,
+                &decision,
+                review_note.as_deref(),
+                Some(review_updated_at),
+            )
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        } else {
+            managed_items::update_managed_status(
+                &state.pool,
+                &state.library_path,
+                &relative_path,
+                managed_status,
+                Some(review_updated_at),
+            )
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        }
+
+        db::update_job_status(&state.pool, job.id, next_job_status)
+            .await
+            .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+
+        let _ = state.sse_tx.send(SseEvent::JobStatus {
+            job_id: job.id,
+            status: next_job_status.into(),
         });
     }
 
     Ok(())
 }
 
-async fn persist_job_transition(state: &Arc<AppState>, job: &db::Job, next_status: &str) {
+async fn apply_review_mode(
+    state: &Arc<AppState>,
+    job: &db::Job,
+    mode: ReviewExecutionMode,
+) -> Result<Option<String>, (StatusCode, String)> {
+    if mode == ReviewExecutionMode::ProcessOnly {
+        return Ok(None);
+    }
+
+    let analysis = db::fetch_job_with_analysis(&state.pool, job.id)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("job {} not found", job.id)))?;
+
+    let proposal = analysis.proposal.ok_or_else(|| {
+        (
+            StatusCode::CONFLICT,
+            "review proposal is missing for this job".to_string(),
+        )
+    })?;
+
+    if !proposal.allowed_modes.contains(&mode) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("mode {:?} is not allowed for this proposal", mode),
+        ));
+    }
+
+    if !proposal.organization.organize_needed {
+        return Ok(None);
+    }
+
+    let selected = load_selected_metadata_for_path(state, &proposal.relative_path).await?;
+    let managed_item = db::fetch_managed_item(&state.pool, &proposal.relative_path)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("managed item missing for {}", proposal.relative_path),
+            )
+        })?;
+    let config = state.config.read().await.clone();
+
+    let result = organizer::preview_or_apply(
+        &config,
+        &state.library_path,
+        organizer::OrganizeRequest {
+            relative_path: proposal.relative_path.clone(),
+            library_id: managed_item.library_id,
+            selected,
+            season: None,
+            episode: None,
+            scope: Some(proposal.organization.scope.clone()),
+            id_mode: Some("none".into()),
+            write_nfo: true,
+            merge_existing: false,
+        },
+        true,
+    )
+    .await
+    .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+
+    if result.applied && result.changed {
+        managed_items::reconcile_after_organize(
+            &state.pool,
+            &state.library_path,
+            &proposal.relative_path,
+            &result.target_relative_path,
+        )
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    }
+
+    Ok(Some(result.target_relative_path))
+}
+
+async fn load_selected_metadata_for_path(
+    state: &Arc<AppState>,
+    relative_path: &str,
+) -> Result<internet_metadata::InternetMetadataMatch, (StatusCode, String)> {
+    let row = db::fetch_selected_internet_metadata(&state.pool, relative_path)
+        .await
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("selected metadata missing for {}", relative_path),
+            )
+        })?;
+
+    Ok(internet_metadata_match_from_row(row))
+}
+
+async fn load_optional_selected_metadata_for_path(
+    state: &Arc<AppState>,
+    relative_path: &str,
+) -> Result<Option<internet_metadata::InternetMetadataMatch>, String> {
+    let row = db::fetch_selected_internet_metadata(&state.pool, relative_path)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(row.map(internet_metadata_match_from_row))
+}
+
+fn internet_metadata_match_from_row(
+    row: db::SelectedInternetMetadataRow,
+) -> internet_metadata::InternetMetadataMatch {
+    let genres = serde_json::from_str::<Vec<String>>(&row.genres_json).unwrap_or_default();
+    internet_metadata::InternetMetadataMatch {
+        provider: row.provider,
+        title: row.title,
+        year: row.year.map(|v| v as u16),
+        media_kind: row.media_kind,
+        imdb_id: row.imdb_id,
+        tvdb_id: row.tvdb_id.map(|v| v as u64),
+        overview: row.overview,
+        rating: row.rating,
+        genres,
+        poster_url: row.poster_url,
+        source_url: row.source_url,
+    }
+}
+
+async fn persist_job_transition(
+    state: &Arc<AppState>,
+    job: &db::Job,
+    next_status: &str,
+    review_updated_at: Option<u64>,
+) {
     let Some(relative_path) = job_relative_path(&state.library_path, &job.file_path) else {
         return;
     };
@@ -555,6 +1030,8 @@ async fn persist_job_transition(state: &Arc<AppState>, job: &db::Job, next_statu
                 &relative_path,
                 next_status,
                 &decision,
+                None,
+                review_updated_at,
             )
             .await
             {
@@ -694,6 +1171,18 @@ async fn create_intake_review_job_for_path(
     }
 
     let config = { state.config.read().await.clone() };
+    let managed_item = db::fetch_managed_item(&state.pool, relative_path)
+        .await
+        .map_err(|error| HandlerError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message: error.to_string(),
+        })?;
+    let selected_metadata = load_optional_selected_metadata_for_path(state, relative_path)
+        .await
+        .map_err(|message| HandlerError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+        })?;
     let group = managed_items::resolve_job_group(&state.pool, &config, relative_path)
         .await
         .map_err(|error| HandlerError {
@@ -716,8 +1205,17 @@ async fn create_intake_review_job_for_path(
 
     let media = IdentifiedMedia {
         path: PathBuf::from(&metadata.file_path),
-        probe: metadata.probe,
+        probe: metadata.probe.clone(),
     };
+    let proposal = review::build_review_proposal(
+        &config,
+        relative_path,
+        managed_item.as_ref().and_then(|item| item.library_id.as_deref()),
+        selected_metadata.as_ref(),
+        metadata.filesystem.clone(),
+        &metadata.probe,
+        &decision,
+    );
 
     let job_id = queue::enqueue_job(
         &state.pool,
@@ -725,6 +1223,7 @@ async fn create_intake_review_job_for_path(
         config.auto_approve_ai_jobs,
         &media,
         &mut decision,
+        Some(&proposal),
         Some("AWAITING_APPROVAL"),
         Some(group.key.as_str()),
         Some(group.label.as_str()),
@@ -742,6 +1241,8 @@ async fn create_intake_review_job_for_path(
         relative_path,
         "AWAITING_APPROVAL",
         &decision,
+        None,
+        None,
     )
     .await
     {
@@ -749,7 +1250,8 @@ async fn create_intake_review_job_for_path(
     }
 
     if let Ok(Some(job)) = db::fetch_job_with_analysis(&state.pool, job_id).await {
-        return Ok(job);
+        let mut jobs = enrich_jobs_with_filesystem(vec![job]).await;
+        return Ok(jobs.pop().expect("created job missing from enrichment result"));
     }
 
     let fallback = db::fetch_job(&state.pool, job_id)
@@ -773,7 +1275,20 @@ async fn create_intake_review_job_for_path(
         created_at: fallback.created_at,
         probe: None,
         decision: None,
+        proposal: None,
+        filesystem: None,
     })
+}
+
+async fn enrich_jobs_with_filesystem(mut jobs: Vec<db::JobWithAnalysis>) -> Vec<db::JobWithAnalysis> {
+    for job in &mut jobs {
+        job.filesystem = match filesystem_audit::stat_path(Path::new(&job.file_path)).await {
+            Ok(facts) => Some(facts),
+            Err(_) => None,
+        };
+    }
+
+    jobs
 }
 
 async fn update_managed_status_for_path(
@@ -795,9 +1310,17 @@ async fn update_managed_status_for_path(
         &state.library_path,
         relative_path,
         &normalized_status,
+        Some(unix_now()),
     )
     .await
     .map_err(|error| error.to_string())
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
 }
 
 async fn list_library(
@@ -882,6 +1405,63 @@ async fn get_library_metadata(
     match metadata::get_or_probe_library_metadata(&state.pool, &state.library_path, &params.path)
         .await
     {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+async fn get_downloads_summary(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match downloads::summarize(&state.pool, &state.ingest_path).await {
+        Ok(summary) => Json(summary).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn list_download_items(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<DownloadsQuery>,
+) -> impl IntoResponse {
+    match downloads::list_items(
+        &state.pool,
+        &state.ingest_path,
+        downloads::DownloadsListOptions {
+            query: params.q,
+            classification: params.classification,
+            limit: params.limit.unwrap_or(100).clamp(1, 500),
+            offset: params.offset.unwrap_or(0),
+        },
+    )
+    .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn get_download_linked_paths(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<DownloadsQuery>,
+) -> impl IntoResponse {
+    let Some(path) = params.path.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+    };
+
+    match downloads::linked_paths(&state.pool, &state.ingest_path, path).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+async fn delete_download_item(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<DeleteDownloadRequest>,
+) -> impl IntoResponse {
+    let path = request.path.trim();
+    if path.is_empty() {
+        return (StatusCode::BAD_REQUEST, "path is required").into_response();
+    }
+
+    match downloads::delete_item(&state.pool, &state.ingest_path, path).await {
         Ok(response) => Json(response).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
@@ -1230,7 +1810,7 @@ async fn save_selected_library_internet_metadata_for_path(
             message: error.to_string(),
         })?;
 
-    if let Err(error) = managed_items::persist_selected_metadata(
+    let persist_outcome = match managed_items::persist_selected_metadata(
         &state.pool,
         &state.library_path,
         path.trim(),
@@ -1238,12 +1818,21 @@ async fn save_selected_library_internet_metadata_for_path(
     )
     .await
     {
-        tracing::warn!(err = %error, path = path.trim(), "failed to persist managed item sidecar");
-    }
+        Ok(outcome) => outcome,
+        Err(error) => {
+            tracing::warn!(err = %error, path = path.trim(), "failed to persist managed item sidecar");
+            managed_items::SelectedMetadataPersistOutcome {
+				metadata_sidecar_written: false,
+				metadata_sidecar_warning: Some("Metadata was saved, but the Jellyfin .nfo could not be refreshed.".into()),
+			}
+        }
+    };
 
     Ok(SelectedInternetMetadataResponse {
         path: path.trim().to_string(),
         selected: selected.clone(),
+		metadata_sidecar_written: persist_outcome.metadata_sidecar_written,
+		metadata_sidecar_warning: persist_outcome.metadata_sidecar_warning,
     })
 }
 
@@ -1280,6 +1869,8 @@ async fn get_selected_library_internet_metadata(
     Json(SelectedInternetMetadataResponse {
         path: row.relative_path,
         selected,
+		metadata_sidecar_written: false,
+		metadata_sidecar_warning: None,
     })
     .into_response()
 }

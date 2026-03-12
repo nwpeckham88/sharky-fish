@@ -8,6 +8,43 @@ export interface Job {
 	created_at: string;
 	probe: MediaProbe | null;
 	decision: JobDecision | null;
+	filesystem: FileSystemFacts | null;
+	proposal: ReviewProposal | null;
+}
+
+export type ReviewExecutionMode = 'full_plan' | 'organize_only' | 'process_only';
+
+export interface ReviewOrganizationProposal {
+	current_relative_path: string;
+	target_relative_path: string | null;
+	organize_needed: boolean;
+	scope: string;
+}
+
+export interface ReviewProcessingProposal {
+	arguments: string[];
+	requires_two_pass: boolean;
+	rationale: string;
+}
+
+export interface ReviewProposal {
+	relative_path: string;
+	filesystem: FileSystemFacts;
+	organization: ReviewOrganizationProposal;
+	processing: ReviewProcessingProposal | null;
+	recommendation: string;
+	recommendation_reason: string | null;
+	warnings: string[];
+	allowed_modes: ReviewExecutionMode[];
+}
+
+export interface FileSystemFacts {
+	device_id: number;
+	inode: number;
+	link_count: number;
+	size_bytes: number;
+	modified_at: number;
+	is_hard_linked: boolean;
 }
 
 export interface MediaProbe {
@@ -32,6 +69,8 @@ export interface IntakeManagedItem {
 	modified_at: number;
 	library_id: string | null;
 	managed_status: string;
+	review_note: string | null;
+	review_updated_at: number | null;
 	has_sidecar: boolean;
 	missing_metadata: boolean;
 	missing_sidecar: boolean;
@@ -51,6 +90,7 @@ export interface BacklogSummary {
 	needs_attention_count: number;
 	unprocessed_count: number;
 	reviewed_count: number;
+	re_source_count: number;
 	kept_original_count: number;
 	awaiting_approval_count: number;
 	approved_count: number;
@@ -87,6 +127,7 @@ export type BacklogFilter =
 	| 'awaiting_approval'
 	| 'approved'
 	| 'reviewed'
+	| 're_source'
 	| 'missing_metadata'
 	| 'missing_sidecar'
 	| 'organize_needed';
@@ -122,10 +163,13 @@ export interface LibraryEntry {
 	modified_at: number | null;
 	library_id: string | null;
 	managed_status: string | null;
+	review_note: string | null;
+	review_updated_at: number | null;
 	has_sidecar: boolean;
 	has_selected_metadata: boolean;
 	organize_target_path: string | null;
 	organize_needed: boolean;
+	filesystem: FileSystemFacts;
 }
 
 export interface LibraryScanStatus {
@@ -154,6 +198,7 @@ export type LibraryManagedStatusFilter =
 	| 'all'
 	| 'UNPROCESSED'
 	| 'REVIEWED'
+	| 'RE_SOURCE'
 	| 'AWAITING_APPROVAL'
 	| 'APPROVED'
 	| 'PROCESSED'
@@ -225,6 +270,7 @@ export interface LibraryMetadata {
 		streams: MediaStreamInfo[];
 	};
 	cached: boolean;
+	filesystem: FileSystemFacts;
 }
 
 export interface InternetMetadataMatch {
@@ -277,6 +323,8 @@ export interface BulkInternetAutoSelectResponse {
 export interface SelectedInternetMetadataResponse {
 	path: string;
 	selected: InternetMetadataMatch;
+	metadata_sidecar_written: boolean;
+	metadata_sidecar_warning: string | null;
 }
 
 export interface LibraryChangeEvent {
@@ -296,6 +344,52 @@ export interface OrganizeLibraryResult {
 	conflict_path: string | null;
 	metadata_sidecar_path: string | null;
 	metadata_sidecar_written: boolean;
+	filesystem: FileSystemFacts;
+	organize_preserves_hard_links: boolean;
+	hard_link_warning: string | null;
+}
+
+export interface DownloadsSummary {
+	total_items: number;
+	total_bytes: number;
+	linked_import_count: number;
+	orphan_count: number;
+	possibly_duplicated_count: number;
+	hard_linked_count: number;
+}
+
+export interface DownloadItem {
+	file_name: string;
+	relative_path: string;
+	path: string;
+	size_bytes: number;
+	modified_at: number;
+	path_root_kind: string;
+	filesystem: FileSystemFacts;
+	classification: string;
+	linked_library_paths_count: number;
+	duplicate_library_paths_count: number;
+}
+
+export interface DownloadsItemsResponse {
+	items: DownloadItem[];
+	total_items: number;
+	limit: number;
+	offset: number;
+	summary: DownloadsSummary;
+}
+
+export interface DownloadsLinkedPathsResponse {
+	path: string;
+	linked_paths: string[];
+}
+
+export interface DeleteDownloadResponse {
+	path: string;
+	deleted: boolean;
+	linked_library_paths_count: number;
+	warning: string | null;
+	frees_space: boolean;
 }
 
 export interface RelatedInternetMetadataPathsResponse {
@@ -496,11 +590,69 @@ export async function approveJob(id: number): Promise<void> {
 	}
 }
 
+export async function approveJobMode(id: number, mode: ReviewExecutionMode): Promise<void> {
+	const res = await fetch(`${BASE}/jobs/${id}/approve-mode`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ mode })
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to approve job ${id} using mode ${mode}: ${res.status}`);
+	}
+}
+
 export async function approveJobGroup(id: number): Promise<void> {
 	const res = await fetch(`${BASE}/jobs/${id}/approve-group`, { method: 'POST' });
 	if (!res.ok) {
 		const text = await res.text();
 		throw new Error(text || `Failed to approve TV show group for job ${id}: ${res.status}`);
+	}
+}
+
+export async function approveJobGroupMode(id: number, mode: ReviewExecutionMode): Promise<void> {
+	const res = await fetch(`${BASE}/jobs/${id}/approve-group-mode`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ mode })
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(
+			text || `Failed to approve TV show group for job ${id} using mode ${mode}: ${res.status}`
+		);
+	}
+}
+
+export async function markJobReSource(id: number): Promise<void> {
+	const res = await fetch(`${BASE}/jobs/${id}/mark-re-source`, { method: 'POST' });
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to mark job ${id} for re-source: ${res.status}`);
+	}
+}
+
+export async function markJobGroupReSource(id: number): Promise<void> {
+	const res = await fetch(`${BASE}/jobs/${id}/mark-re-source-group`, { method: 'POST' });
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to mark TV show group for re-source: ${res.status}`);
+	}
+}
+
+export async function markJobKeepOriginal(id: number): Promise<void> {
+	const res = await fetch(`${BASE}/jobs/${id}/mark-keep-original`, { method: 'POST' });
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to mark job ${id} as kept original: ${res.status}`);
+	}
+}
+
+export async function markJobGroupKeepOriginal(id: number): Promise<void> {
+	const res = await fetch(`${BASE}/jobs/${id}/mark-keep-original-group`, { method: 'POST' });
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to mark TV show group as kept original: ${res.status}`);
 	}
 }
 
@@ -660,6 +812,52 @@ export async function organizeLibraryFile(input: {
 	if (!res.ok) {
 		const text = await res.text();
 		throw new Error(text || `Failed to organize library file: ${res.status}`);
+	}
+	return res.json();
+}
+
+export async function fetchDownloadsSummary(): Promise<DownloadsSummary> {
+	const res = await fetch(`${BASE}/downloads/summary`);
+	if (!res.ok) throw new Error(`Failed to fetch downloads summary: ${res.status}`);
+	return res.json();
+}
+
+export async function fetchDownloadItems(input: {
+	query?: string;
+	classification?: 'all' | 'linked_import' | 'download_orphan' | 'possibly_duplicated';
+	limit?: number;
+	offset?: number;
+} = {}): Promise<DownloadsItemsResponse> {
+	const params = new URLSearchParams({
+		limit: String(input.limit ?? 100),
+		offset: String(input.offset ?? 0)
+	});
+	if (input.query?.trim()) params.set('q', input.query.trim());
+	if (input.classification && input.classification !== 'all') {
+		params.set('classification', input.classification);
+	}
+
+	const res = await fetch(`${BASE}/downloads/items?${params.toString()}`);
+	if (!res.ok) throw new Error(`Failed to fetch downloads items: ${res.status}`);
+	return res.json();
+}
+
+export async function fetchDownloadLinkedPaths(path: string): Promise<DownloadsLinkedPathsResponse> {
+	const params = new URLSearchParams({ path });
+	const res = await fetch(`${BASE}/downloads/linked-paths?${params.toString()}`);
+	if (!res.ok) throw new Error(`Failed to fetch linked library paths for ${path}: ${res.status}`);
+	return res.json();
+}
+
+export async function deleteDownloadItem(path: string): Promise<DeleteDownloadResponse> {
+	const res = await fetch(`${BASE}/downloads/delete`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ path })
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to delete download item: ${res.status}`);
 	}
 	return res.json();
 }
