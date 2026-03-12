@@ -291,8 +291,11 @@ export interface OrganizeLibraryResult {
 	target_relative_path: string;
 	changed: boolean;
 	applied: boolean;
+	scope: string;
 	target_exists: boolean;
 	conflict_path: string | null;
+	metadata_sidecar_path: string | null;
+	metadata_sidecar_written: boolean;
 }
 
 export interface RelatedInternetMetadataPathsResponse {
@@ -644,6 +647,8 @@ export async function organizeLibraryFile(input: {
 	season?: number;
 	episode?: number;
 	scope?: 'file' | 'movie_folder';
+	id_mode?: 'none' | 'imdb' | 'tvdb';
+	write_nfo?: boolean;
 	merge_existing?: boolean;
 	apply?: boolean;
 }): Promise<OrganizeLibraryResult> {

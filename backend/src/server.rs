@@ -299,6 +299,8 @@ struct OrganizeLibraryFileRequest {
     season: Option<u32>,
     episode: Option<u32>,
     scope: Option<String>,
+    id_mode: Option<String>,
+    write_nfo: Option<bool>,
     merge_existing: Option<bool>,
     apply: Option<bool>,
 }
@@ -1016,7 +1018,7 @@ async fn list_library_duplicates(
                         .iter()
                         .find(|library| library.id == library_id)
                 })
-                .map(|library| organizer::movie_target_container(&library.path, &selected))
+                .map(|library| organizer::movie_target_container(&library.path, &selected, "none"))
                 .and_then(|target_dir| {
                     let prefix = format!("{target_dir}/");
                     members
@@ -1341,6 +1343,8 @@ async fn organize_library_file(
             season: request.season,
             episode: request.episode,
             scope: request.scope,
+            id_mode: request.id_mode,
+            write_nfo: request.write_nfo.unwrap_or(true),
             merge_existing: request.merge_existing.unwrap_or(false),
         },
         apply,

@@ -26,6 +26,8 @@
 	let chosenMatch = $state<InternetMetadataMatch | null>(null);
 	let season = $state<number | null>(null);
 	let episode = $state<number | null>(null);
+	let idMode = $state<'none' | 'imdb' | 'tvdb'>('none');
+	let writeNfo = $state(true);
 	let previewResult = $state<OrganizeLibraryResult | null>(null);
 	let actionLoading = $state(false);
 	let actionError = $state('');
@@ -71,6 +73,8 @@
 		status = '';
 		season = null;
 		episode = null;
+		idMode = item.library_id === activeLibraryId && activeLibrary()?.media_type === 'tv' ? 'tvdb' : 'none';
+		writeNfo = true;
 	}
 
 	async function loadSavedSelection(path: string) {
@@ -125,6 +129,8 @@
 				selected: chosenMatch,
 				season: season ?? undefined,
 				episode: episode ?? undefined,
+				id_mode: idMode,
+				write_nfo: writeNfo,
 				apply: false
 			});
 		} catch (error) {
@@ -145,10 +151,15 @@
 				selected: chosenMatch,
 				season: season ?? undefined,
 				episode: episode ?? undefined,
+				id_mode: idMode,
+				write_nfo: writeNfo,
 				apply: true
 			});
 			previewResult = result;
 			status = result.changed ? 'File renamed and organized.' : 'File already follows naming conventions.';
+			if (result.metadata_sidecar_written) {
+				status += ' Jellyfin .nfo sidecar written.';
+			}
 			await loadLibraryItems();
 			if (selected) {
 				selected = items.find((i) => i.relative_path === result.target_relative_path) ?? null;
@@ -260,6 +271,23 @@
 						</div>
 					{/if}
 
+						<div class="grid gap-3 rounded-lg border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.45)] px-3 py-3 sm:grid-cols-2">
+							<label class="text-xs text-[color:var(--ink-muted)]">Name Suffix
+								<select bind:value={idMode} class="mt-1 w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-2 py-1.5 text-sm text-[color:var(--ink-strong)]">
+									<option value="none">No external ID</option>
+									{#if activeLibrary()?.media_type === 'tv'}
+										<option value="tvdb">Add TVDB ID</option>
+									{:else}
+										<option value="imdb">Add IMDb ID</option>
+									{/if}
+								</select>
+							</label>
+							<label class="flex items-center gap-2 text-xs text-[color:var(--ink-muted)]">
+								<input type="checkbox" bind:checked={writeNfo} class="accent-[color:var(--accent)]" />
+								Write Jellyfin .nfo next to media
+							</label>
+						</div>
+
 					<div class="flex flex-wrap gap-2">
 						<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={previewRename} disabled={!chosenMatch || actionLoading}>Preview Rename</button>
 						<button class="rounded-lg bg-[color:var(--accent)] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50" onclick={applyRename} disabled={!chosenMatch || actionLoading}>Apply Rename</button>
@@ -271,6 +299,10 @@
 							<div class="font-mono text-[color:var(--ink-strong)]">{previewResult.current_relative_path}</div>
 							<div class="mt-2 text-[color:var(--ink-muted)]">Target (Jellyfin naming)</div>
 							<div class="font-mono text-[color:var(--ink-strong)]">{previewResult.target_relative_path}</div>
+							{#if previewResult.metadata_sidecar_path}
+								<div class="mt-2 text-[color:var(--ink-muted)]">Metadata Sidecar</div>
+								<div class="font-mono text-[color:var(--ink-strong)]">{previewResult.metadata_sidecar_path}</div>
+							{/if}
 						</div>
 					{/if}
 

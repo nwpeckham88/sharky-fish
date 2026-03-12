@@ -59,6 +59,7 @@
 	let localLoading = $state(true);
 	let backlogError = $state('');
 	let activeBacklogFilter = $state<BacklogFilter>(parseBacklogFilter(page.url.searchParams.get('filter')));
+	let showOutsideLibrary = $state(page.url.searchParams.get('outside') === '1');
 	let reviewBusy = $state<Record<string, boolean>>({});
 	let statusBusy = $state<Record<string, boolean>>({});
 	let refreshTimer: ReturnType<typeof setTimeout> | undefined;
@@ -129,6 +130,11 @@
 		} else {
 			params.set('filter', filter);
 		}
+		if (showOutsideLibrary) {
+			params.set('outside', '1');
+		} else {
+			params.delete('outside');
+		}
 		const query = params.toString();
 		return query ? `/?${query}` : '/';
 	}
@@ -152,6 +158,7 @@
 
 	$effect(() => {
 		const filterFromUrl = parseBacklogFilter(page.url.searchParams.get('filter'));
+		showOutsideLibrary = page.url.searchParams.get('outside') === '1';
 		if (filterFromUrl === activeBacklogFilter) {
 			return;
 		}
@@ -226,12 +233,67 @@
 		});
 	}
 
+	function toggleOutsideLibrary() {
+		showOutsideLibrary = !showOutsideLibrary;
+		void syncBacklogFilter(activeBacklogFilter);
+	}
+
+	function backlogDisplayItems(items: IntakeManagedItem[]): IntakeManagedItem[] {
+		if (showOutsideLibrary) {
+			return items;
+		}
+		return items.filter((item) => !!item.library_id);
+	}
+
+	function showDetailHref(item: IntakeManagedItem): string {
+		const params = new URLSearchParams();
+		if (item.library_id) {
+			params.set('library', item.library_id);
+		}
+		if (item.group_label) {
+			params.set('show', item.group_label);
+		}
+		params.set('path', item.relative_path);
+		if (!item.library_id || showOutsideLibrary) {
+			params.set('outside', '1');
+		}
+		return `/library/show?${params.toString()}`;
+	}
+
+	function libraryHref(item: IntakeManagedItem): string {
+		if (item.group_kind === 'tv_show') {
+			return showDetailHref(item);
+		}
+		const params = new URLSearchParams();
+		if (item.library_id) {
+			params.set('library', item.library_id);
+		}
+		params.set('path', item.relative_path);
+		if (!item.library_id || showOutsideLibrary) {
+			params.set('outside', '1');
+		}
+		return `/library?${params.toString()}`;
+	}
+
+	function organizeHref(item: IntakeManagedItem): string {
+		const libraryId = item.library_id;
+		if (item.group_kind === 'tv_show') {
+			return showDetailHref(item);
+		}
+		if (!libraryId) {
+			return libraryHref(item);
+		}
+		const params = new URLSearchParams({ path: item.relative_path });
+		params.set('library', libraryId);
+		return `/organize?${params.toString()}`;
+	}
+
 	const backlogFilterMeta = $derived([
 		{
 			key: 'needs_attention' as const,
 			label: 'Needs Attention',
 			count: managedItemStore.summary.needs_attention_count,
-			description: 'Open issues across status, metadata, or sidecars'
+			description: 'Open issues across status, metadata, or Jellyfin NFO files'
 		},
 		{
 			key: 'unprocessed' as const,
@@ -253,9 +315,9 @@
 		},
 		{
 			key: 'missing_sidecar' as const,
-			label: 'Missing Sidecar',
+			label: 'Missing NFO',
 			count: managedItemStore.summary.missing_sidecar_count,
-			description: 'No persisted sidecar alongside the file'
+			description: 'No Jellyfin NFO alongside the media file'
 		},
 		{
 			key: 'organize_needed' as const,
@@ -274,6 +336,7 @@
 	const activeBacklogMeta = $derived(
 		backlogFilterMeta.find((filter) => filter.key === activeBacklogFilter) ?? backlogFilterMeta[0]
 	);
+	const visibleBacklogItems = $derived(backlogDisplayItems(backlogItems));
 </script>
 
 <section class="mb-6 grid gap-4 md:grid-cols-[minmax(0,1.3fr)_minmax(18rem,0.7fr)]">
@@ -367,20 +430,26 @@
 				<p class="text-lg text-[color:var(--ink-strong)]">{activeBacklogMeta.label}</p>
 				<p class="mt-1 text-sm text-[color:var(--ink-muted)]">{activeBacklogMeta.description}</p>
 			</div>
-			<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-[color:var(--accent-deep)]">{backlogItems.length}</span>
+			<div class="flex items-center gap-2">
+				<label class="flex items-center gap-2 rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.14em] text-[color:var(--ink-muted)]">
+					<input type="checkbox" checked={showOutsideLibrary} onchange={toggleOutsideLibrary} class="accent-[color:var(--accent)]" />
+					Show outside library
+				</label>
+				<span class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-[color:var(--accent-deep)]">{visibleBacklogItems.length}</span>
+			</div>
 		</div>
 
 		{#if localLoading}
 			<div class="rounded-[1rem] border border-dashed border-[color:var(--line)] px-5 py-10 text-center text-sm text-[color:var(--ink-muted)]">Loading backlog…</div>
 		{:else if backlogError}
 			<div class="rounded-[1rem] border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-4 py-3 text-sm text-[color:var(--danger)]">{backlogError}</div>
-		{:else if backlogItems.length === 0}
+		{:else if visibleBacklogItems.length === 0}
 			<div class="rounded-[1rem] border border-dashed border-[color:var(--line)] px-5 py-10 text-center text-sm text-[color:var(--ink-muted)]">
 				No items match this backlog filter right now. Use <a href="/library" class="underline">Library</a> to audit shaped items and <a href="/intake" class="underline">Review</a> to approve new plans.
 			</div>
 		{:else}
 			<div class="space-y-3">
-				{#each backlogItems.slice(0, 8) as item (item.group_key ?? item.relative_path)}
+				{#each visibleBacklogItems.slice(0, 8) as item (item.group_key ?? item.relative_path)}
 					<div class="rounded-[1rem] border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-4">
 						<div class="flex flex-wrap items-start justify-between gap-3">
 							<div class="min-w-0 flex-1">
@@ -392,15 +461,28 @@
 									{/if}
 									{#if item.library_id}
 										<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">{item.library_id}</span>
+									{:else}
+										<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">outside library</span>
 									{/if}
 									{#if item.has_sidecar}
-										<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">sidecar</span>
+										<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">nfo</span>
+									{:else}
+										<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">missing nfo</span>
 									{/if}
 									{#if item.missing_metadata}
 										<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">needs metadata</span>
+									{:else if item.selected_metadata}
+										<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">metadata selected</span>
 									{/if}
 									{#if item.organize_needed}
 										<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">organize needed</span>
+									{/if}
+									{#if item.managed_status === 'REVIEWED'}
+										<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">reviewed</span>
+									{:else if item.managed_status === 'APPROVED'}
+										<span class="rounded-full border border-[color:rgba(214,180,111,0.35)] bg-[color:rgba(214,180,111,0.12)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">approved</span>
+									{:else if item.managed_status === 'KEPT_ORIGINAL'}
+										<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">kept original</span>
 									{/if}
 									{#if item.group_kind === 'tv_show'}
 										<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">{item.member_count} episode{item.member_count === 1 ? '' : 's'}</span>
@@ -448,10 +530,8 @@
 							{:else if item.managed_status === 'FAILED' || item.last_decision}
 								<a href="/forge" class="rounded-lg border border-[color:var(--line)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-strong)] no-underline">Open execution</a>
 							{/if}
-							{#if item.library_id}
-								<a href={`/organize?library=${encodeURIComponent(item.library_id)}&path=${encodeURIComponent(item.relative_path)}`} class="rounded-lg border border-[color:var(--line)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-strong)] no-underline">Open organize</a>
-							{/if}
-							<a href="/library" class="rounded-lg border border-[color:var(--line)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-strong)] no-underline">Open in library</a>
+							<a href={organizeHref(item)} class="rounded-lg border border-[color:var(--line)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-strong)] no-underline">{item.group_kind === 'tv_show' ? 'Open show' : 'Open organize'}</a>
+							<a href={libraryHref(item)} class="rounded-lg border border-[color:var(--line)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-strong)] no-underline">Open in library</a>
 						</div>
 					</div>
 				{/each}

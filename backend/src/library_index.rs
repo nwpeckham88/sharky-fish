@@ -257,6 +257,11 @@ pub async fn apply_library_path_change(
         return Ok(());
     }
 
+    if is_metadata_sidecar_path(path) {
+        refresh_media_for_metadata_sidecar(pool, library_root, libraries, path).await?;
+        return Ok(());
+    }
+
     // Deletions and missing files should evict stale rows.
     if change == "removed" || !path.exists() {
         db::delete_library_index_entry(pool, &relative_path).await?;
@@ -327,6 +332,89 @@ pub async fn apply_library_path_change(
     Ok(())
 }
 
+async fn refresh_media_for_metadata_sidecar(
+    pool: &SqlitePool,
+    library_root: &Path,
+    libraries: &[LibraryFolder],
+    sidecar_path: &Path,
+) -> Result<()> {
+    let Some(parent) = sidecar_path.parent() else {
+        return Ok(());
+    };
+    let Some(stem) = sidecar_path.file_stem().and_then(|value| value.to_str()) else {
+        return Ok(());
+    };
+
+    let mut entries = match tokio::fs::read_dir(parent).await {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+
+    while let Some(entry) = entries.next_entry().await? {
+        let candidate = entry.path();
+        if !candidate.is_file() {
+            continue;
+        }
+        let candidate_stem = candidate.file_stem().and_then(|value| value.to_str());
+        if candidate_stem != Some(stem) {
+            continue;
+        }
+        let Some(media_type) = detect_media_type(&candidate) else {
+            continue;
+        };
+        let metadata = match tokio::fs::metadata(&candidate).await {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        let relative_path = relative_path_string(library_root, &candidate);
+        let file_name = candidate
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let extension = candidate
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+            .map(|value| value.as_secs())
+            .unwrap_or(0);
+        let library_id = match_library_id(&relative_path, libraries);
+
+        db::upsert_library_index_entry(
+            pool,
+            &relative_path,
+            &candidate.display().to_string(),
+            &file_name,
+            &extension,
+            media_type,
+            metadata.len(),
+            modified_at,
+            library_id.as_deref(),
+        )
+        .await?;
+
+        managed_items::sync_library_file(
+            pool,
+            library_root,
+            &relative_path,
+            &candidate.display().to_string(),
+            &file_name,
+            media_type,
+            metadata.len(),
+            modified_at,
+            library_id.as_deref(),
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 pub fn detect_media_type(path: &Path) -> Option<&'static str> {
     let extension = path.extension()?.to_str()?.to_ascii_lowercase();
     match extension.as_str() {
@@ -335,6 +423,13 @@ pub fn detect_media_type(path: &Path) -> Option<&'static str> {
         "srt" | "ass" | "vtt" => Some("subtitle"),
         _ => None,
     }
+}
+
+fn is_metadata_sidecar_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.eq_ignore_ascii_case("nfo"))
+        .unwrap_or(false)
 }
 
 pub fn is_excluded_relative_path(relative_path: &str, patterns: &[String]) -> bool {

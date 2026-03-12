@@ -182,6 +182,8 @@
 	let sortBy = $state<LibrarySortBy>('modified_at');
 	let sortDirection = $state<LibrarySortDirection>('desc');
 	let advancedMode = $state(false);
+	let requestedPath = $state<string | null>(null);
+	let requestedShow = $state<string | null>(null);
 	let queryTimer: ReturnType<typeof setTimeout> | undefined;
 	let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -233,9 +235,9 @@
 		},
 		{
 			key: 'missing_sidecar' as const,
-			label: 'Missing Sidecar',
+			label: 'Missing NFO',
 			count: managedItemStore.summary.missing_sidecar_count,
-			description: 'No persisted sidecar alongside the file'
+			description: 'No Jellyfin NFO alongside the media file'
 		},
 		{
 			key: 'processed' as const,
@@ -262,6 +264,8 @@
 		if (urlQuery) query = urlQuery;
 		const urlLib = page.url.searchParams.get('library');
 		if (urlLib) activeLibraryId = urlLib;
+		requestedPath = page.url.searchParams.get('path');
+		requestedShow = page.url.searchParams.get('show');
 		const urlOffset = Number(page.url.searchParams.get('offset') ?? '0');
 		if (Number.isFinite(urlOffset) && urlOffset > 0) offset = urlOffset;
 		const urlView = parseShapingView(page.url.searchParams.get('view'));
@@ -327,6 +331,22 @@
 			scanStatus = response.scan;
 			libraryState.scan = response.scan;
 			totalLibrary = response.total_items;
+			if (requestedShow && activeLibraryId) {
+				expandedShows = new Set([...expandedShows, requestedShow]);
+			}
+			if (requestedPath) {
+				const match = response.items.find((item) => item.relative_path === requestedPath) ?? null;
+				if (match) {
+					requestedShow = activeLibraryFolder?.media_type === 'tv'
+						? stripLibraryPrefix(match.relative_path, activeLibraryFolder.path).split('/').filter(Boolean)[0] ?? requestedShow
+						: requestedShow;
+					if (requestedShow) {
+						expandedShows = new Set([...expandedShows, requestedShow]);
+					}
+					void loadMetadata(match);
+				}
+				requestedPath = null;
+			}
 			if (selectedItem) {
 				const updated = response.items.find((i) => i.relative_path === selectedItem?.relative_path) ?? null;
 				selectedItem = updated;
@@ -843,6 +863,18 @@
 		return provider.toUpperCase();
 	}
 
+	function showDetailHref(show: string, item?: LibraryEntry): string {
+		const params = new URLSearchParams();
+		if (activeLibraryId) {
+			params.set('library', activeLibraryId);
+		}
+		params.set('show', show);
+		if (item) {
+			params.set('path', item.relative_path);
+		}
+		return `/library/show?${params.toString()}`;
+	}
+
 </script>
 
 <!-- Library Folder Tabs -->
@@ -936,7 +968,7 @@
 			['KEPT_ORIGINAL', 'Kept Original'],
 			['MISSING_METADATA', 'Needs Metadata'],
 			['ORGANIZE_NEEDED', 'Organize Needed'],
-			['NO_SIDECAR', 'No Sidecar']
+			['NO_SIDECAR', 'No NFO']
 		] as [value, label] (value)}
 			<button class="rounded-lg px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {managedStatusFilter === value ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => setManagedStatusFilter(value as LibraryManagedFilter)}>{label}</button>
 		{/each}
@@ -1035,6 +1067,9 @@
 					{#each tvShowGroups as group (group.show)}
 						{@const showStatuses = group.items.map((item) => item.managed_status ?? 'UNPROCESSED')}
 						{@const showNeedsAttention = showStatuses.filter((status) => status === 'UNPROCESSED' || status === 'FAILED' || status === 'AWAITING_APPROVAL').length}
+						{@const showMissingMetadata = group.items.filter((item) => !item.has_selected_metadata && (item.managed_status ?? 'UNPROCESSED') !== 'KEPT_ORIGINAL' && (item.managed_status ?? 'UNPROCESSED') !== 'PROCESSED').length}
+						{@const showMissingNfo = group.items.filter((item) => !item.has_sidecar).length}
+						{@const showOrganizeNeeded = group.items.filter((item) => item.organize_needed).length}
 						<div class="border-b border-[color:rgba(123,105,81,0.14)]">
 							<button class="flex w-full items-center justify-between px-4 py-3 text-left hover:bg-[color:rgba(214,180,111,0.08)]" onclick={() => toggleShow(group.show)}>
 								<div>
@@ -1044,9 +1079,21 @@
 										{#if showNeedsAttention > 0}
 											<span class="status-chip failed">{showNeedsAttention} need attention</span>
 										{/if}
+										{#if showMissingMetadata > 0}
+											<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">{showMissingMetadata} need metadata</span>
+										{/if}
+										{#if showMissingNfo > 0}
+											<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">{showMissingNfo} missing nfo</span>
+										{/if}
+										{#if showOrganizeNeeded > 0}
+											<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">{showOrganizeNeeded} organize needed</span>
+										{/if}
 									</div>
 								</div>
-								<span class="text-[color:var(--ink-muted)]">{expandedShows.has(group.show) ? '▾' : '▸'}</span>
+								<div class="flex items-center gap-3">
+									<a href={showDetailHref(group.show, group.items[0])} class="rounded-md border border-[color:var(--line)] px-2.5 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)] no-underline" onclick={(event) => event.stopPropagation()}>Open show page</a>
+									<span class="text-[color:var(--ink-muted)]">{expandedShows.has(group.show) ? '▾' : '▸'}</span>
+								</div>
 							</button>
 							{#if expandedShows.has(group.show)}
 								<div class="bg-[color:rgba(244,236,223,0.5)]">
@@ -1057,9 +1104,16 @@
 												<span class="status-chip {statusTone(item.managed_status ?? 'UNPROCESSED')}">{statusLabel(item.managed_status ?? 'UNPROCESSED')}</span>
 												{#if !item.has_selected_metadata && (item.managed_status ?? 'UNPROCESSED') !== 'KEPT_ORIGINAL' && (item.managed_status ?? 'UNPROCESSED') !== 'PROCESSED'}
 													<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">needs metadata</span>
+												{:else if item.has_selected_metadata}
+													<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">metadata selected</span>
 												{/if}
 												{#if item.has_sidecar}
-													<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">sidecar</span>
+													<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">nfo</span>
+												{:else}
+													<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">missing nfo</span>
+												{/if}
+												{#if item.organize_needed}
+													<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">organize needed</span>
 												{/if}
 											</div>
 											<div class="mt-0.5 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
@@ -1116,12 +1170,16 @@
 										<span class="status-chip {statusTone(item.managed_status ?? 'UNPROCESSED')}">{statusLabel(item.managed_status ?? 'UNPROCESSED')}</span>
 										{#if !item.has_selected_metadata && (item.managed_status ?? 'UNPROCESSED') !== 'KEPT_ORIGINAL' && (item.managed_status ?? 'UNPROCESSED') !== 'PROCESSED'}
 											<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">needs metadata</span>
+										{:else if item.has_selected_metadata}
+											<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">metadata selected</span>
 										{/if}
 										{#if item.organize_needed}
 											<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">organize needed</span>
 										{/if}
 										{#if item.has_sidecar}
-											<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">sidecar</span>
+											<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">nfo</span>
+										{:else}
+											<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">missing nfo</span>
 										{/if}
 									</div>
 								</td>

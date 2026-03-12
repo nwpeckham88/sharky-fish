@@ -14,6 +14,8 @@ pub struct OrganizeRequest {
     pub season: Option<u32>,
     pub episode: Option<u32>,
     pub scope: Option<String>,
+    pub id_mode: Option<String>,
+    pub write_nfo: bool,
     pub merge_existing: bool,
 }
 
@@ -26,6 +28,8 @@ pub struct OrganizeResult {
     pub scope: String,
     pub target_exists: bool,
     pub conflict_path: Option<String>,
+    pub metadata_sidecar_path: Option<String>,
+    pub metadata_sidecar_written: bool,
 }
 
 pub async fn preview_or_apply(
@@ -48,21 +52,31 @@ pub async fn preview_or_apply(
         .map(|v| v.to_ascii_lowercase())
         .unwrap_or_default();
 
-    let target_relative = if library_folder.media_type == "tv" {
+    let id_mode = request.id_mode.as_deref().unwrap_or("none");
+
+    let episode_numbers = if library_folder.media_type == "tv" {
         let (season, episode) = infer_or_validate_episode_numbers(
             &current_relative_str,
             request.season,
             request.episode,
         )?;
+        Some((season, episode))
+    } else {
+        None
+    };
+
+    let target_relative = if library_folder.media_type == "tv" {
+        let (season, episode) = episode_numbers.context("season/episode missing for tv target")?;
         build_tv_target(
             &library_folder.path,
             &request.selected,
             season,
             episode,
             &extension,
+            id_mode,
         )
     } else {
-        build_movie_target(&library_folder.path, &request.selected, &extension)
+        build_movie_target(&library_folder.path, &request.selected, &extension, id_mode)
     };
 
     let target_relative = sanitize_relative_path(&target_relative)?;
@@ -75,7 +89,7 @@ pub async fn preview_or_apply(
                 .map(Path::to_path_buf)
                 .unwrap_or_else(PathBuf::new);
             let source_container_str = source_container.to_string_lossy().replace('\\', "/");
-            let target_container = movie_target_container(&library_folder.path, &request.selected);
+            let target_container = movie_target_container(&library_folder.path, &request.selected, id_mode);
             let target_container = sanitize_relative_path(&target_container)?;
             let target_container_str = target_container.to_string_lossy().replace('\\', "/");
             let target_container_abs = library_root.join(&target_container);
@@ -138,6 +152,25 @@ pub async fn preview_or_apply(
         }
     }
 
+    let metadata_sidecar_path = if request.write_nfo {
+        sidecar::metadata_sidecar_relative_path(&target_relative_str)
+    } else {
+        None
+    };
+    let mut metadata_sidecar_written = false;
+    if apply && request.write_nfo {
+        let (season, episode) = episode_numbers.map(|(s, e)| (Some(s), Some(e))).unwrap_or((None, None));
+        sidecar::write_jellyfin_nfo(
+            library_root,
+            &target_relative_str,
+            &request.selected,
+            season,
+            episode,
+        )
+        .await?;
+        metadata_sidecar_written = true;
+    }
+
     Ok(OrganizeResult {
         current_relative_path: current_relative_str,
         target_relative_path: target_relative_str,
@@ -146,11 +179,17 @@ pub async fn preview_or_apply(
         scope: scope.to_string(),
         target_exists,
         conflict_path,
+        metadata_sidecar_path,
+        metadata_sidecar_written,
     })
 }
 
-pub fn movie_target_container(library_prefix: &str, selected: &InternetMetadataMatch) -> String {
-    let title = sanitize_segment(&selected.title);
+pub fn movie_target_container(
+    library_prefix: &str,
+    selected: &InternetMetadataMatch,
+    id_mode: &str,
+) -> String {
+    let title = movie_title_segment(selected, id_mode);
     let year = selected
         .year
         .map(|value| value.to_string())
@@ -178,9 +217,9 @@ pub fn preview_target_relative_path(
     let target_relative = if library_folder.media_type == "tv" {
         let (season, episode) =
             infer_or_validate_episode_numbers(&current_relative_str, None, None)?;
-        build_tv_target(&library_folder.path, selected, season, episode, &extension)
+        build_tv_target(&library_folder.path, selected, season, episode, &extension, "none")
     } else {
-        build_movie_target(&library_folder.path, selected, &extension)
+        build_movie_target(&library_folder.path, selected, &extension, "none")
     };
 
     Ok(sanitize_relative_path(&target_relative)?
@@ -203,7 +242,7 @@ async fn apply_movie_folder_organization(
 
     let source_dir_relative = current_relative.parent().unwrap_or_else(|| Path::new(""));
     let source_dir_abs = library_root.join(source_dir_relative);
-    let target_dir_relative = PathBuf::from(movie_target_container(&library_folder.path, selected));
+    let target_dir_relative = PathBuf::from(movie_target_container(&library_folder.path, selected, "none"));
     let target_dir_abs = library_root.join(&target_dir_relative);
 
     let source_stem = current_relative
@@ -258,12 +297,22 @@ async fn rename_sidecar_for_file(
 ) -> Result<()> {
     let current_relative = current_relative.to_string_lossy().replace('\\', "/");
     let target_relative = target_relative.to_string_lossy().replace('\\', "/");
-    let Some(current_sidecar) = sidecar::sidecar_absolute_path(library_root, &current_relative)
-    else {
-        return Ok(());
-    };
-    let Some(target_sidecar) = sidecar::sidecar_absolute_path(library_root, &target_relative)
-    else {
+    rename_one_sidecar(
+        sidecar::sidecar_absolute_path(library_root, &current_relative),
+        sidecar::sidecar_absolute_path(library_root, &target_relative),
+    )
+    .await?;
+    rename_one_sidecar(
+        sidecar::metadata_sidecar_absolute_path(library_root, &current_relative),
+        sidecar::metadata_sidecar_absolute_path(library_root, &target_relative),
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn rename_one_sidecar(current: Option<PathBuf>, target: Option<PathBuf>) -> Result<()> {
+    let (Some(current_sidecar), Some(target_sidecar)) = (current, target) else {
         return Ok(());
     };
 
@@ -400,8 +449,9 @@ fn build_movie_target(
     library_prefix: &str,
     selected: &InternetMetadataMatch,
     extension: &str,
+    id_mode: &str,
 ) -> String {
-    let title = sanitize_segment(&selected.title);
+    let title = movie_title_segment(selected, id_mode);
     let year = selected
         .year
         .map(|v| v.to_string())
@@ -433,8 +483,9 @@ fn build_tv_target(
     season: u32,
     episode: u32,
     extension: &str,
+    id_mode: &str,
 ) -> String {
-    let show = sanitize_segment(&selected.title);
+    let show = tv_show_segment(selected, id_mode);
     let season_dir = format!("Season {:02}", season);
     let episode_name = format!("{} - S{:02}E{:02}", show, season, episode);
 
@@ -455,6 +506,34 @@ fn build_tv_target(
             episode_name,
             extension
         )
+    }
+}
+
+fn movie_title_segment(selected: &InternetMetadataMatch, id_mode: &str) -> String {
+    with_external_id(&selected.title, metadata_id_suffix(selected, id_mode))
+}
+
+fn tv_show_segment(selected: &InternetMetadataMatch, id_mode: &str) -> String {
+    with_external_id(&selected.title, metadata_id_suffix(selected, id_mode))
+}
+
+fn with_external_id(title: &str, suffix: Option<String>) -> String {
+    let base = sanitize_segment(title);
+    match suffix {
+        Some(suffix) => format!("{} {}", base, suffix),
+        None => base,
+    }
+}
+
+fn metadata_id_suffix(selected: &InternetMetadataMatch, id_mode: &str) -> Option<String> {
+    match id_mode {
+        "imdb" => selected
+            .imdb_id
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .map(|value| format!("[imdbid-{}]", sanitize_segment(value))),
+        "tvdb" => selected.tvdb_id.map(|value| format!("[tvdbid-{}]", value)),
+        _ => None,
     }
 }
 

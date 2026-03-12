@@ -111,7 +111,7 @@ pub async fn sync_library_file(
         .or_else(|| sidecar_doc.as_ref().and_then(|value| value.first_seen_at))
         .unwrap_or(now);
 
-    let sidecar_path = sidecar::sidecar_relative_path(relative_path);
+    let sidecar_path = sidecar::find_metadata_sidecar_relative_path(library_root, relative_path).await?;
 
     db::upsert_managed_item(
         pool,
