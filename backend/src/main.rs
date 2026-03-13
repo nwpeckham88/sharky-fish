@@ -24,10 +24,25 @@ use crate::metadata::prewarm_recent_library_metadata;
 use crate::server::{AppState, build_router};
 
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
-use tracing::info;
+use tracing::{info, warn};
+
+fn log_storage_path_guidance(cfg: &AppConfig) {
+    let ingest_path = Path::new(&cfg.ingest_path);
+    if !ingest_path.exists() {
+        warn!(
+            path = %ingest_path.display(),
+            "storage: configured downloads folder does not exist in this container; check your volume mount and settings"
+        );
+    }
+
+    info!(
+        downloads_path = %ingest_path.display(),
+        "storage: use this same in-container downloads path in qBittorrent, the *arr stack, and Sharky Fish for consistent imports and hardlinks"
+    );
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -42,6 +57,7 @@ async fn main() -> Result<()> {
     let config_path = std::env::var("SHARKY_CONFIG_PATH").unwrap_or_else(|_| "/config".into());
     let cfg = AppConfig::load(&config_path);
     info!(port = cfg.port, "sharky-fish starting");
+    log_storage_path_guidance(&cfg);
 
     // Initialize SQLite pool.
     let db_path = PathBuf::from(&cfg.config_path).join("sharky.db");
