@@ -40,6 +40,7 @@ pub async fn run_full_rescan(
     exclude_patterns: Vec<String>,
     scan_concurrency: usize,
     scan_queue_capacity: usize,
+    compute_checksums: bool,
     sse_tx: broadcast::Sender<SseEvent>,
 ) -> Result<bool> {
     let started_at = unix_now();
@@ -48,6 +49,7 @@ pub async fn run_full_rescan(
         libraries = libraries.len(),
         concurrency = scan_concurrency,
         queue_capacity = scan_queue_capacity,
+        compute_checksums,
         "library scan: attempting to start"
     );
     if !db::try_begin_library_scan(&pool, started_at).await? {
@@ -205,17 +207,22 @@ pub async fn run_full_rescan(
                 let pool = pool.clone();
                 let library_root = scan_library_root.clone();
                 async move {
-                    let checksum_start = Instant::now();
-                    let checksum_blake3 =
-                        filesystem_audit::blake3_checksum(Path::new(&candidate.file_path)).await?;
-                    let checksum_elapsed = checksum_start.elapsed();
-                    if checksum_elapsed.as_secs() >= 2 {
-                        warn!(
-                            path = %candidate.file_path,
-                            secs = checksum_elapsed.as_secs(),
-                            "library scan: slow checksum (large file or slow storage?)"
-                        );
-                    }
+                    let checksum_blake3 = if compute_checksums {
+                        let checksum_start = Instant::now();
+                        let hash =
+                            filesystem_audit::blake3_checksum(Path::new(&candidate.file_path)).await?;
+                        let checksum_elapsed = checksum_start.elapsed();
+                        if checksum_elapsed.as_secs() >= 2 {
+                            warn!(
+                                path = %candidate.file_path,
+                                secs = checksum_elapsed.as_secs(),
+                                "library scan: slow checksum (large file or slow storage?)"
+                            );
+                        }
+                        Some(hash)
+                    } else {
+                        None
+                    };
 
                     db::upsert_library_index_entry(
                         &pool,
@@ -229,7 +236,7 @@ pub async fn run_full_rescan(
                         candidate.device_id,
                         candidate.inode,
                         candidate.link_count,
-                        Some(&checksum_blake3),
+                        checksum_blake3.as_deref(),
                         candidate.library_id.as_deref(),
                     )
                     .await?;
@@ -363,6 +370,7 @@ pub async fn apply_library_path_change(
     exclude_patterns: &[String],
     path: &Path,
     change: &str,
+    compute_checksums: bool,
 ) -> Result<()> {
     let relative_path = relative_path_string(library_root, path);
     debug!(path = %path.display(), change, "library index: applying path change");
@@ -372,7 +380,7 @@ pub async fn apply_library_path_change(
     }
 
     if is_metadata_sidecar_path(path) {
-        refresh_media_for_metadata_sidecar(pool, library_root, libraries, path).await?;
+        refresh_media_for_metadata_sidecar(pool, library_root, libraries, path, compute_checksums).await?;
         return Ok(());
     }
 
@@ -416,7 +424,11 @@ pub async fn apply_library_path_change(
         .unwrap_or_default()
         .to_ascii_lowercase();
     let facts = filesystem_audit::file_system_facts(&metadata);
-    let checksum_blake3 = filesystem_audit::blake3_checksum(path).await?;
+    let checksum_blake3 = if compute_checksums {
+        Some(filesystem_audit::blake3_checksum(path).await?)
+    } else {
+        None
+    };
 
     let library_id = match_library_id(&relative_path, libraries);
     db::upsert_library_index_entry(
@@ -431,7 +443,7 @@ pub async fn apply_library_path_change(
         facts.device_id,
         facts.inode,
         facts.link_count,
-        Some(&checksum_blake3),
+        checksum_blake3.as_deref(),
         library_id.as_deref(),
     )
     .await?;
@@ -459,6 +471,7 @@ async fn refresh_media_for_metadata_sidecar(
     library_root: &Path,
     libraries: &[LibraryFolder],
     sidecar_path: &Path,
+    compute_checksums: bool,
 ) -> Result<()> {
     let Some(parent) = sidecar_path.parent() else {
         return Ok(());
@@ -506,7 +519,11 @@ async fn refresh_media_for_metadata_sidecar(
             .map(|value| value.as_secs())
             .unwrap_or(0);
         let facts = filesystem_audit::file_system_facts(&metadata);
-        let checksum_blake3 = filesystem_audit::blake3_checksum(&candidate).await?;
+        let checksum_blake3 = if compute_checksums {
+            Some(filesystem_audit::blake3_checksum(&candidate).await?)
+        } else {
+            None
+        };
         let library_id = match_library_id(&relative_path, libraries);
 
         db::upsert_library_index_entry(
@@ -521,7 +538,7 @@ async fn refresh_media_for_metadata_sidecar(
             facts.device_id,
             facts.inode,
             facts.link_count,
-            Some(&checksum_blake3),
+            checksum_blake3.as_deref(),
             library_id.as_deref(),
         )
         .await?;

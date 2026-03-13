@@ -139,6 +139,7 @@ async fn main() -> Result<()> {
         let exclude_patterns = cfg.scan_exclude_patterns.clone();
         let scan_concurrency = cfg.scan_concurrency;
         let scan_queue_capacity = cfg.scan_queue_capacity;
+        let compute_checksums = cfg.scan_compute_checksums;
         let sse_tx = sse_tx.clone();
         tokio::spawn(async move {
             let result = library_index::run_full_rescan(
@@ -148,6 +149,7 @@ async fn main() -> Result<()> {
                 exclude_patterns,
                 scan_concurrency,
                 scan_queue_capacity,
+                compute_checksums,
                 sse_tx,
             )
             .await;

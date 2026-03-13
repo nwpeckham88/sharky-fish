@@ -749,6 +749,13 @@ ${normalizedContext}`;
 						<input type="number" bind:value={config.metadata_prewarm_limit} min="0" max="5000" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]" />
 						<span class="mt-1 block text-xs text-[color:var(--ink-muted)]">Number of recent items to probe on startup</span>
 					</label>
+					<label class="flex items-start gap-3">
+						<input type="checkbox" bind:checked={config.scan_compute_checksums} class="mt-1 rounded border-[color:var(--line)] accent-[color:var(--accent)]" />
+						<span>
+							<span class="block text-sm font-semibold text-[color:var(--ink-strong)]">Compute checksums during scan</span>
+							<span class="block text-xs text-[color:var(--ink-muted)]">Hashes every library file with BLAKE3 to enable duplicate detection in the Downloads view. Can add several minutes to scans on large NAS libraries. Off by default.</span>
+						</span>
+					</label>
 				</div>
 			</div>
 

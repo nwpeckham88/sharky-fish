@@ -131,9 +131,9 @@ impl WatcherActor {
             }
 
             if is_media_file(&path) && path.starts_with(&self.library_path) {
-                let (libraries, exclude_patterns) = {
+                let (libraries, exclude_patterns, compute_checksums) = {
                     let cfg = self.config.read().await;
-                    (cfg.libraries.clone(), cfg.scan_exclude_patterns.clone())
+                    (cfg.libraries.clone(), cfg.scan_exclude_patterns.clone(), cfg.scan_compute_checksums)
                 };
 
                 if let Err(error) = library_index::apply_library_path_change(
@@ -143,6 +143,7 @@ impl WatcherActor {
                     &exclude_patterns,
                     &path,
                     change,
+                    compute_checksums,
                 )
                 .await
                 {

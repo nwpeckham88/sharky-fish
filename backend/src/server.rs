@@ -1425,13 +1425,14 @@ async fn trigger_library_rescan(State(state): State<Arc<AppState>>) -> impl Into
         }
     }
 
-    let (libraries, exclude_patterns, scan_concurrency, scan_queue_capacity) = {
+    let (libraries, exclude_patterns, scan_concurrency, scan_queue_capacity, compute_checksums) = {
         let cfg = state.config.read().await;
         (
             cfg.libraries.clone(),
             cfg.scan_exclude_patterns.clone(),
             cfg.scan_concurrency,
             cfg.scan_queue_capacity,
+            cfg.scan_compute_checksums,
         )
     };
 
@@ -1447,6 +1448,7 @@ async fn trigger_library_rescan(State(state): State<Arc<AppState>>) -> impl Into
             exclude_patterns,
             scan_concurrency,
             scan_queue_capacity,
+            compute_checksums,
             sse_tx,
         )
         .await

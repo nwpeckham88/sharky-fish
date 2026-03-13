@@ -53,6 +53,11 @@ pub struct AppConfig {
     /// Internet metadata providers (OMDb/TVDB) used for title enrichment.
     #[serde(default)]
     pub internet_metadata: InternetMetadataConfig,
+    /// Whether to compute blake3 checksums for every library file during scanning.
+    /// Enables checksum-duplicate detection in the Downloads view but can add
+    /// several minutes to scans on large NAS libraries. Defaults to false.
+    #[serde(default)]
+    pub scan_compute_checksums: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,6 +268,7 @@ impl Default for AppConfig {
             auto_approve_ai_jobs: true,
             libraries: Vec::new(),
             internet_metadata: InternetMetadataConfig::default(),
+            scan_compute_checksums: false,
         }
     }
 }

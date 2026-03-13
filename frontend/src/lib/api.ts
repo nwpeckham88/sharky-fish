@@ -469,6 +469,7 @@ export interface AppConfig {
 	auto_approve_ai_jobs: boolean;
 	libraries: LibraryFolder[];
 	internet_metadata: InternetMetadataConfig;
+	scan_compute_checksums: boolean;
 }
 
 export interface ImprovePromptRequest {
