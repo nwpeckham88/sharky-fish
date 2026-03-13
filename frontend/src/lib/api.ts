@@ -308,6 +308,7 @@ export interface InternetMetadataProviderStatus {
 	provider: string;
 	attempted: boolean;
 	match_count: number;
+	top_match_title?: string | null;
 	warning: string | null;
 }
 

@@ -39,6 +39,7 @@ pub struct InternetMetadataProviderStatus {
     pub provider: String,
     pub attempted: bool,
     pub match_count: usize,
+    pub top_match_title: Option<String>,
     pub warning: Option<String>,
 }
 
@@ -155,12 +156,19 @@ pub async fn lookup_for_library_path_with_query(
                         .await
                         {
                             Ok(found) if !found.is_empty() => {
-                                provider_matches = found;
-                                break;
+                                provider_matches.extend(found);
                             }
                             Ok(_) => {}
                             Err(error) => provider_warning = Some(error.to_string()),
                         }
+                    }
+                    if !provider_matches.is_empty() {
+                        dedupe_matches(&mut provider_matches);
+                        rank_tmdb_matches(
+                            &mut provider_matches,
+                            search_candidates.first(),
+                            media_hint.as_deref(),
+                        );
                     }
                     if let Some(warning) = provider_warning.clone() {
                         warnings.push(format!("TMDb lookup failed: {}", warning));
@@ -169,6 +177,13 @@ pub async fn lookup_for_library_path_with_query(
                         provider: "tmdb".into(),
                         attempted: true,
                         match_count: provider_matches.len(),
+                        top_match_title: provider_matches.first().map(|item| {
+                            if let Some(year) = item.year {
+                                format!("{} ({year})", item.title)
+                            } else {
+                                item.title.clone()
+                            }
+                        }),
                         warning: provider_warning,
                     });
                     matches.extend(provider_matches);
@@ -203,6 +218,13 @@ pub async fn lookup_for_library_path_with_query(
                         provider: "omdb".into(),
                         attempted: true,
                         match_count: provider_matches.len(),
+                        top_match_title: provider_matches.first().map(|item| {
+                            if let Some(year) = item.year {
+                                format!("{} ({year})", item.title)
+                            } else {
+                                item.title.clone()
+                            }
+                        }),
                         warning: provider_warning,
                     });
                     matches.extend(provider_matches);
@@ -237,6 +259,13 @@ pub async fn lookup_for_library_path_with_query(
                         provider: "tvdb".into(),
                         attempted: true,
                         match_count: provider_matches.len(),
+                        top_match_title: provider_matches.first().map(|item| {
+                            if let Some(year) = item.year {
+                                format!("{} ({year})", item.title)
+                            } else {
+                                item.title.clone()
+                            }
+                        }),
                         warning: provider_warning,
                     });
                     matches.extend(provider_matches);
@@ -597,19 +626,14 @@ async fn lookup_tmdb(
     media_hint: Option<&str>,
 ) -> Result<Vec<InternetMetadataMatch>> {
     let kind = if media_hint == Some("series") { "tv" } else { "movie" };
-    let search_url = format!("https://api.themoviedb.org/3/search/{kind}");
-    let mut request = client.get(search_url).query(&[
-        ("api_key", api_key),
-        ("query", query),
-        ("include_adult", "false"),
-    ]);
+    let mut payload = tmdb_search(client, api_key, kind, query, year).await?;
 
-    if let Some(value) = year {
-        request = request.query(&[(if kind == "tv" { "first_air_date_year" } else { "year" }, &value.to_string())]);
+    // Some releases are tagged with the wrong year in file names; fall back to
+    // unscoped search when strict year filtering yields no results.
+    if payload.results.as_ref().is_none_or(|results| results.is_empty()) && year.is_some() {
+        payload = tmdb_search(client, api_key, kind, query, None).await?;
     }
 
-    let response = request.send().await?.error_for_status()?;
-    let payload = response.json::<TmdbSearchResponse>().await?;
     let mut matches = Vec::new();
 
     for item in payload.results.unwrap_or_default().into_iter().take(5) {
@@ -685,6 +709,106 @@ async fn lookup_tmdb(
     }
 
     Ok(matches)
+}
+
+async fn tmdb_search(
+    client: &Client,
+    api_key: &str,
+    kind: &str,
+    query: &str,
+    year: Option<u16>,
+) -> Result<TmdbSearchResponse> {
+    let search_url = format!("https://api.themoviedb.org/3/search/{kind}");
+    let mut request = client.get(search_url).query(&[
+        ("api_key", api_key),
+        ("query", query),
+        ("include_adult", "false"),
+    ]);
+
+    if let Some(value) = year {
+        request = request.query(&[(
+            if kind == "tv" {
+                "first_air_date_year"
+            } else {
+                "year"
+            },
+            &value.to_string(),
+        )]);
+    }
+
+    let response = request.send().await?.error_for_status()?;
+    Ok(response.json::<TmdbSearchResponse>().await?)
+}
+
+fn rank_tmdb_matches(
+    matches: &mut [InternetMetadataMatch],
+    primary_candidate: Option<&SearchCandidate>,
+    media_hint: Option<&str>,
+) {
+    let Some(candidate) = primary_candidate else {
+        return;
+    };
+
+    let normalized_query = candidate.query.to_ascii_lowercase();
+    let query_tokens = tokenize_for_match_score(&normalized_query);
+
+    matches.sort_by(|left, right| {
+        let left_score = tmdb_match_score(left, &normalized_query, &query_tokens, candidate.parsed_year, media_hint);
+        let right_score = tmdb_match_score(right, &normalized_query, &query_tokens, candidate.parsed_year, media_hint);
+
+        right_score
+            .cmp(&left_score)
+            .then_with(|| left.title.len().cmp(&right.title.len()))
+    });
+}
+
+fn tmdb_match_score(
+    item: &InternetMetadataMatch,
+    normalized_query: &str,
+    query_tokens: &[String],
+    parsed_year: Option<u16>,
+    media_hint: Option<&str>,
+) -> i32 {
+    let normalized_title = item.title.to_ascii_lowercase();
+    let title_tokens = tokenize_for_match_score(&normalized_title);
+    let overlap = query_tokens
+        .iter()
+        .filter(|token| title_tokens.iter().any(|candidate| candidate == *token))
+        .count() as i32;
+
+    let mut score = overlap * 10;
+
+    if normalized_title == normalized_query {
+        score += 120;
+    } else if normalized_title.starts_with(normalized_query) {
+        score += 60;
+    }
+
+    if let Some(year) = parsed_year {
+        if item.year == Some(year) {
+            score += 30;
+        }
+    }
+
+    if media_hint == Some("series") {
+        if item.media_kind == "series" {
+            score += 25;
+        }
+        if normalized_title.contains("season") {
+            score -= 20;
+        }
+    }
+
+    score
+}
+
+fn tokenize_for_match_score(input: &str) -> Vec<String> {
+    input
+        .split_whitespace()
+        .map(str::trim)
+        .filter(|value| value.len() >= 2)
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
 }
 
 #[derive(Debug, Deserialize)]

@@ -3,6 +3,7 @@ use crate::config::QbittorrentConfig;
 use anyhow::{Context, Result};
 use reqwest::header::{COOKIE, SET_COOKIE};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct QbittorrentTransferInfo {
@@ -275,4 +276,67 @@ pub async fn test_connection(cfg: &QbittorrentConfig) -> Result<String> {
     } else {
         Ok(format!("Connected to qBittorrent {version} at {base_url}"))
     }
+}
+
+fn normalize_path_for_compare(input: &str) -> String {
+    input.replace('\\', "/").trim_end_matches('/').to_string()
+}
+
+fn path_matches(base: &str, target: &str) -> bool {
+    if base.is_empty() {
+        return false;
+    }
+    target == base || target.starts_with(&format!("{base}/"))
+}
+
+fn torrent_is_actively_downloading(torrent: &QbittorrentTorrent) -> bool {
+    if torrent.progress < 0.999 {
+        return true;
+    }
+
+    let state = torrent.state.to_ascii_lowercase();
+    state.contains("down")
+        || state.contains("meta")
+        || state.contains("check")
+        || state.contains("stalled")
+        || state.contains("queued")
+        || state.contains("alloc")
+        || state.contains("move")
+}
+
+pub fn path_is_in_active_torrent(status: &QbittorrentStatus, path: &Path) -> bool {
+    if !status.connected {
+        return false;
+    }
+
+    let target = normalize_path_for_compare(&path.to_string_lossy());
+    if target.is_empty() {
+        return false;
+    }
+
+    status.torrents.iter().any(|torrent| {
+        if !torrent_is_actively_downloading(torrent) {
+            return false;
+        }
+
+        let content = normalize_path_for_compare(&torrent.content_path);
+        let save = normalize_path_for_compare(&torrent.save_path);
+        path_matches(&content, &target) || path_matches(&save, &target)
+    })
+}
+
+pub async fn path_is_actively_downloading(cfg: &QbittorrentConfig, path: &Path) -> Result<bool> {
+    if !cfg.enabled {
+        return Ok(false);
+    }
+
+    let status = fetch_status(cfg).await;
+    if !status.connected {
+        if let Some(error) = status.error {
+            anyhow::bail!("qBittorrent unavailable: {error}");
+        }
+        anyhow::bail!("qBittorrent unavailable");
+    }
+
+    Ok(path_is_in_active_torrent(&status, path))
 }

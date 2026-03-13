@@ -109,7 +109,12 @@ async fn main() -> Result<()> {
         }
     });
 
-    let identifier = IdentifierActor::new(ingest_rx, identified_tx, io_semaphore.clone());
+    let identifier = IdentifierActor::new(
+        ingest_rx,
+        identified_tx,
+        io_semaphore.clone(),
+        shared_config.clone(),
+    );
     tokio::spawn(async move {
         if let Err(e) = identifier.run().await {
             tracing::error!(err = %e, "identifier actor crashed");

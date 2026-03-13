@@ -5,6 +5,7 @@
 		fetchLibrary,
 		fetchLibraries,
 		fetchLibraryInternetMetadata,
+		searchLibraryInternetMetadata,
 		fetchSelectedLibraryInternetMetadata,
 		saveSelectedLibraryInternetMetadata,
 		organizeLibraryFile,
@@ -23,6 +24,7 @@
 	let metadataResults = $state<InternetMetadataResponse | null>(null);
 	let metadataLoading = $state(false);
 	let metadataError = $state('');
+	let metadataQueryOverride = $state('');
 	let chosenMatch = $state<InternetMetadataMatch | null>(null);
 	let season = $state<number | null>(null);
 	let episode = $state<number | null>(null);
@@ -107,6 +109,7 @@
 		actionError = '';
 		actionWarning = '';
 		status = '';
+		metadataQueryOverride = '';
 		season = null;
 		episode = null;
 		idMode = item.library_id === activeLibraryId && activeLibrary()?.media_type === 'tv' ? 'tvdb' : 'none';
@@ -136,7 +139,9 @@
 		metadataLoading = true;
 		metadataError = '';
 		try {
-			metadataResults = await fetchLibraryInternetMetadata(selected.relative_path);
+			metadataResults = metadataQueryOverride.trim()
+				? await searchLibraryInternetMetadata(selected.relative_path, metadataQueryOverride.trim())
+				: await fetchLibraryInternetMetadata(selected.relative_path);
 		} catch (error) {
 			metadataError = error instanceof Error ? error.message : 'Failed metadata lookup';
 		} finally {
@@ -318,11 +323,61 @@
 						</button>
 					</div>
 
+					<div class="grid gap-2">
+						<label class="text-xs text-[color:var(--ink-muted)]" for="organize-metadata-override">Custom metadata search</label>
+						<div class="flex flex-wrap gap-2">
+							<input
+								id="organize-metadata-override"
+								class="min-w-[14rem] flex-1 rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-sm text-[color:var(--ink-strong)]"
+								type="search"
+								bind:value={metadataQueryOverride}
+								placeholder="e.g. The Pitt 2025"
+								onkeydown={(event) => {
+									if (event.key === 'Enter') {
+										event.preventDefault();
+										void lookupMetadata();
+									}
+								}}
+							/>
+							<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={lookupMetadata} disabled={metadataLoading || !metadataQueryOverride.trim()}>
+								Search Override
+							</button>
+							{#if metadataQueryOverride.trim()}
+								<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)]" onclick={() => { metadataQueryOverride = ''; void lookupMetadata(); }}>
+									Clear Override
+								</button>
+							{/if}
+						</div>
+					</div>
+
 					{#if metadataError}
 						<div class="rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{metadataError}</div>
 					{/if}
 
 					{#if metadataResults}
+						{#if metadataResults.search_candidates.length > 0}
+							<div class="rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.45)] px-3 py-2 text-[11px] text-[color:var(--ink-muted)]">
+								Search candidates: <span class="font-semibold text-[color:var(--ink-strong)]">{metadataResults.search_candidates.join(' -> ')}</span>
+							</div>
+						{/if}
+						{#if metadataResults.providers.length > 0}
+							<div class="grid gap-2 sm:grid-cols-2">
+								{#each metadataResults.providers as provider (provider.provider)}
+									<div class="rounded-lg border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.45)] px-3 py-2 text-[11px] text-[color:var(--ink-muted)]">
+										<div class="flex items-center justify-between gap-2">
+											<span class="font-semibold uppercase tracking-[0.12em] text-[color:var(--ink-strong)]">{provider.provider}</span>
+											<span>{provider.match_count} match{provider.match_count === 1 ? '' : 'es'}</span>
+										</div>
+										{#if provider.top_match_title}
+											<div class="mt-1">Top ranked: <span class="font-semibold text-[color:var(--ink-strong)]">{provider.top_match_title}</span></div>
+										{/if}
+										{#if provider.warning}
+											<div class="mt-1 text-[color:var(--danger)]">{provider.warning}</div>
+										{/if}
+									</div>
+								{/each}
+							</div>
+						{/if}
 						{#if metadataResults.provider_used}
 							<div class="text-[11px] text-[color:var(--ink-muted)]">Searched: <span class="font-semibold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]">{metadataResults.provider_used}</span></div>
 						{/if}
