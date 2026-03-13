@@ -82,6 +82,34 @@
 	const hasLibraries = $derived(libraries.length > 0);
 	const scanRunning = $derived(scanStatus.status === 'running');
 	const showFirstRunChecklist = $derived(!hasLibraries || scanRunning || librarySummary.total_items === 0);
+	const currentQueuePressure = $derived(
+		reviewItemCount + executionCounts.approved + executionCounts.processing
+	);
+	const suggestedReviewBatchSize = $derived.by(() => {
+		let size = 25;
+
+		if (librarySummary.total_items >= 100000) {
+			size = 200;
+		} else if (librarySummary.total_items >= 50000) {
+			size = 150;
+		} else if (librarySummary.total_items >= 20000) {
+			size = 100;
+		} else if (librarySummary.total_items >= 5000) {
+			size = 50;
+		}
+
+		if (currentQueuePressure >= 200) {
+			size = Math.min(size, 10);
+		} else if (currentQueuePressure >= 100) {
+			size = Math.min(size, 20);
+		} else if (currentQueuePressure >= 40) {
+			size = Math.min(size, 35);
+		} else if (currentQueuePressure >= 15) {
+			size = Math.min(size, 50);
+		}
+
+		return Math.max(10, Math.min(size, 200));
+	});
 
 	onMount(async () => {
 		await Promise.all([
@@ -152,14 +180,15 @@
 		shortcutStatus = '';
 		shortcutError = '';
 		try {
-			const unprocessed = await fetchBacklogItems('unprocessed', 200);
+			const fetchLimit = Math.min(Math.max(suggestedReviewBatchSize * 3, 200), 500);
+			const unprocessed = await fetchBacklogItems('unprocessed', fetchLimit);
 			const paths = Array.from(
 				new Set(
 					unprocessed
 						.flatMap((item) => item.group_kind === 'tv_show' ? item.member_paths : [item.relative_path])
 						.filter((path) => path.trim().length > 0)
 				)
-			).slice(0, 25);
+			).slice(0, suggestedReviewBatchSize);
 
 			if (paths.length === 0) {
 				shortcutStatus = 'No unprocessed items are available for an initial review batch.';
@@ -178,8 +207,8 @@
 			]);
 
 			shortcutStatus = response.failure_count === 0
-				? `Created ${response.success_count} review job(s) and opened Review.`
-				: `Created ${response.success_count} review job(s); ${response.failure_count} need follow-up. Opening Review.`;
+				? `Created ${response.success_count} review job(s) using the suggested batch size of ${suggestedReviewBatchSize} and opened Review.`
+				: `Created ${response.success_count} review job(s) from the suggested batch size of ${suggestedReviewBatchSize}; ${response.failure_count} need follow-up. Opening Review.`;
 
 			await goto('/intake');
 		} catch (error) {
@@ -561,9 +590,9 @@
 		if (managedItemStore.summary.unprocessed_count > 0) {
 			actions.push({
 				title: 'Launch the first review batch',
-				detail: 'Create up to 25 AI review jobs from the unprocessed queue and move straight into Review.',
+				detail: `Create a suggested batch of about ${suggestedReviewBatchSize} review jobs from the unprocessed queue. The batch grows with library size and shrinks when Review or Execution is already busy.`,
 				action: 'review_batch',
-				cta: 'Start review batch'
+				cta: `Start ${suggestedReviewBatchSize}-item batch`
 			});
 		}
 

@@ -189,11 +189,20 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             rating          REAL,
             genres_json     TEXT NOT NULL,
             poster_url      TEXT,
+            backdrop_url    TEXT,
             source_url      TEXT,
             updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
     )
     .execute(pool)
+    .await?;
+
+    ensure_column(
+        pool,
+        "selected_internet_metadata",
+        "backdrop_url",
+        "TEXT",
+    )
     .await?;
 
     sqlx::query(
@@ -437,6 +446,7 @@ pub struct SelectedInternetMetadataRow {
     pub rating: Option<f64>,
     pub genres_json: String,
     pub poster_url: Option<String>,
+    pub backdrop_url: Option<String>,
     pub source_url: Option<String>,
     pub updated_at: String,
 }
@@ -1060,8 +1070,8 @@ pub async fn upsert_selected_internet_metadata(
     sqlx::query(
         "INSERT INTO selected_internet_metadata (
             relative_path, provider, title, year, media_kind, imdb_id, tvdb_id, overview,
-            rating, genres_json, poster_url, source_url, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                rating, genres_json, poster_url, backdrop_url, source_url, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
          ON CONFLICT(relative_path) DO UPDATE SET
             provider = excluded.provider,
             title = excluded.title,
@@ -1073,6 +1083,7 @@ pub async fn upsert_selected_internet_metadata(
             rating = excluded.rating,
             genres_json = excluded.genres_json,
             poster_url = excluded.poster_url,
+                backdrop_url = excluded.backdrop_url,
             source_url = excluded.source_url,
             updated_at = CURRENT_TIMESTAMP",
     )
@@ -1087,6 +1098,7 @@ pub async fn upsert_selected_internet_metadata(
     .bind(selected.rating)
     .bind(genres_json)
     .bind(&selected.poster_url)
+    .bind(&selected.backdrop_url)
     .bind(&selected.source_url)
     .execute(pool)
     .await?;
@@ -1100,7 +1112,7 @@ pub async fn fetch_selected_internet_metadata(
 ) -> Result<Option<SelectedInternetMetadataRow>> {
     let row = sqlx::query_as::<_, SelectedInternetMetadataRow>(
         "SELECT relative_path, provider, title, year, media_kind, imdb_id, tvdb_id, overview,
-                rating, genres_json, poster_url, source_url, updated_at
+                rating, genres_json, poster_url, backdrop_url, source_url, updated_at
          FROM selected_internet_metadata
          WHERE relative_path = ?",
     )

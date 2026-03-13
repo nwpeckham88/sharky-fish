@@ -278,6 +278,7 @@ ${normalizedContext}`;
 	const GEMINI_DEFAULT_MODEL = 'gemini-3.1-flash-lite-preview';
 
 	const METADATA_PROVIDERS = [
+		{ value: 'tmdb', label: 'TMDb (Jellyfin default for movies and shows)' },
 		{ value: 'omdb', label: 'OMDb (IMDb-backed)' },
 		{ value: 'tvdb', label: 'TVDB' }
 	] as const;
@@ -791,7 +792,14 @@ ${normalizedContext}`;
 			<!-- Internet Metadata Providers -->
 			<div class="rounded-[1rem] border border-[color:var(--line)] p-5">
 				<h3 class="section-label mb-4">Internet Metadata</h3>
+				<p class="mb-4 text-xs leading-5 text-[color:var(--ink-muted)]">
+					Sharky Fish is tuned for Jellyfin. TMDb should usually be your primary provider for movie and TV libraries, with OMDb and TVDB acting as fallback sources when you want broader coverage.
+				</p>
 				<div class="space-y-4">
+					<label class="block">
+						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">TMDb API Key <span class="font-normal">(recommended)</span></span>
+						<input type="password" value={config.internet_metadata.tmdb_api_key ?? ''} oninput={(e) => { if (config) config.internet_metadata.tmdb_api_key = (e.target as HTMLInputElement).value || null; }} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
+					</label>
 					<label class="block">
 						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">OMDb API Key <span class="font-normal">(IMDb-backed)</span></span>
 						<input type="password" value={config.internet_metadata.omdb_api_key ?? ''} oninput={(e) => { if (config) config.internet_metadata.omdb_api_key = (e.target as HTMLInputElement).value || null; }} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
@@ -811,13 +819,13 @@ ${normalizedContext}`;
 								<option {value}>{label}</option>
 							{/each}
 						</select>
-						<span class="mt-1 block text-xs text-[color:var(--ink-muted)]">If both API keys are configured, only this provider will be queried by default.</span>
+						<span class="mt-1 block text-xs text-[color:var(--ink-muted)]">Sharky Fish queries configured providers in order, starting with this one and falling back when a search comes back empty.</span>
 					</label>
 					<label class="block">
 						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">User Agent</span>
 						<input type="text" bind:value={config.internet_metadata.user_agent} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
 					</label>
-					<p class="text-xs text-[color:var(--ink-muted)]">Lookup behavior: one configured API key = only that provider searched. Both configured = only default provider searched.</p>
+					<p class="text-xs text-[color:var(--ink-muted)]">Recommended Jellyfin setup: configure TMDb first for movies and shows, then add OMDb or TVDB if you want fallback IDs and alternate match coverage.</p>
 				</div>
 			</div>
 

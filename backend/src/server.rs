@@ -387,6 +387,7 @@ struct OrganizeLibraryFileRequest {
     scope: Option<String>,
     id_mode: Option<String>,
     write_nfo: Option<bool>,
+    write_artwork: Option<bool>,
     merge_existing: Option<bool>,
     apply: Option<bool>,
 }
@@ -1006,6 +1007,7 @@ async fn apply_review_mode(
             scope: Some(proposal.organization.scope.clone()),
             id_mode: Some("none".into()),
             write_nfo: true,
+            write_artwork: false,
             merge_existing: false,
         },
         true,
@@ -1069,6 +1071,7 @@ fn internet_metadata_match_from_row(
         rating: row.rating,
         genres,
         poster_url: row.poster_url,
+        backdrop_url: row.backdrop_url,
         source_url: row.source_url,
     }
 }
@@ -1667,6 +1670,7 @@ async fn list_library_duplicates(
                 rating: None,
                 genres: Vec::new(),
                 poster_url: None,
+                backdrop_url: None,
                 source_url: None,
             };
 
@@ -1946,6 +1950,7 @@ async fn get_selected_library_internet_metadata(
         rating: row.rating,
         genres,
         poster_url: row.poster_url,
+        backdrop_url: row.backdrop_url,
         source_url: row.source_url,
     };
 
@@ -1997,6 +2002,7 @@ async fn organize_library_file(
             rating: row.rating,
             genres,
             poster_url: row.poster_url,
+            backdrop_url: row.backdrop_url,
             source_url: row.source_url,
         }
     };
@@ -2019,6 +2025,7 @@ async fn organize_library_file(
             scope: request.scope,
             id_mode: request.id_mode,
             write_nfo: request.write_nfo.unwrap_or(true),
+            write_artwork: request.write_artwork.unwrap_or(false),
             merge_existing: request.merge_existing.unwrap_or(false),
         },
         apply,

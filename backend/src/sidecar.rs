@@ -2,11 +2,19 @@ use crate::internet_metadata::InternetMetadataMatch;
 use crate::messages::ProcessingDecision;
 
 use anyhow::Result;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 const INTERNAL_SIDECAR_SUFFIX: &str = ".sharky.json";
 const JELLYFIN_METADATA_SUFFIX: &str = ".nfo";
+const MAX_ARTWORK_BYTES: usize = 15 * 1024 * 1024;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtworkWriteResult {
+    pub files: Vec<String>,
+    pub warnings: Vec<String>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SidecarDecision {
@@ -156,6 +164,85 @@ pub async fn write_jellyfin_nfo(
     Ok(metadata_sidecar_relative_path(relative_path))
 }
 
+pub fn planned_jellyfin_artwork_relative_paths(
+    relative_path: &str,
+    media_kind: &str,
+    poster_url: Option<&str>,
+    backdrop_url: Option<&str>,
+) -> Vec<String> {
+    let Some(target_dir) = jellyfin_artwork_target_dir(relative_path, media_kind) else {
+        return Vec::new();
+    };
+
+    let mut paths = Vec::new();
+    if let Some(url) = poster_url {
+        let file_name = artwork_file_name("poster", url);
+        paths.push(join_relative_dir_file(&target_dir, &file_name));
+    }
+    if let Some(url) = backdrop_url {
+        let file_name = artwork_file_name("backdrop", url);
+        paths.push(join_relative_dir_file(&target_dir, &file_name));
+    }
+    paths
+}
+
+pub async fn write_jellyfin_artwork(
+    library_root: &Path,
+    relative_path: &str,
+    media_kind: &str,
+    poster_url: Option<&str>,
+    backdrop_url: Option<&str>,
+) -> Result<ArtworkWriteResult> {
+    let Some(target_dir_rel) = jellyfin_artwork_target_dir(relative_path, media_kind) else {
+        return Ok(ArtworkWriteResult {
+            files: Vec::new(),
+            warnings: vec!["Unable to determine artwork container for this media path.".into()],
+        });
+    };
+
+    let target_dir_abs = if target_dir_rel.is_empty() {
+        library_root.to_path_buf()
+    } else {
+        library_root.join(&target_dir_rel)
+    };
+    tokio::fs::create_dir_all(&target_dir_abs).await?;
+
+    let client = Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()?;
+
+    let mut files = Vec::new();
+    let mut warnings = Vec::new();
+
+    if let Some(url) = poster_url.filter(|value| !value.trim().is_empty()) {
+        let file_name = artwork_file_name("poster", url);
+        let target_abs = target_dir_abs.join(&file_name);
+        let target_rel = join_relative_dir_file(&target_dir_rel, &file_name);
+        match download_binary(&client, url).await {
+            Ok(bytes) => {
+                tokio::fs::write(&target_abs, bytes).await?;
+                files.push(target_rel);
+            }
+            Err(error) => warnings.push(format!("Poster download failed: {}", error)),
+        }
+    }
+
+    if let Some(url) = backdrop_url.filter(|value| !value.trim().is_empty()) {
+        let file_name = artwork_file_name("backdrop", url);
+        let target_abs = target_dir_abs.join(&file_name);
+        let target_rel = join_relative_dir_file(&target_dir_rel, &file_name);
+        match download_binary(&client, url).await {
+            Ok(bytes) => {
+                tokio::fs::write(&target_abs, bytes).await?;
+                files.push(target_rel);
+            }
+            Err(error) => warnings.push(format!("Backdrop download failed: {}", error)),
+        }
+    }
+
+    Ok(ArtworkWriteResult { files, warnings })
+}
+
 fn render_jellyfin_nfo(
     selected: &InternetMetadataMatch,
     season: Option<u32>,
@@ -296,4 +383,46 @@ fn escape_xml(value: &str) -> String {
         }
     }
     escaped
+}
+
+fn jellyfin_artwork_target_dir(relative_path: &str, media_kind: &str) -> Option<String> {
+    let path = Path::new(relative_path);
+    let parent = path.parent().unwrap_or_else(|| Path::new(""));
+
+    if media_kind == "series" {
+        let season_dir = parent;
+        let show_dir = season_dir.parent().unwrap_or(season_dir);
+        return Some(show_dir.to_string_lossy().replace('\\', "/"));
+    }
+
+    Some(parent.to_string_lossy().replace('\\', "/"))
+}
+
+fn join_relative_dir_file(dir: &str, file_name: &str) -> String {
+    if dir.is_empty() {
+        file_name.to_string()
+    } else {
+        format!("{dir}/{file_name}")
+    }
+}
+
+fn artwork_file_name(base_name: &str, source_url: &str) -> String {
+    let ext = source_url
+        .split('?')
+        .next()
+        .and_then(|value| value.rsplit('.').next())
+        .map(|value| value.to_ascii_lowercase())
+        .filter(|value| matches!(value.as_str(), "jpg" | "jpeg" | "png" | "webp"))
+        .map(|value| if value == "jpeg" { "jpg".to_string() } else { value })
+        .unwrap_or_else(|| "jpg".to_string());
+    format!("{base_name}.{ext}")
+}
+
+async fn download_binary(client: &Client, url: &str) -> Result<Vec<u8>> {
+    let response = client.get(url).send().await?.error_for_status()?;
+    let bytes = response.bytes().await?;
+    if bytes.len() > MAX_ARTWORK_BYTES {
+        anyhow::bail!("asset exceeded {} bytes", MAX_ARTWORK_BYTES);
+    }
+    Ok(bytes.to_vec())
 }

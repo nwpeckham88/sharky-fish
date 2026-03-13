@@ -284,6 +284,7 @@ export interface InternetMetadataMatch {
 	rating: number | null;
 	genres: string[];
 	poster_url: string | null;
+	backdrop_url: string | null;
 	source_url: string | null;
 }
 
@@ -344,6 +345,9 @@ export interface OrganizeLibraryResult {
 	conflict_path: string | null;
 	metadata_sidecar_path: string | null;
 	metadata_sidecar_written: boolean;
+	artwork_paths: string[];
+	artwork_written: boolean;
+	artwork_warning: string | null;
 	filesystem: FileSystemFacts;
 	organize_preserves_hard_links: boolean;
 	hard_link_warning: string | null;
@@ -443,11 +447,12 @@ export interface LlmConfig {
 }
 
 export interface InternetMetadataConfig {
+	tmdb_api_key: string | null;
 	omdb_api_key: string | null;
 	tvdb_api_key: string | null;
 	tvdb_pin: string | null;
 	user_agent: string;
-	default_provider: 'omdb' | 'tvdb';
+	default_provider: 'tmdb' | 'omdb' | 'tvdb';
 }
 
 export interface QbittorrentConfig {
@@ -860,6 +865,7 @@ export async function organizeLibraryFile(input: {
 	scope?: 'file' | 'movie_folder';
 	id_mode?: 'none' | 'imdb' | 'tvdb';
 	write_nfo?: boolean;
+	write_artwork?: boolean;
 	merge_existing?: boolean;
 	apply?: boolean;
 }): Promise<OrganizeLibraryResult> {

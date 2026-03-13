@@ -85,6 +85,8 @@ pub struct QbittorrentConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InternetMetadataConfig {
+	/// TMDb API key (Jellyfin's default movie/show metadata source).
+	pub tmdb_api_key: Option<String>,
     /// OMDb API key (OMDb provides IMDb-backed metadata).
     pub omdb_api_key: Option<String>,
     /// TVDB API key.
@@ -194,7 +196,7 @@ fn default_bulk_metadata_max_inflight() -> usize {
 }
 
 fn default_metadata_provider() -> String {
-    "omdb".into()
+    "tmdb".into()
 }
 
 fn default_qbittorrent_base_url() -> String {
@@ -312,6 +314,7 @@ impl Default for AppConfig {
 impl Default for InternetMetadataConfig {
     fn default() -> Self {
         Self {
+			tmdb_api_key: None,
             omdb_api_key: None,
             tvdb_api_key: None,
             tvdb_pin: None,

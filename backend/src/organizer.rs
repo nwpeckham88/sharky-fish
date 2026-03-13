@@ -17,6 +17,7 @@ pub struct OrganizeRequest {
     pub scope: Option<String>,
     pub id_mode: Option<String>,
     pub write_nfo: bool,
+    pub write_artwork: bool,
     pub merge_existing: bool,
 }
 
@@ -31,6 +32,9 @@ pub struct OrganizeResult {
     pub conflict_path: Option<String>,
     pub metadata_sidecar_path: Option<String>,
     pub metadata_sidecar_written: bool,
+    pub artwork_paths: Vec<String>,
+    pub artwork_written: bool,
+    pub artwork_warning: Option<String>,
     pub filesystem: FileSystemFacts,
     pub organize_preserves_hard_links: bool,
     pub hard_link_warning: Option<String>,
@@ -181,6 +185,44 @@ pub async fn preview_or_apply(
         metadata_sidecar_written = true;
     }
 
+    let artwork_paths = if request.write_artwork {
+        sidecar::planned_jellyfin_artwork_relative_paths(
+            &target_relative_str,
+            &request.selected.media_kind,
+            request.selected.poster_url.as_deref(),
+            request.selected.backdrop_url.as_deref(),
+        )
+    } else {
+        Vec::new()
+    };
+
+    let mut artwork_written = false;
+    let mut artwork_warning = None;
+    if apply && request.write_artwork {
+        match sidecar::write_jellyfin_artwork(
+            library_root,
+            &target_relative_str,
+            &request.selected.media_kind,
+            request.selected.poster_url.as_deref(),
+            request.selected.backdrop_url.as_deref(),
+        )
+        .await
+        {
+            Ok(result) => {
+                artwork_written = !result.files.is_empty();
+                if !result.warnings.is_empty() {
+                    artwork_warning = Some(result.warnings.join(" "));
+                }
+            }
+            Err(error) => {
+                artwork_warning = Some(format!(
+                    "Artwork write skipped because downloads failed: {}",
+                    error
+                ));
+            }
+        }
+    }
+
     Ok(OrganizeResult {
         current_relative_path: current_relative_str,
         target_relative_path: target_relative_str,
@@ -191,6 +233,9 @@ pub async fn preview_or_apply(
         conflict_path,
         metadata_sidecar_path,
         metadata_sidecar_written,
+        artwork_paths,
+        artwork_written,
+        artwork_warning,
         filesystem: filesystem.clone(),
         organize_preserves_hard_links: true,
         hard_link_warning: if filesystem.is_hard_linked {
