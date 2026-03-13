@@ -915,7 +915,7 @@
 		(!activeLibraryId && libraryFolders.length > 0 ? 1 : 0) +
 		1 +
 		1 +
-		1
+		(libraryViewMode === 'compact' ? 0 : 1)
 	);
 
 	function switchLibrary(id: string | null) {
@@ -1362,7 +1362,7 @@
 										{@const detail = detailState(item.relative_path)}
 										{@const artworkSrc = itemArtworkSrc(detail)}
 										<div class="border-t border-[color:rgba(123,105,81,0.1)] first:border-t-0">
-											<div class="flex items-start justify-between gap-3 px-8 py-3 text-left text-sm hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''}">
+											<div class="flex items-start justify-between gap-3 px-8 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'} text-left {libraryViewMode === 'compact' ? 'text-[13px]' : 'text-sm'} hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''}">
 												<button class="min-w-0 flex-1 text-left" onclick={() => loadMetadata(item)}>
 													<div class="flex flex-wrap items-center gap-2">
 														<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
@@ -1372,22 +1372,47 @@
 														{:else if item.has_selected_metadata}
 															<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">metadata selected</span>
 														{/if}
-														{#if item.has_sidecar}
-															<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">nfo</span>
-														{:else}
-															<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">missing nfo</span>
+														{#if libraryViewMode !== 'compact'}
+															{#if item.has_sidecar}
+																<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">nfo</span>
+															{:else}
+																<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">missing nfo</span>
+															{/if}
 														{/if}
 														{#if item.organize_needed}
 															<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">organize needed</span>
 														{/if}
 													</div>
-													<div class="mt-0.5 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
+													<div class="{libraryViewMode === 'compact' ? 'mt-0' : 'mt-0.5'} truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
 												</button>
-												{#if libraryViewMode === 'compact'}
-													<button class="shrink-0 rounded-md border border-[color:var(--line)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-[color:var(--ink-strong)]" onclick={() => toggleItemExpansion(item)}>
-														{itemIsExpanded(item.relative_path) ? 'Collapse' : 'Expand'}
-													</button>
-												{/if}
+												<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+												<div class="shrink-0 space-y-1">
+													<div class="flex flex-wrap justify-end gap-1">
+														<button class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)]" onclick={(event) => { event.stopPropagation(); loadMetadata(item); }}>
+															Inspect
+														</button>
+														{#if (item.managed_status ?? 'UNPROCESSED') === 'UNPROCESSED'}
+															<button class="rounded-md bg-[color:var(--accent)] px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50" onclick={(event) => { event.stopPropagation(); createReview(item); }} disabled={!!rowActionBusy[item.relative_path]}>
+																{rowActionBusy[item.relative_path] === 'review' ? '...' : 'Review'}
+															</button>
+															<button class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={(event) => { event.stopPropagation(); updateManagedStatus(item, 'REVIEWED'); }} disabled={!!rowActionBusy[item.relative_path]}>
+																{rowActionBusy[item.relative_path] === 'REVIEWED' ? '...' : 'Reviewed'}
+															</button>
+														{/if}
+														{#if item.library_id}
+															<a href={`/organize?library=${encodeURIComponent(item.library_id)}&path=${encodeURIComponent(item.relative_path)}`} class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)] no-underline" onclick={(event) => event.stopPropagation()}>
+																Organize
+															</a>
+														{/if}
+													</div>
+													{#if libraryViewMode === 'compact'}
+														<div class="flex justify-end">
+															<button class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]" onclick={(event) => { event.stopPropagation(); toggleItemExpansion(item); }}>
+																{itemIsExpanded(item.relative_path) ? 'Collapse' : 'Expand'}
+															</button>
+														</div>
+													{/if}
+												</div>
 											</div>
 											{#if itemIsExpanded(item.relative_path)}
 												<div class="px-8 pb-4">
@@ -1454,23 +1479,25 @@
 				</div>
 			{/if}
 		{:else}
-			<table class="w-full text-left text-sm">
+			<table class="w-full text-left {libraryViewMode === 'compact' ? 'text-[13px]' : 'text-sm'}">
 				<thead class="border-b border-[color:var(--line)] bg-[color:rgba(234,223,201,0.6)] text-xs uppercase tracking-[0.18em] text-[color:var(--ink-muted)]">
 					<tr>
 						{#if bulkMode}
-							<th class="w-10 px-3 py-3">
+							<th class="w-10 px-3 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'}">
 								<input type="checkbox" checked={filteredLibrary.length > 0 && selectedPaths.size === filteredLibrary.length} onchange={toggleSelectAll} class="accent-[color:var(--accent)]" />
 							</th>
 						{/if}
-						<th class="px-4 py-3">Path</th>
-						<th class="px-4 py-3">Type</th>
-						<th class="px-4 py-3">Managed</th>
+						<th class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'}">Path</th>
+						<th class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'}">Type</th>
+						<th class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'}">Managed</th>
 						{#if !activeLibraryId && libraryFolders.length > 0}
-							<th class="px-4 py-3">Library</th>
+							<th class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'}">Library</th>
 						{/if}
-						<th class="px-4 py-3">Size</th>
-						<th class="px-4 py-3">Modified</th>
-						<th class="px-4 py-3">Actions</th>
+						<th class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'}">Size</th>
+						<th class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'}">Modified</th>
+						{#if libraryViewMode !== 'compact'}
+							<th class="px-4 py-3">Actions</th>
+						{/if}
 					</tr>
 				</thead>
 				<tbody>
@@ -1484,15 +1511,39 @@
 							{@const artworkSrc = itemArtworkSrc(detail)}
 							<tr class="cursor-pointer border-b border-[color:rgba(123,105,81,0.14)] hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''} {selectedPaths.has(item.relative_path) ? 'bg-[color:rgba(214,180,111,0.08)]' : ''}" onclick={() => { if (bulkMode) { toggleSelect(item.relative_path); } else { loadMetadata(item); } }}>
 								{#if bulkMode}
-									<td class="w-10 px-3 py-3" onclick={(e) => { e.stopPropagation(); toggleSelect(item.relative_path); }}>
+									<td class="w-10 px-3 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'}" onclick={(e) => { e.stopPropagation(); toggleSelect(item.relative_path); }}>
 										<input type="checkbox" checked={selectedPaths.has(item.relative_path)} class="accent-[color:var(--accent)]" />
 									</td>
 								{/if}
-								<td class="px-4 py-3 align-top">
+								<td class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'} align-top">
 									<div class="flex items-start justify-between gap-3">
 										<div class="min-w-0">
 											<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
-											<div class="mt-0.5 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
+											<div class="{libraryViewMode === 'compact' ? 'mt-0' : 'mt-0.5'} truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
+											{#if libraryViewMode === 'compact'}
+												<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+												<div class="mt-1 flex flex-wrap items-center gap-1">
+													<button class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)]" onclick={(event) => { event.stopPropagation(); loadMetadata(item); }}>
+														Inspect
+													</button>
+													{#if (item.managed_status ?? 'UNPROCESSED') === 'UNPROCESSED'}
+														<button class="rounded-md bg-[color:var(--accent)] px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50" onclick={(event) => { event.stopPropagation(); createReview(item); }} disabled={!!rowActionBusy[item.relative_path]}>
+															{rowActionBusy[item.relative_path] === 'review' ? '...' : 'Review'}
+														</button>
+														<button class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={(event) => { event.stopPropagation(); updateManagedStatus(item, 'REVIEWED'); }} disabled={!!rowActionBusy[item.relative_path]}>
+															{rowActionBusy[item.relative_path] === 'REVIEWED' ? '...' : 'Reviewed'}
+														</button>
+														<button class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={(event) => { event.stopPropagation(); updateManagedStatus(item, 'KEPT_ORIGINAL'); }} disabled={!!rowActionBusy[item.relative_path]}>
+															{rowActionBusy[item.relative_path] === 'KEPT_ORIGINAL' ? '...' : 'Keep'}
+														</button>
+													{/if}
+													{#if item.library_id}
+														<a href={`/organize?library=${encodeURIComponent(item.library_id)}&path=${encodeURIComponent(item.relative_path)}`} class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)] no-underline" onclick={(event) => event.stopPropagation()}>
+															Organize
+														</a>
+													{/if}
+												</div>
+											{/if}
 										</div>
 										{#if libraryViewMode === 'compact'}
 											<button class="shrink-0 rounded-md border border-[color:var(--line)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-[color:var(--ink-strong)]" onclick={(event) => { event.stopPropagation(); toggleItemExpansion(item); }}>
@@ -1501,10 +1552,10 @@
 										{/if}
 									</div>
 								</td>
-								<td class="px-4 py-3 align-top">
+								<td class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'} align-top">
 									<span class="status-chip {item.media_type === 'video' ? 'processing' : item.media_type === 'audio' ? 'completed' : ''}">{item.media_type}</span>
 								</td>
-								<td class="px-4 py-3 align-top">
+								<td class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'} align-top">
 									<div class="flex max-w-[18rem] flex-wrap items-center gap-2">
 										<span class="status-chip {statusTone(item.managed_status ?? 'UNPROCESSED')}">{statusLabel(item.managed_status ?? 'UNPROCESSED')}</span>
 										{#if metadataSelectionNeeded(item)}
@@ -1515,15 +1566,17 @@
 										{#if item.organize_needed}
 											<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">organize needed</span>
 										{/if}
-										{#if item.has_sidecar}
-											<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">nfo</span>
-										{:else}
-											<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">missing nfo</span>
+										{#if libraryViewMode !== 'compact'}
+											{#if item.has_sidecar}
+												<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">nfo</span>
+											{:else}
+												<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">missing nfo</span>
+											{/if}
 										{/if}
 									</div>
 								</td>
 								{#if !activeLibraryId && libraryFolders.length > 0}
-									<td class="px-4 py-3 align-top">
+									<td class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'} align-top">
 										{#if item.library_id}
 											{@const lib = libraryFolders.find((l) => l.id === item.library_id)}
 											{#if lib}
@@ -1534,10 +1587,11 @@
 										{/if}
 									</td>
 								{/if}
-								<td class="px-4 py-3 align-top text-[color:var(--ink-strong)]">{formatBytes(item.size_bytes)}</td>
-								<td class="px-4 py-3 align-top text-[color:var(--ink-muted)]">{formatTimestamp(item.modified_at)}</td>
-								<td class="px-4 py-3 align-top" onclick={(e) => e.stopPropagation()}>
-									<div class="flex flex-wrap gap-2">
+								<td class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'} align-top text-[color:var(--ink-strong)]">{formatBytes(item.size_bytes)}</td>
+								<td class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'} align-top text-[color:var(--ink-muted)]">{formatTimestamp(item.modified_at)}</td>
+								{#if libraryViewMode !== 'compact'}
+									<td class="px-4 py-3 align-top" onclick={(e) => e.stopPropagation()}>
+										<div class="flex flex-wrap gap-2">
 										{#if (item.managed_status ?? 'UNPROCESSED') === 'UNPROCESSED'}
 											<button class="rounded-md bg-[color:var(--accent)] px-2.5 py-1.5 text-[10px] font-semibold text-white disabled:opacity-50" onclick={() => createReview(item)} disabled={!!rowActionBusy[item.relative_path]}>
 												{rowActionBusy[item.relative_path] === 'review' ? 'Building…' : 'Create Review'}
@@ -1558,8 +1612,9 @@
 												Organize
 											</a>
 										{/if}
-									</div>
-								</td>
+										</div>
+									</td>
+								{/if}
 							</tr>
 							{#if itemIsExpanded(item.relative_path)}
 								<tr class="border-b border-[color:rgba(123,105,81,0.14)] bg-[color:rgba(244,236,223,0.42)] last:border-b-0">
