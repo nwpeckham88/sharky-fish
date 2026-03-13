@@ -178,7 +178,7 @@
 	let librarySummary = $state<LibrarySummary>({
 		total_items: 0, total_bytes: 0, video_items: 0, audio_items: 0, other_items: 0
 	});
-	let roots = $state<LibraryRoots>({ library_path: '/data', ingest_path: '/ingest' });
+	let roots = $state<LibraryRoots>({ library_path: '/data/media', ingest_path: '/data/downloads' });
 	let selectedItem = $state<LibraryEntry | null>(null);
 	let selectedMetadata = $state<LibraryMetadata | null>(null);
 	let metadataLoading = $state(false);

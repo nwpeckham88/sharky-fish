@@ -30,6 +30,5 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - /mnt/nas/servarr/data/media:/data:rw
-      - /opt/sharky/ingest:/ingest:rw
+      - /mnt/nas/servarr/data:/data:rw
       - /opt/sharky/config:/config:rw

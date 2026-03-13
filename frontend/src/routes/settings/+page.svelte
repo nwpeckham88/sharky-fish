@@ -381,7 +381,7 @@ ${normalizedContext}`;
 {#if activeTab === 'libraries'}
 	<section class="surface-card p-6">
 		<h2 class="mb-4 text-xl text-[color:var(--ink-strong)]">Library Folders</h2>
-		<p class="mb-6 text-sm text-[color:var(--ink-muted)]">Map folders inside your media volume to named libraries. Similar to Jellyfin, bind-mount your entire media directory and register sub-folders here as Movies, TV Shows, etc.</p>
+		<p class="mb-6 text-sm text-[color:var(--ink-muted)]">Map folders inside your managed media root to named libraries. Following the standard TRaSH layout, Sharky Fish defaults to <span class="font-mono text-[color:var(--ink-strong)]">/data/media</span> for libraries and expects folders here such as Movies and TV.</p>
 
 		<!-- Existing libraries -->
 		{#if libraries.length > 0}
@@ -889,8 +889,8 @@ ${normalizedContext}`;
 					</div>
 					<label class="block">
 						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Downloads folder <span class="font-normal">(path inside container)</span></span>
-						<input type="text" bind:value={config.ingest_path} placeholder="/ingest" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
-						<span class="mt-1 block text-xs text-[color:var(--ink-muted)]">The folder your download client writes completed files to. Mount it into this container and set the same in-container path used by qBittorrent and the *arr stack whenever you want consistent imports and hardlinks. Also watched for new files entering the processing pipeline. Requires a container restart to take effect.</span>
+						<input type="text" bind:value={config.ingest_path} placeholder="/data/downloads" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
+						<span class="mt-1 block text-xs text-[color:var(--ink-muted)]">The folder your download client writes completed files to. Following the TRaSH-style default layout, use <span class="font-mono text-[color:var(--ink-strong)]">/data/downloads</span> for qBittorrent ingress and <span class="font-mono text-[color:var(--ink-strong)]">/data/media</span> for your managed libraries. Requires a container restart to take effect.</span>
 					</label>
 				</div>
 			</div>

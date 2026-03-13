@@ -6,9 +6,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    /// Path to the primary media library (MergerFS pool mount inside container).
+    /// Path to the managed media library root inside the container.
     pub data_path: String,
-    /// Path to ingest / cache directory.
+    /// Path to the download ingress directory inside the container.
     pub ingest_path: String,
     /// Path to config directory (SQLite db lives here).
     pub config_path: String,
@@ -280,8 +280,8 @@ impl Default for AudioStandards {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            data_path: "/data".into(),
-            ingest_path: "/ingest".into(),
+            data_path: "/data/media".into(),
+            ingest_path: "/data/downloads".into(),
             config_path: "/config".into(),
             port: 3000,
             llm: LlmConfig {

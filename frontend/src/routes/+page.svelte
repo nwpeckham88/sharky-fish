@@ -56,7 +56,7 @@
 		audio_items: 0,
 		other_items: 0
 	});
-	let roots = $state<LibraryRoots>({ library_path: '/data', ingest_path: '/ingest' });
+	let roots = $state<LibraryRoots>({ library_path: '/data/media', ingest_path: '/data/downloads' });
 	let localLoading = $state(true);
 	let backlogError = $state('');
 	let activeBacklogFilter = $state<BacklogFilter>(parseBacklogFilter(page.url.searchParams.get('filter')));
