@@ -16,6 +16,8 @@ use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, info, warn};
 
+const STALE_SCAN_TIMEOUT_SECS: u64 = 10 * 60;
+
 #[derive(Debug, Clone)]
 pub struct IndexCandidate {
     pub relative_path: String,
@@ -49,8 +51,44 @@ pub async fn run_full_rescan(
         "library scan: attempting to start"
     );
     if !db::try_begin_library_scan(&pool, started_at).await? {
-        warn!("library scan: another scan is already running — skipping");
-        return Ok(false);
+        let scan_state = db::fetch_library_scan_state(&pool).await?;
+        let prior_started_at = scan_state.started_at.map(|v| v.max(0) as u64).unwrap_or(0);
+        let running_age_secs = started_at.saturating_sub(prior_started_at);
+
+        // Recovery: a stale "running" flag can remain after an unclean shutdown.
+        // If it has been running too long, mark it failed and retry once.
+        if scan_state.status == "running" && running_age_secs >= STALE_SCAN_TIMEOUT_SECS {
+            warn!(
+                started_at = prior_started_at,
+                age_secs = running_age_secs,
+                scanned = scan_state.scanned_items,
+                total = scan_state.total_items,
+                "library scan: stale running state detected; resetting before retry"
+            );
+
+            db::fail_library_scan(
+                &pool,
+                started_at,
+                scan_state.scanned_items.max(0) as usize,
+                scan_state.total_items.max(0) as usize,
+                "stale running scan state reset automatically",
+            )
+            .await?;
+
+            if !db::try_begin_library_scan(&pool, started_at).await? {
+                warn!("library scan: retry failed because a scan is still marked running");
+                return Ok(false);
+            }
+        } else {
+            warn!(
+                status = %scan_state.status,
+                age_secs = running_age_secs,
+                scanned = scan_state.scanned_items,
+                total = scan_state.total_items,
+                "library scan: another scan is already running — skipping"
+            );
+            return Ok(false);
+        }
     }
 
     let run_result = async {
