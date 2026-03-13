@@ -485,6 +485,8 @@ export interface ArtworkDownloadConfig {
 	episodes: ArtworkTypeCounts;
 }
 
+export type LibraryViewMode = 'compact' | 'expanded';
+
 export interface AppConfig {
 	data_path: string;
 	ingest_path: string;
@@ -500,6 +502,7 @@ export interface AppConfig {
 	bulk_metadata_max_inflight: number;
 	golden_standards: GoldenStandards;
 	playback_context: string;
+	library_view_mode: LibraryViewMode;
 	system_prompt: string;
 	auto_approve_ai_jobs: boolean;
 	libraries: LibraryFolder[];

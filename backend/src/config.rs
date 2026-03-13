@@ -41,6 +41,9 @@ pub struct AppConfig {
     /// Freeform notes about playback devices and compatibility constraints.
     #[serde(default)]
     pub playback_context: String,
+    /// Preferred library list density in the UI.
+    #[serde(default = "default_library_view_mode")]
+    pub library_view_mode: String,
     /// System prompt sent to the LLM for ffmpeg command generation.
     #[serde(default)]
     pub system_prompt: String,
@@ -200,6 +203,10 @@ fn default_bulk_metadata_max_inflight() -> usize {
 
 fn default_metadata_provider() -> String {
     "tmdb".into()
+}
+
+fn default_library_view_mode() -> String {
+    "compact".into()
 }
 
 // ---------------------------------------------------------------------------
@@ -421,6 +428,7 @@ impl Default for AppConfig {
             bulk_metadata_max_inflight: default_bulk_metadata_max_inflight(),
             golden_standards: GoldenStandards::default(),
             playback_context: String::new(),
+            library_view_mode: default_library_view_mode(),
             system_prompt: SYSTEM_PROMPT_DEFAULT.into(),
             auto_approve_ai_jobs: true,
             libraries: Vec::new(),

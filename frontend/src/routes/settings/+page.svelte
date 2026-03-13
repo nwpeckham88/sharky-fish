@@ -882,6 +882,26 @@ ${normalizedContext}`;
 			</div>
 
 			<div class="rounded-[1rem] border border-[color:var(--line)] p-5 md:col-span-2">
+				<h3 class="section-label mb-4">Library View Defaults</h3>
+				<div class="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,0.9fr)] lg:items-start">
+					<div>
+						<label class="block">
+							<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Default Library Presentation</span>
+							<select bind:value={config.library_view_mode} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]">
+								<option value="compact">Compact rows</option>
+								<option value="expanded">Expanded cards</option>
+							</select>
+						</label>
+						<p class="mt-2 text-xs leading-5 text-[color:var(--ink-muted)]">Compact rows keep large libraries scannable and let you expand items inline on demand. Expanded cards trade density for richer per-item detail.</p>
+					</div>
+					<div class="rounded-xl border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.55)] px-4 py-3 text-xs leading-5 text-[color:var(--ink-muted)]">
+						<p class="font-semibold uppercase tracking-[0.14em] text-[color:var(--accent-deep)]">Current behavior</p>
+						<p class="mt-2">{config.library_view_mode === 'expanded' ? 'Library opens in expanded cards with artwork and richer metadata emphasis.' : 'Library opens in compact rows designed for sweeping large movie and show lists quickly.'}</p>
+					</div>
+				</div>
+			</div>
+
+			<div class="rounded-[1rem] border border-[color:var(--line)] p-5 md:col-span-2">
 				<h3 class="section-label mb-4">Playback Context</h3>
 				<p class="mb-3 text-sm text-[color:var(--ink-muted)]">This is the simpler alternative to a full player-endpoint feature for now. List the clients and constraints the AI should optimize for, such as Onn 4K Pro, Nvidia Shield, AVR support, 4K HDR, Dolby Vision, lossless-audio limits, or subtitle quirks.</p>
 				<textarea bind:value={config.playback_context} rows="5" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-3 text-sm text-[color:var(--ink-strong)]" placeholder="Living room: Nvidia Shield Pro into a 4K HDR TV and AVR, prefers direct play, can handle 4K HDR10 and 5.1. Bedroom: Onn 4K Pro on a stereo TV, needs a stereo-compatible track on everything."></textarea>
