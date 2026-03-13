@@ -8,11 +8,14 @@
 		fetchBacklogItems,
 		fetchLibrary,
 		fetchLibraryEvents,
+		fetchLibraries,
+		triggerLibraryRescan,
 		updateBulkIntakeManagedStatus,
 		updateIntakeManagedStatus,
 		type BacklogFilter,
 		type IntakeManagedItem,
 		type LibraryChangeEvent,
+		type LibraryFolder,
 		type LibraryRoots,
 		type LibrarySummary
 	} from '$lib/api';
@@ -49,6 +52,7 @@
 
 	let recentChanges = $state<LibraryChangeEvent[]>([]);
 	let backlogItems = $state<IntakeManagedItem[]>([]);
+	let libraries = $state<LibraryFolder[]>([]);
 	let librarySummary = $state<LibrarySummary>({
 		total_items: 0,
 		total_bytes: 0,
@@ -63,15 +67,21 @@
 	let showOutsideLibrary = $state(page.url.searchParams.get('outside') === '1');
 	let reviewBusy = $state<Record<string, boolean>>({});
 	let statusBusy = $state<Record<string, boolean>>({});
+	let rescanLoading = $state(false);
+	let rescanError = $state('');
 	let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const reviewJobs = $derived(getReviewState().awaitingApproval);
 	const reviewItemCount = $derived(getReviewState().counts.awaitingApprovalItems);
 	const executionCounts = $derived(getExecutionState().counts);
 	const failedJobs = $derived(getExecutionState().failed);
+	const scanStatus = $derived(libraryState.scan);
+	const hasLibraries = $derived(libraries.length > 0);
+	const scanRunning = $derived(scanStatus.status === 'running');
 
 	onMount(async () => {
 		await Promise.all([
+			loadLibraries(),
 			refreshManagedItemStore(),
 			loadBacklog(activeBacklogFilter),
 			loadSummary(),
@@ -83,6 +93,14 @@
 	onDestroy(() => {
 		if (refreshTimer) clearTimeout(refreshTimer);
 	});
+
+	async function loadLibraries() {
+		try {
+			libraries = await fetchLibraries();
+		} catch {
+			libraries = [];
+		}
+	}
 
 	async function loadBacklog(filter: BacklogFilter = activeBacklogFilter) {
 		try {
@@ -109,6 +127,18 @@
 			recentChanges = await fetchLibraryEvents(8);
 		} catch {
 			recentChanges = [];
+		}
+	}
+
+	async function runRescan() {
+		rescanLoading = true;
+		rescanError = '';
+		try {
+			await triggerLibraryRescan();
+		} catch (error) {
+			rescanError = error instanceof Error ? error.message : 'Failed to trigger rescan';
+		} finally {
+			rescanLoading = false;
 		}
 	}
 
@@ -344,6 +374,125 @@
 		backlogFilterMeta.find((filter) => filter.key === activeBacklogFilter) ?? backlogFilterMeta[0]
 	);
 	const visibleBacklogItems = $derived(backlogDisplayItems(backlogItems));
+	const prioritizedQueues = $derived.by(() => {
+		const candidates = [
+			{
+				label: 'Needs Metadata',
+				count: managedItemStore.summary.missing_metadata_count,
+				detail: 'Bulk-select matches before organizing or reviewing.',
+				href: '/library?view=missing_metadata'
+			},
+			{
+				label: 'Organize Needed',
+				count: managedItemStore.summary.organize_needed_count,
+				detail: 'Metadata is selected, but target paths still drift.',
+				href: '/library?view=organize_needed'
+			},
+			{
+				label: 'Unprocessed',
+				count: managedItemStore.summary.unprocessed_count,
+				detail: 'No durable sharky-fish decisions exist yet.',
+				href: '/?filter=unprocessed'
+			},
+			{
+				label: 'Awaiting Approval',
+				count: managedItemStore.summary.awaiting_approval_count,
+				detail: 'AI plans are waiting for a human decision.',
+				href: '/intake'
+			},
+			{
+				label: 'Missing NFO',
+				count: managedItemStore.summary.missing_sidecar_count,
+				detail: 'Sidecars are missing alongside otherwise-managed files.',
+				href: '/library?view=missing_sidecar'
+			},
+			{
+				label: 'Failed',
+				count: managedItemStore.summary.failed_count,
+				detail: 'Execution exceptions need follow-up before more queueing.',
+				href: '/forge'
+			}
+		];
+
+		return candidates.filter((item) => item.count > 0).sort((left, right) => right.count - left.count).slice(0, 3);
+	});
+	const guidanceFocus = $derived.by(() => {
+		if (!hasLibraries) {
+			return {
+				title: 'Register libraries first',
+				detail: 'Create your managed Movies and TV libraries under /data/media before the first scan.',
+				href: '/settings',
+				cta: 'Open settings'
+			};
+		}
+
+		if (scanRunning) {
+			const progressTotal = scanStatus.total_items > 0 ? ` of ${scanStatus.total_items}` : '';
+			return {
+				title: 'Initial indexing is in progress',
+				detail: `Scanning ${scanStatus.scanned_items}${progressTotal} items. Let the first pass finish before doing deep backlog cleanup.`,
+				href: '/library',
+				cta: 'Open library'
+			};
+		}
+
+		if (librarySummary.total_items === 0) {
+			return {
+				title: 'Run the first full scan',
+				detail: 'Sharky Fish can only prioritize a huge library after it indexes the files under /data/media.',
+				action: 'rescan' as const,
+				cta: 'Start first scan'
+			};
+		}
+
+		const topQueue = prioritizedQueues[0];
+		if (topQueue) {
+			return {
+				title: `Work the ${topQueue.label.toLowerCase()} queue`,
+				detail: `${topQueue.count} items currently need this kind of attention. ${topQueue.detail}`,
+				href: topQueue.href,
+				cta: `Open ${topQueue.label}`
+			};
+		}
+
+		if (executionCounts.approved + executionCounts.processing > 0) {
+			return {
+				title: 'Execution is already moving',
+				detail: `${executionCounts.approved} approved and ${executionCounts.processing} active jobs are downstream from backlog shaping.`,
+				href: '/forge',
+				cta: 'Open execution'
+			};
+		}
+
+		return {
+			title: 'Library is in a stable state',
+			detail: 'No major backlog categories are spiking right now. Use Library for spot checks or Downloads for ingress cleanup.',
+			href: '/library',
+			cta: 'Open library'
+		};
+	});
+	const workflowSteps = $derived([
+		{
+			title: 'Map libraries in /data/media',
+			complete: hasLibraries,
+			detail: hasLibraries ? `${libraries.length} librar${libraries.length === 1 ? 'y is' : 'ies are'} configured.` : 'Create Movies and TV libraries before scanning.'
+		},
+		{
+			title: 'Run the first library scan',
+			complete: librarySummary.total_items > 0,
+			detail: scanRunning ? `Scanning ${scanStatus.scanned_items} items now.` : librarySummary.total_items > 0 ? `${librarySummary.total_items} items indexed so far.` : 'Build the initial index so queues can be prioritized automatically.'
+		},
+		{
+			title: 'Work the biggest shaping queue',
+			complete: managedItemStore.summary.needs_attention_count === 0,
+			detail: managedItemStore.summary.needs_attention_count === 0 ? 'No shaping backlog is currently spiking.' : `${managedItemStore.summary.needs_attention_count} items still need backlog shaping.`
+		},
+		{
+			title: 'Approve and monitor execution',
+			complete: reviewItemCount === 0 && executionCounts.approved + executionCounts.processing === 0,
+			detail: reviewItemCount > 0 ? `${reviewItemCount} items are waiting in Review.` : executionCounts.approved + executionCounts.processing > 0 ? `${executionCounts.approved + executionCounts.processing} jobs are downstream in execution.` : 'Review and execution are both clear.'
+		}
+	]);
 </script>
 
 <section class="mb-6 grid gap-4 md:grid-cols-[minmax(0,1.3fr)_minmax(18rem,0.7fr)]">
@@ -418,6 +567,83 @@
 		</div>
 	</div>
 </section>
+
+	<section class="mb-6 grid gap-5 xl:grid-cols-[minmax(0,1.15fr)_minmax(20rem,0.85fr)]">
+		<div class="surface-card p-6">
+			<div class="mb-4 flex flex-wrap items-start justify-between gap-3">
+				<div>
+					<p class="section-label">Guided Workflow</p>
+					<h3 class="mt-1 text-xl text-[color:var(--ink-strong)]">Make the first pass predictable</h3>
+					<p class="mt-2 max-w-2xl text-sm leading-6 text-[color:var(--ink-muted)]">For a huge library, the fastest path is: register libraries, run one full scan, work the biggest queues first, then let Review and Execution stay downstream.</p>
+				</div>
+				{#if 'action' in guidanceFocus && guidanceFocus.action === 'rescan'}
+					<button onclick={runRescan} disabled={rescanLoading || scanRunning} class="rounded-full bg-[color:var(--accent)] px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+						{rescanLoading ? 'Starting scan…' : scanRunning ? 'Scan running…' : guidanceFocus.cta}
+					</button>
+				{:else}
+					<a href={guidanceFocus.href} class="rounded-full bg-[color:var(--accent)] px-4 py-2 text-sm font-semibold text-white no-underline">{guidanceFocus.cta}</a>
+				{/if}
+			</div>
+
+			<div class="rounded-[1rem] border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.45)] p-4">
+				<div class="text-sm font-semibold text-[color:var(--ink-strong)]">{guidanceFocus.title}</div>
+				<p class="mt-2 text-sm leading-6 text-[color:var(--ink-muted)]">{guidanceFocus.detail}</p>
+				{#if scanRunning}
+					<div class="mt-3 h-2.5 overflow-hidden rounded-full bg-[color:var(--paper-deep)]">
+						<div class="h-full rounded-full bg-[linear-gradient(90deg,var(--accent),var(--accent-soft),var(--olive))] transition-all duration-300" style={`width: ${scanStatus.total_items > 0 ? Math.min(100, (scanStatus.scanned_items / scanStatus.total_items) * 100) : 10}%`}></div>
+					</div>
+				{/if}
+				{#if rescanError}
+					<div class="mt-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-sm text-[color:var(--danger)]">{rescanError}</div>
+				{/if}
+			</div>
+
+			<div class="mt-4 grid gap-3 md:grid-cols-2">
+				{#each workflowSteps as step, index (step.title)}
+					<div class="rounded-[1rem] border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-4">
+						<div class="flex items-start justify-between gap-3">
+							<div>
+								<div class="text-xs font-semibold uppercase tracking-[0.16em] text-[color:var(--ink-muted)]">Step {index + 1}</div>
+								<div class="mt-2 text-sm font-semibold text-[color:var(--ink-strong)]">{step.title}</div>
+							</div>
+							<span class={`status-chip ${step.complete ? 'completed' : 'processing'}`}>{step.complete ? 'Ready' : 'Next'}</span>
+						</div>
+						<p class="mt-2 text-sm text-[color:var(--ink-muted)]">{step.detail}</p>
+					</div>
+				{/each}
+			</div>
+		</div>
+
+		<div class="surface-card p-6">
+			<div class="mb-4 flex items-center justify-between gap-3">
+				<div>
+					<p class="section-label">Auto Prioritized</p>
+					<p class="text-lg text-[color:var(--ink-strong)]">Start with the biggest queues</p>
+				</div>
+				<a href="/library" class="text-sm font-semibold text-[color:var(--accent-deep)] no-underline hover:underline">Open library</a>
+			</div>
+			{#if prioritizedQueues.length === 0}
+				<p class="text-sm text-[color:var(--ink-muted)]">No shaping queues are currently dominating the library. Use Review, Execution, or Downloads for spot checks.</p>
+			{:else}
+				<div class="space-y-3">
+					{#each prioritizedQueues as queue (queue.label)}
+						<a href={queue.href} class="block rounded-[1rem] border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-4 no-underline transition-colors hover:bg-[color:rgba(214,180,111,0.08)]">
+							<div class="flex items-center justify-between gap-3">
+								<div>
+									<div class="text-sm font-semibold text-[color:var(--ink-strong)]">{queue.label}</div>
+									<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{queue.detail}</div>
+								</div>
+								<div class="text-right">
+									<div class="text-2xl font-semibold text-[color:var(--ink-strong)]">{queue.count}</div>
+									<div class="text-[11px] uppercase tracking-[0.14em] text-[color:var(--ink-muted)]">items</div>
+								</div>
+							</div>
+						</a>
+					{/each}
+				</div>
+			{/if}
+		</div>
+	</section>
 
 <section class="mb-4 grid gap-3 lg:grid-cols-3 xl:grid-cols-7">
 	{#each backlogFilterMeta as filter (filter.key)}
