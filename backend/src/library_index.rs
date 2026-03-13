@@ -458,7 +458,7 @@ pub fn detect_media_type(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn is_metadata_sidecar_path(path: &Path) -> bool {
+pub fn is_metadata_sidecar_path(path: &Path) -> bool {
     path.extension()
         .and_then(|value| value.to_str())
         .map(|value| value.eq_ignore_ascii_case("nfo"))

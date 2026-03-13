@@ -6,10 +6,14 @@ use anyhow::Result;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::{info, warn};
+
+const WATCHER_EVENT_BUFFER_CAPACITY: usize = 4096;
+const WATCHER_DROP_LOG_INTERVAL_SECS: u64 = 30;
 
 /// The Watcher actor monitors the ingest directory for new media files via
 /// filesystem notification APIs (inotify on Linux) and forwards events to the
@@ -43,13 +47,32 @@ impl WatcherActor {
     }
 
     pub async fn run(self) -> Result<()> {
-        let (notify_tx, mut notify_rx) = mpsc::channel::<notify::Result<Event>>(256);
+        let (notify_tx, mut notify_rx) =
+            mpsc::channel::<notify::Result<Event>>(WATCHER_EVENT_BUFFER_CAPACITY);
 
         let ingest_path = self.ingest_path.clone();
         let library_path = self.library_path.clone();
+        let dropped_events = Arc::new(AtomicU64::new(0));
+        let last_drop_log_at = Arc::new(AtomicU64::new(0));
+        let dropped_events_for_cb = dropped_events.clone();
+        let last_drop_log_at_for_cb = last_drop_log_at.clone();
+        let ingest_for_cb = ingest_path.clone();
+        let library_for_cb = library_path.clone();
         let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
+            let should_enqueue = match &res {
+                Ok(event) => should_enqueue_event(event, &ingest_for_cb, &library_for_cb),
+                Err(_) => true,
+            };
+
+            if !should_enqueue {
+                return;
+            }
+
             if notify_tx.try_send(res).is_err() {
-                warn!("watcher: dropping filesystem event because the event buffer is full");
+                note_dropped_event(
+                    dropped_events_for_cb.as_ref(),
+                    last_drop_log_at_for_cb.as_ref(),
+                );
             }
         })?;
 
@@ -67,11 +90,28 @@ impl WatcherActor {
             );
         }
 
+        let mut drop_log_tick = tokio::time::interval(Duration::from_secs(5));
+        drop_log_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         // Event processing loop on the async runtime.
-        while let Some(event_result) = notify_rx.recv().await {
-            match event_result {
-                Ok(event) => self.handle_event(event).await,
-                Err(e) => warn!("watcher: notification error: {e}"),
+        loop {
+            tokio::select! {
+                _ = drop_log_tick.tick() => {
+                    flush_dropped_event_summary(
+                        dropped_events.as_ref(),
+                        last_drop_log_at.as_ref(),
+                    );
+                }
+                maybe_event = notify_rx.recv() => {
+                    let Some(event_result) = maybe_event else {
+                        break;
+                    };
+
+                    match event_result {
+                        Ok(event) => self.handle_event(event).await,
+                        Err(e) => warn!("watcher: notification error: {e}"),
+                    }
+                }
             }
         }
 
@@ -152,6 +192,46 @@ fn is_media_file(path: &Path) -> bool {
     library_index::detect_media_type(path).is_some()
 }
 
+fn is_metadata_sidecar(path: &Path) -> bool {
+    library_index::is_metadata_sidecar_path(path)
+}
+
+fn should_enqueue_event(event: &Event, ingest_path: &Path, library_path: &Path) -> bool {
+    if change_label(&event.kind).is_none() {
+        return false;
+    }
+
+    event.paths.iter().any(|path| {
+        (path.starts_with(ingest_path) && is_media_file(path))
+            || (path.starts_with(library_path) && (is_media_file(path) || is_metadata_sidecar(path)))
+    })
+}
+
+fn note_dropped_event(dropped_events: &AtomicU64, last_drop_log_at: &AtomicU64) {
+    dropped_events.fetch_add(1, Ordering::Relaxed);
+    flush_dropped_event_summary(dropped_events, last_drop_log_at);
+}
+
+fn flush_dropped_event_summary(dropped_events: &AtomicU64, last_drop_log_at: &AtomicU64) {
+    let now = unix_now();
+    let last = last_drop_log_at.load(Ordering::Relaxed);
+    if now.saturating_sub(last) < WATCHER_DROP_LOG_INTERVAL_SECS {
+        return;
+    }
+
+    let dropped = dropped_events.swap(0, Ordering::Relaxed);
+    if dropped == 0 {
+        return;
+    }
+
+    last_drop_log_at.store(now, Ordering::Relaxed);
+    warn!(
+        dropped_events = dropped,
+        window_secs = WATCHER_DROP_LOG_INTERVAL_SECS,
+        "watcher: dropped filesystem events because callback buffer was full"
+    );
+}
+
 fn watch_path(watcher: &mut RecommendedWatcher, path: &Path, label: &str) -> bool {
     if !path.exists() {
         if let Err(error) = std::fs::create_dir_all(path) {
@@ -170,4 +250,11 @@ fn watch_path(watcher: &mut RecommendedWatcher, path: &Path, label: &str) -> boo
             false
         }
     }
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
 }
