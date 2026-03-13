@@ -51,12 +51,19 @@ impl ForgeActor {
         loop {
             // Poll the queue for the next job.
             let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-            self.queue_tx
+            if let Err(error) = self
+                .queue_tx
                 .send(QueueMsg::PollNext { reply: reply_tx })
                 .await
-                .ok();
+            {
+                warn!(err = %error, "forge: queue actor unavailable while polling");
+                return Ok(());
+            }
 
-            let Some(job) = reply_rx.await.ok().flatten() else {
+            let Some(job) = reply_rx
+                .await
+                .context("forge: queue poll response dropped")?
+            else {
                 // No work available; back off before polling again.
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                 continue;
@@ -71,13 +78,17 @@ impl ForgeActor {
                 }
             };
 
-            let _ = self
+            if let Err(error) = self
                 .queue_tx
                 .send(QueueMsg::Complete {
                     job_id: job.job_id,
                     success,
                 })
-                .await;
+                .await
+            {
+                warn!(job_id = job.job_id, err = %error, "forge: failed to report job completion");
+                return Ok(());
+            }
 
             let _ = self.sse_tx.send(SseEvent::JobCompleted {
                 job_id: job.job_id,
@@ -144,7 +155,10 @@ impl ForgeActor {
             .stderr(std::process::Stdio::piped());
 
         let mut child = cmd.spawn().context("failed to spawn ffmpeg pass 1")?;
-        let stderr = child.stderr.take().expect("stderr piped");
+        let stderr = child
+            .stderr
+            .take()
+            .context("ffmpeg pass 1 stderr was not piped")?;
         let reader = BufReader::new(stderr);
         let mut lines = reader.lines();
 
@@ -210,8 +224,7 @@ impl ForgeActor {
         // Remove any existing -map 0:s or -c:s entries from LLM args
         let mut i = 0;
         while i < args.len() {
-            let is_sub_map =
-                args[i] == "-map" && args.get(i + 1).map_or(false, |v| v.contains(":s"));
+            let is_sub_map = args[i] == "-map" && args.get(i + 1).is_some_and(|v| v.contains(":s"));
             let is_sub_codec = args[i] == "-c:s";
             if is_sub_map || is_sub_codec {
                 args.remove(i); // remove flag
@@ -285,7 +298,7 @@ impl ForgeActor {
         let mut child = cmd.spawn().context("failed to spawn ffmpeg")?;
 
         // Drain stderr to prevent pipe buffer deadlock.
-        let stderr = child.stderr.take().expect("stderr piped");
+        let stderr = child.stderr.take().context("ffmpeg stderr was not piped")?;
         tokio::spawn(async move {
             let reader = BufReader::new(stderr);
             let mut lines = reader.lines();
@@ -293,7 +306,7 @@ impl ForgeActor {
         });
 
         // Parse progress from stdout.
-        let stdout = child.stdout.take().expect("stdout piped");
+        let stdout = child.stdout.take().context("ffmpeg stdout was not piped")?;
         let job_id = job.job_id;
         let duration = self.get_duration(job).await;
         let sse_tx = self.sse_tx.clone();

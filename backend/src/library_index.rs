@@ -149,6 +149,9 @@ pub async fn run_full_rescan(
                 let pool = pool.clone();
                 let library_root = scan_library_root.clone();
                 async move {
+                    let checksum_blake3 =
+                        filesystem_audit::blake3_checksum(Path::new(&candidate.file_path)).await?;
+
                     db::upsert_library_index_entry(
                         &pool,
                         &candidate.relative_path,
@@ -161,6 +164,7 @@ pub async fn run_full_rescan(
                         candidate.device_id,
                         candidate.inode,
                         candidate.link_count,
+                        Some(&checksum_blake3),
                         candidate.library_id.as_deref(),
                     )
                     .await?;
@@ -168,13 +172,15 @@ pub async fn run_full_rescan(
                     managed_items::sync_library_file(
                         &pool,
                         &library_root,
-                        &candidate.relative_path,
-                        &candidate.file_path,
-                        &candidate.file_name,
-                        &candidate.media_type,
-                        candidate.size_bytes,
-                        candidate.modified_at,
-                        candidate.library_id.as_deref(),
+                        managed_items::SyncLibraryFileInput {
+                            relative_path: &candidate.relative_path,
+                            file_path: &candidate.file_path,
+                            file_name: &candidate.file_name,
+                            media_type: &candidate.media_type,
+                            size_bytes: candidate.size_bytes,
+                            modified_at: candidate.modified_at,
+                            library_id: candidate.library_id.as_deref(),
+                        },
                     )
                     .await
                 }
@@ -186,7 +192,7 @@ pub async fn run_full_rescan(
             scanned_items += 1;
             let total = discovered_total.load(Ordering::Relaxed).max(scanned_items);
 
-            if scanned_items % 200 == 0 {
+            if scanned_items.is_multiple_of(200) {
                 db::update_library_scan_progress(&pool, scanned_items, total).await?;
                 let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(
                     LibraryIndexScanProgress {
@@ -313,6 +319,7 @@ pub async fn apply_library_path_change(
         .unwrap_or_default()
         .to_ascii_lowercase();
     let facts = filesystem_audit::file_system_facts(&metadata);
+    let checksum_blake3 = filesystem_audit::blake3_checksum(path).await?;
 
     let library_id = match_library_id(&relative_path, libraries);
     db::upsert_library_index_entry(
@@ -327,6 +334,7 @@ pub async fn apply_library_path_change(
         facts.device_id,
         facts.inode,
         facts.link_count,
+        Some(&checksum_blake3),
         library_id.as_deref(),
     )
     .await?;
@@ -334,13 +342,15 @@ pub async fn apply_library_path_change(
     managed_items::sync_library_file(
         pool,
         library_root,
-        &relative_path,
-        &path.display().to_string(),
-        &file_name,
-        media_type,
-        metadata.len(),
-        modified_at,
-        library_id.as_deref(),
+        managed_items::SyncLibraryFileInput {
+            relative_path: &relative_path,
+            file_path: &path.display().to_string(),
+            file_name: &file_name,
+            media_type,
+            size_bytes: metadata.len(),
+            modified_at,
+            library_id: library_id.as_deref(),
+        },
     )
     .await?;
 
@@ -399,6 +409,7 @@ async fn refresh_media_for_metadata_sidecar(
             .map(|value| value.as_secs())
             .unwrap_or(0);
         let facts = filesystem_audit::file_system_facts(&metadata);
+        let checksum_blake3 = filesystem_audit::blake3_checksum(&candidate).await?;
         let library_id = match_library_id(&relative_path, libraries);
 
         db::upsert_library_index_entry(
@@ -413,6 +424,7 @@ async fn refresh_media_for_metadata_sidecar(
             facts.device_id,
             facts.inode,
             facts.link_count,
+            Some(&checksum_blake3),
             library_id.as_deref(),
         )
         .await?;
@@ -420,13 +432,15 @@ async fn refresh_media_for_metadata_sidecar(
         managed_items::sync_library_file(
             pool,
             library_root,
-            &relative_path,
-            &candidate.display().to_string(),
-            &file_name,
-            media_type,
-            metadata.len(),
-            modified_at,
-            library_id.as_deref(),
+            managed_items::SyncLibraryFileInput {
+                relative_path: &relative_path,
+                file_path: &candidate.display().to_string(),
+                file_name: &file_name,
+                media_type,
+                size_bytes: metadata.len(),
+                modified_at,
+                library_id: library_id.as_deref(),
+            },
         )
         .await?;
     }

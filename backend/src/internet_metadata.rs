@@ -291,14 +291,7 @@ fn normalize_title_and_year(input: &str) -> Option<(String, Option<u16>)> {
         .map(|(left, _)| left)
         .unwrap_or(input);
 
-    let cleaned = stem
-        .replace('.', " ")
-        .replace('_', " ")
-        .replace('-', " ")
-        .replace('[', " ")
-        .replace(']', " ")
-        .replace('(', " ")
-        .replace(')', " ");
+    let cleaned = stem.replace(['.', '_', '-', '[', ']', '(', ')'], " ");
 
     let tokens = cleaned
         .split_whitespace()
@@ -308,13 +301,12 @@ fn normalize_title_and_year(input: &str) -> Option<(String, Option<u16>)> {
 
     let mut year: Option<u16> = None;
     for token in &tokens {
-        if token.len() == 4 {
-            if let Ok(value) = token.parse::<u16>() {
-                if (1900..=2099).contains(&value) {
-                    year = Some(value);
-                    break;
-                }
-            }
+        if token.len() == 4
+            && let Ok(value) = token.parse::<u16>()
+            && (1900..=2099).contains(&value)
+        {
+            year = Some(value);
+            break;
         }
     }
 
@@ -736,9 +728,11 @@ fn first_present_string(item: &Value, keys: &[&str]) -> Option<String> {
                 (!trimmed.is_empty()).then(|| trimmed.to_string())
             }
             Value::Number(number) => Some(number.to_string()),
-            Value::Object(map) => map.get("name").and_then(Value::as_str).map(str::trim).and_then(
-                |text| (!text.is_empty()).then(|| text.to_string()),
-            ),
+            Value::Object(map) => map
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .and_then(|text| (!text.is_empty()).then(|| text.to_string())),
             _ => None,
         })
     })
@@ -789,7 +783,11 @@ fn build_tvdb_source_url(item: &Value, tvdb_id: Option<u64>, media_kind: &str) -
         ));
     }
 
-    let path_kind = if media_kind == "movie" { "movie" } else { "series" };
+    let path_kind = if media_kind == "movie" {
+        "movie"
+    } else {
+        "series"
+    };
     tvdb_id.map(|id| format!("https://thetvdb.com/dereferrer/{}/{}", path_kind, id))
 }
 
@@ -838,7 +836,10 @@ mod tests {
         assert_eq!(matches[0].tvdb_id, Some(12345));
         assert_eq!(matches[0].year, Some(2023));
         assert_eq!(matches[0].media_kind, "series");
-        assert_eq!(matches[0].source_url.as_deref(), Some("https://thetvdb.com/series/will-trent"));
+        assert_eq!(
+            matches[0].source_url.as_deref(),
+            Some("https://thetvdb.com/series/will-trent")
+        );
     }
 
     #[test]
@@ -863,8 +864,14 @@ mod tests {
         assert_eq!(matches.len(), 1);
         assert_eq!(matches[0].tvdb_id, Some(67890));
         assert_eq!(matches[0].year, Some(2023));
-        assert_eq!(matches[0].poster_url.as_deref(), Some("https://images.example/thumb.jpg"));
-        assert_eq!(matches[0].overview.as_deref(), Some("Nested search response"));
+        assert_eq!(
+            matches[0].poster_url.as_deref(),
+            Some("https://images.example/thumb.jpg")
+        );
+        assert_eq!(
+            matches[0].overview.as_deref(),
+            Some("Nested search response")
+        );
         assert_eq!(
             matches[0].source_url.as_deref(),
             Some("https://thetvdb.com/dereferrer/series/67890")

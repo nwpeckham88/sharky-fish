@@ -34,18 +34,46 @@
 	let actionWarning = $state('');
 	let status = $state('');
 	let requestedPath = $state<string | null>(null);
+	let requestedLibraryId = $state<string | null>(null);
+	let autoPreviewRequested = $state(false);
 
 	onMount(async () => {
 		libraries = await fetchLibraries().catch(() => []);
 		const urlLibrary = page.url.searchParams.get('library');
 		requestedPath = page.url.searchParams.get('path');
+		requestedLibraryId = urlLibrary;
+		autoPreviewRequested = page.url.searchParams.get('autopreview') === '1';
 		if (libraries.length > 0) {
 			activeLibraryId = libraries.find((library) => library.id === urlLibrary)?.id ?? libraries[0].id;
 			await loadLibraryItems();
 		}
 	});
 
+	async function resolveRequestedPathLibrary(): Promise<string | null> {
+		if (!requestedPath || libraries.length === 0) return null;
+		if (requestedLibraryId && libraries.some((library) => library.id === requestedLibraryId)) {
+			return requestedLibraryId;
+		}
+
+		for (const library of libraries) {
+			const response = await fetchLibrary('', 400, 0, library.id);
+			if (response.items.some((item) => item.relative_path === requestedPath)) {
+				return library.id;
+			}
+		}
+
+		return null;
+	}
+
 	async function loadLibraryItems() {
+		if (requestedPath && !requestedLibraryId) {
+			const resolvedLibraryId = await resolveRequestedPathLibrary();
+			if (resolvedLibraryId && resolvedLibraryId !== activeLibraryId) {
+				activeLibraryId = resolvedLibraryId;
+				requestedLibraryId = resolvedLibraryId;
+			}
+		}
+
 		if (!activeLibraryId) return;
 		loading = true;
 		try {
@@ -55,9 +83,14 @@
 				const match = response.items.find((item) => item.relative_path === requestedPath) ?? null;
 				if (match) {
 					selectItem(match);
-					await loadSavedSelection(match.relative_path);
+					const hasSavedSelection = await loadSavedSelection(match.relative_path);
+					if (hasSavedSelection && autoPreviewRequested) {
+						await previewRename();
+						status = 'Loaded saved metadata selection and generated an organize preview.';
+					}
 				}
 				requestedPath = null;
+				autoPreviewRequested = false;
 			}
 		} finally {
 			loading = false;
@@ -79,7 +112,7 @@
 		writeNfo = true;
 	}
 
-	async function loadSavedSelection(path: string) {
+	async function loadSavedSelection(path: string): Promise<boolean> {
 		actionError = '';
 		actionWarning = '';
 		try {
@@ -87,9 +120,12 @@
 			chosenMatch = selected?.selected ?? null;
 			if (selected?.selected) {
 				status = 'Loaded saved metadata selection.';
+				return true;
 			}
+			return false;
 		} catch (error) {
 			actionError = error instanceof Error ? error.message : 'Failed to load saved selection';
+			return false;
 		}
 	}
 
@@ -248,6 +284,21 @@
 					{#if selected.filesystem.is_hard_linked}
 						<div class="rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">
 							This item is hard-linked. Organize-only changes keep the same inode and preserve the shared storage relationship.
+						</div>
+					{/if}
+
+					{#if chosenMatch}
+						<div class="rounded-lg border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-3 py-2 text-xs text-[color:var(--olive)]">
+							<div class="font-semibold uppercase tracking-[0.12em]">Selected Metadata</div>
+							<div class="mt-1 text-[color:var(--ink-strong)]">{chosenMatch.title}{chosenMatch.year ? ` (${chosenMatch.year})` : ''}</div>
+							<div class="mt-1 uppercase tracking-[0.08em] text-[11px] text-[color:var(--ink-muted)]">{chosenMatch.provider}</div>
+							{#if chosenMatch.imdb_id || chosenMatch.tvdb_id}
+								<div class="mt-1 text-[11px] text-[color:var(--ink-muted)]">
+									{#if chosenMatch.imdb_id}IMDb {chosenMatch.imdb_id}{/if}
+									{#if chosenMatch.imdb_id && chosenMatch.tvdb_id} · {/if}
+									{#if chosenMatch.tvdb_id}TVDB {chosenMatch.tvdb_id}{/if}
+								</div>
+							{/if}
 						</div>
 					{/if}
 

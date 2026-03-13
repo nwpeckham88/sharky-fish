@@ -12,65 +12,54 @@ use tracing::{info, warn};
 
 use crate::messages::SseEvent;
 
+pub struct EnqueueJobOptions<'a> {
+    pub auto_approve: bool,
+    pub proposal: Option<&'a ReviewProposal>,
+    pub initial_status_override: Option<&'a str>,
+    pub group_key: Option<&'a str>,
+    pub group_label: Option<&'a str>,
+    pub group_kind: &'a str,
+}
+
 pub async fn enqueue_job(
     pool: &SqlitePool,
     sse_tx: &broadcast::Sender<SseEvent>,
-    auto_approve: bool,
     media: &IdentifiedMedia,
     decision: &mut crate::messages::ProcessingDecision,
-    proposal: Option<&ReviewProposal>,
-    initial_status_override: Option<&str>,
-    group_key: Option<&str>,
-    group_label: Option<&str>,
-    group_kind: &str,
+    options: EnqueueJobOptions<'_>,
 ) -> Result<i64> {
     let file_path = media.path.to_string_lossy().to_string();
-    let initial_status = initial_status_override.unwrap_or(if auto_approve {
-        "APPROVED"
-    } else {
-        "AWAITING_APPROVAL"
-    });
+    let initial_status = options
+        .initial_status_override
+        .unwrap_or(if options.auto_approve {
+            "APPROVED"
+        } else {
+            "AWAITING_APPROVAL"
+        });
 
-    let job_id = db::insert_job(
-        pool,
-        &file_path,
-        initial_status,
-        group_key,
-        group_label,
-        group_kind,
-    )
-    .await?;
+    let task_payload = serde_json::to_string(&decision.arguments)?;
+    let bundle = db::InsertJobBundleInput {
+        file_path: &file_path,
+        status: initial_status,
+        group_key: options.group_key,
+        group_label: options.group_label,
+        group_kind: options.group_kind,
+        probe: &media.probe,
+        decision,
+        proposal: options.proposal,
+        requires_two_pass: decision.requires_two_pass,
+        transcode_payload: &task_payload,
+    };
+    let job_id = db::insert_job_bundle(pool, &bundle).await?;
     decision.job_id = job_id;
-    db::upsert_job_analysis(pool, job_id, &media.probe, decision, proposal).await?;
-
-    if decision.requires_two_pass {
-        db::insert_task(pool, job_id, 1, "AUDIO_SCAN", None).await?;
-        db::insert_task(
-            pool,
-            job_id,
-            2,
-            "TRANSCODE",
-            Some(&serde_json::to_string(&decision.arguments)?),
-        )
-        .await?;
-    } else {
-        db::insert_task(
-            pool,
-            job_id,
-            1,
-            "TRANSCODE",
-            Some(&serde_json::to_string(&decision.arguments)?),
-        )
-        .await?;
-    }
 
     let _ = sse_tx.send(SseEvent::JobCreated {
         job_id,
         file_path: file_path.clone(),
         status: initial_status.into(),
-        group_key: group_key.map(str::to_string),
-        group_label: group_label.map(str::to_string),
-        group_kind: group_kind.into(),
+        group_key: options.group_key.map(str::to_string),
+        group_label: options.group_label.map(str::to_string),
+        group_kind: options.group_kind.into(),
     });
 
     info!(job_id, file = %file_path, "queue: job enqueued");
@@ -169,17 +158,19 @@ impl QueueActor {
         enqueue_job(
             &self.pool,
             &self.sse_tx,
-            auto_approve,
             media,
             decision,
-            None,
-            None,
-            group.as_ref().map(|value| value.key.as_str()),
-            group.as_ref().map(|value| value.label.as_str()),
-            group
-                .as_ref()
-                .map(|value| value.kind.as_str())
-                .unwrap_or("file"),
+            EnqueueJobOptions {
+                auto_approve,
+                proposal: None,
+                initial_status_override: None,
+                group_key: group.as_ref().map(|value| value.key.as_str()),
+                group_label: group.as_ref().map(|value| value.label.as_str()),
+                group_kind: group
+                    .as_ref()
+                    .map(|value| value.kind.as_str())
+                    .unwrap_or("file"),
+            },
         )
         .await?;
         Ok(())

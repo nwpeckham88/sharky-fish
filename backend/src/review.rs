@@ -17,10 +17,12 @@ pub fn build_review_proposal(
     decision: &ProcessingDecision,
 ) -> ReviewProposal {
     let scope = selected_metadata
-        .map(|selected| match selected.media_kind.trim().to_ascii_lowercase().as_str() {
-            "movie" => "movie_folder",
-            _ => "file",
-        })
+        .map(
+            |selected| match selected.media_kind.trim().to_ascii_lowercase().as_str() {
+                "movie" => "movie_folder",
+                _ => "file",
+            },
+        )
         .unwrap_or("file")
         .to_string();
 
@@ -106,7 +108,10 @@ pub fn build_review_proposal(
 }
 
 fn re_source_reason(probe: &MediaProbe) -> Option<String> {
-    let video = probe.streams.iter().find(|stream| stream.codec_type == "video")?;
+    let video = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type == "video")?;
     let codec = video.codec_name.trim().to_ascii_lowercase();
     let width = video.width.unwrap_or(0);
     let height = video.height.unwrap_or(0);

@@ -69,19 +69,35 @@ pub struct SelectedMetadataPersistOutcome {
     pub metadata_sidecar_warning: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct SyncLibraryFileInput<'a> {
+    pub relative_path: &'a str,
+    pub file_path: &'a str,
+    pub file_name: &'a str,
+    pub media_type: &'a str,
+    pub size_bytes: u64,
+    pub modified_at: u64,
+    pub library_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ListFilteredOptions<'a> {
+    pub managed_status: Option<&'a str>,
+    pub missing_metadata_only: bool,
+    pub missing_sidecar_only: bool,
+    pub needs_attention_only: bool,
+    pub organize_needed_only: bool,
+    pub limit: i64,
+    pub offset: i64,
+}
+
 pub async fn sync_library_file(
     pool: &SqlitePool,
     library_root: &Path,
-    relative_path: &str,
-    file_path: &str,
-    file_name: &str,
-    media_type: &str,
-    size_bytes: u64,
-    modified_at: u64,
-    library_id: Option<&str>,
+    input: SyncLibraryFileInput<'_>,
 ) -> Result<()> {
-    let existing = db::fetch_managed_item(pool, relative_path).await?;
-    let sidecar_doc = sidecar::read_sidecar(library_root, relative_path).await?;
+    let existing = db::fetch_managed_item(pool, input.relative_path).await?;
+    let sidecar_doc = sidecar::read_sidecar(library_root, input.relative_path).await?;
     let now = unix_now();
 
     let managed_status = sidecar_doc
@@ -116,7 +132,11 @@ pub async fn sync_library_file(
     let review_note = sidecar_doc
         .as_ref()
         .and_then(|value| value.review_note.clone())
-        .or_else(|| existing.as_ref().and_then(|value| value.review_note.clone()));
+        .or_else(|| {
+            existing
+                .as_ref()
+                .and_then(|value| value.review_note.clone())
+        });
     let review_updated_at = sidecar_doc
         .as_ref()
         .and_then(|value| value.review_updated_at)
@@ -132,17 +152,18 @@ pub async fn sync_library_file(
         .or_else(|| sidecar_doc.as_ref().and_then(|value| value.first_seen_at))
         .unwrap_or(now);
 
-    let sidecar_path = sidecar::find_metadata_sidecar_relative_path(library_root, relative_path).await?;
+    let sidecar_path =
+        sidecar::find_metadata_sidecar_relative_path(library_root, input.relative_path).await?;
 
     db::upsert_managed_item(
         pool,
-        relative_path,
-        file_path,
-        file_name,
-        media_type,
-        size_bytes,
-        modified_at,
-        library_id,
+        input.relative_path,
+        input.file_path,
+        input.file_name,
+        input.media_type,
+        input.size_bytes,
+        input.modified_at,
+        input.library_id,
         &managed_status,
         review_note.as_deref(),
         review_updated_at,
@@ -201,7 +222,9 @@ pub async fn persist_selected_metadata(
             }
         }
         _ => {
-            let written_path = sidecar::write_jellyfin_nfo(library_root, relative_path, selected, None, None).await?;
+            let written_path =
+                sidecar::write_jellyfin_nfo(library_root, relative_path, selected, None, None)
+                    .await?;
             metadata_sidecar_written = written_path.is_some();
             written_path
         }
@@ -284,8 +307,8 @@ pub async fn list_unprocessed(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<IntakeManagedItem>> {
-    let rows = db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0)
-        .await?;
+    let rows =
+        db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
     let items = aggregate_backlog_items(config, rows)?;
     Ok(paginate_items(
         items
@@ -300,63 +323,84 @@ pub async fn list_unprocessed(
 pub async fn list_filtered(
     pool: &SqlitePool,
     config: &AppConfig,
-    managed_status: Option<&str>,
-    missing_metadata_only: bool,
-    missing_sidecar_only: bool,
-    needs_attention_only: bool,
-    organize_needed_only: bool,
-    limit: i64,
-    offset: i64,
+    options: ListFilteredOptions<'_>,
 ) -> Result<Vec<IntakeManagedItem>> {
-    let rows = db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0)
-        .await?;
+    let rows =
+        db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
     let items = aggregate_backlog_items(config, rows)?;
 
     Ok(paginate_items(
         items
             .into_iter()
             .filter(|item| {
-                if let Some(status) = managed_status {
-                    if item.managed_status != status {
-                        return false;
-                    }
-                }
-                if missing_metadata_only && !item.missing_metadata {
+                if let Some(status) = options.managed_status
+                    && item.managed_status != status
+                {
                     return false;
                 }
-                if missing_sidecar_only && !item.missing_sidecar {
+                if options.missing_metadata_only && !item.missing_metadata {
                     return false;
                 }
-                if organize_needed_only && !item.organize_needed {
+                if options.missing_sidecar_only && !item.missing_sidecar {
                     return false;
                 }
-                if needs_attention_only && !item_needs_attention(item) {
+                if options.organize_needed_only && !item.organize_needed {
+                    return false;
+                }
+                if options.needs_attention_only && !item_needs_attention(item) {
                     return false;
                 }
                 true
             })
             .collect(),
-        limit,
-        offset,
+        options.limit,
+        options.offset,
     ))
 }
 
 pub async fn summarize(pool: &SqlitePool, config: &AppConfig) -> Result<BacklogSummary> {
-    let all_rows = db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0)
-        .await?;
+    let all_rows =
+        db::list_managed_items_filtered(pool, None, false, false, false, i64::MAX, 0).await?;
     let items = aggregate_backlog_items(config, all_rows)?;
 
     Ok(BacklogSummary {
         total_items: items.len() as u64,
-        needs_attention_count: items.iter().filter(|item| item_needs_attention(item)).count() as u64,
-        unprocessed_count: items.iter().filter(|item| item.managed_status == "UNPROCESSED").count() as u64,
-        reviewed_count: items.iter().filter(|item| item.managed_status == "REVIEWED").count() as u64,
-        re_source_count: items.iter().filter(|item| item.managed_status == "RE_SOURCE").count() as u64,
-        kept_original_count: items.iter().filter(|item| item.managed_status == "KEPT_ORIGINAL").count() as u64,
-        awaiting_approval_count: items.iter().filter(|item| item.managed_status == "AWAITING_APPROVAL").count() as u64,
-        approved_count: items.iter().filter(|item| item.managed_status == "APPROVED").count() as u64,
-        processed_count: items.iter().filter(|item| item.managed_status == "PROCESSED").count() as u64,
-        failed_count: items.iter().filter(|item| item.managed_status == "FAILED").count() as u64,
+        needs_attention_count: items
+            .iter()
+            .filter(|item| item_needs_attention(item))
+            .count() as u64,
+        unprocessed_count: items
+            .iter()
+            .filter(|item| item.managed_status == "UNPROCESSED")
+            .count() as u64,
+        reviewed_count: items
+            .iter()
+            .filter(|item| item.managed_status == "REVIEWED")
+            .count() as u64,
+        re_source_count: items
+            .iter()
+            .filter(|item| item.managed_status == "RE_SOURCE")
+            .count() as u64,
+        kept_original_count: items
+            .iter()
+            .filter(|item| item.managed_status == "KEPT_ORIGINAL")
+            .count() as u64,
+        awaiting_approval_count: items
+            .iter()
+            .filter(|item| item.managed_status == "AWAITING_APPROVAL")
+            .count() as u64,
+        approved_count: items
+            .iter()
+            .filter(|item| item.managed_status == "APPROVED")
+            .count() as u64,
+        processed_count: items
+            .iter()
+            .filter(|item| item.managed_status == "PROCESSED")
+            .count() as u64,
+        failed_count: items
+            .iter()
+            .filter(|item| item.managed_status == "FAILED")
+            .count() as u64,
         missing_metadata_count: items.iter().filter(|item| item.missing_metadata).count() as u64,
         missing_sidecar_count: items.iter().filter(|item| item.missing_sidecar).count() as u64,
         organize_needed_count: items.iter().filter(|item| item.organize_needed).count() as u64,
@@ -402,7 +446,14 @@ pub async fn update_managed_status(
         .await?
         .with_context(|| format!("managed item not found for {}", relative_path))?;
 
-    db::update_managed_item_status(pool, relative_path, managed_status, review_updated_at, unix_now()).await?;
+    db::update_managed_item_status(
+        pool,
+        relative_path,
+        managed_status,
+        review_updated_at,
+        unix_now(),
+    )
+    .await?;
 
     let updated_row = db::fetch_managed_item(pool, relative_path)
         .await?
@@ -548,7 +599,8 @@ fn aggregate_backlog_items(
     rows: Vec<db::ManagedItemRow>,
 ) -> Result<Vec<IntakeManagedItem>> {
     let mut items = Vec::new();
-    let mut grouped_rows = std::collections::HashMap::<String, (JobGroup, Vec<db::ManagedItemRow>)>::new();
+    let mut grouped_rows =
+        std::collections::HashMap::<String, (JobGroup, Vec<db::ManagedItemRow>)>::new();
 
     for row in rows {
         if let Some(group) = backlog_group_for_row(config, &row) {
@@ -576,7 +628,9 @@ fn backlog_group_for_row(config: &AppConfig, row: &db::ManagedItemRow) -> Option
         .as_deref()
         .and_then(|json| serde_json::from_str::<InternetMetadataMatch>(json).ok())
         .and_then(job_group_from_selected_metadata)
-        .or_else(|| derive_tv_group_from_library(config, &row.relative_path, row.library_id.as_deref()))
+        .or_else(|| {
+            derive_tv_group_from_library(config, &row.relative_path, row.library_id.as_deref())
+        })
         .or_else(|| derive_tv_group_from_path_heuristic(&row.relative_path))
 }
 
@@ -598,7 +652,9 @@ fn derive_tv_group_from_path_heuristic(relative_path: &str) -> Option<JobGroup> 
         return None;
     }
 
-    let has_episode_pattern = segments.iter().any(|segment| contains_episode_marker(segment));
+    let has_episode_pattern = segments
+        .iter()
+        .any(|segment| contains_episode_marker(segment));
     let has_season_folder = segments.iter().any(|segment| is_season_segment(segment));
     if !has_episode_pattern && !has_season_folder {
         return None;
@@ -678,7 +734,9 @@ fn intake_item_from_group(
         .collect::<Vec<_>>();
     let missing_metadata = rows.iter().any(row_missing_metadata);
     let missing_sidecar = rows.iter().any(row_missing_sidecar);
-    let organize_needed = rows.iter().any(|row| managed_item_needs_organize(config, row));
+    let organize_needed = rows
+        .iter()
+        .any(|row| managed_item_needs_organize(config, row));
     let selected_metadata = if missing_metadata {
         None
     } else {
@@ -722,14 +780,20 @@ fn intake_item_from_group(
     })
 }
 
-fn compare_managed_item_rows(left: &db::ManagedItemRow, right: &db::ManagedItemRow) -> std::cmp::Ordering {
+fn compare_managed_item_rows(
+    left: &db::ManagedItemRow,
+    right: &db::ManagedItemRow,
+) -> std::cmp::Ordering {
     status_priority(&left.managed_status)
         .cmp(&status_priority(&right.managed_status))
         .then_with(|| right.modified_at.cmp(&left.modified_at))
         .then_with(|| left.relative_path.cmp(&right.relative_path))
 }
 
-fn compare_backlog_items(left: &IntakeManagedItem, right: &IntakeManagedItem) -> std::cmp::Ordering {
+fn compare_backlog_items(
+    left: &IntakeManagedItem,
+    right: &IntakeManagedItem,
+) -> std::cmp::Ordering {
     status_priority(&left.managed_status)
         .cmp(&status_priority(&right.managed_status))
         .then_with(|| right.modified_at.cmp(&left.modified_at))
@@ -761,7 +825,11 @@ fn row_missing_sidecar(row: &db::ManagedItemRow) -> bool {
     row.sidecar_path.is_none()
 }
 
-fn paginate_items(items: Vec<IntakeManagedItem>, limit: i64, offset: i64) -> Vec<IntakeManagedItem> {
+fn paginate_items(
+    items: Vec<IntakeManagedItem>,
+    limit: i64,
+    offset: i64,
+) -> Vec<IntakeManagedItem> {
     items
         .into_iter()
         .skip(offset.max(0) as usize)
@@ -814,13 +882,15 @@ pub async fn reconcile_after_organize(
     sync_library_file(
         pool,
         library_root,
-        target_relative_path,
-        &target_abs.display().to_string(),
-        &file_name,
-        media_type,
-        metadata.len(),
-        modified_at,
-        existing.library_id.as_deref(),
+        SyncLibraryFileInput {
+            relative_path: target_relative_path,
+            file_path: &target_abs.display().to_string(),
+            file_name: &file_name,
+            media_type,
+            size_bytes: metadata.len(),
+            modified_at,
+            library_id: existing.library_id.as_deref(),
+        },
     )
     .await?;
 
@@ -904,12 +974,23 @@ fn intake_item_from_row(config: &AppConfig, row: db::ManagedItemRow) -> Result<I
     })
 }
 
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|value| value.as_secs())
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::LibraryFolder;
 
-    fn row(relative_path: &str, status: &str, selected_metadata_json: Option<&str>) -> db::ManagedItemRow {
+    fn row(
+        relative_path: &str,
+        status: &str,
+        selected_metadata_json: Option<&str>,
+    ) -> db::ManagedItemRow {
         row_with_library(relative_path, "tv", status, selected_metadata_json)
     }
 
@@ -922,7 +1003,11 @@ mod tests {
         db::ManagedItemRow {
             relative_path: relative_path.into(),
             file_path: format!("/data/{relative_path}"),
-            file_name: relative_path.rsplit('/').next().unwrap_or(relative_path).into(),
+            file_name: relative_path
+                .rsplit('/')
+                .next()
+                .unwrap_or(relative_path)
+                .into(),
             media_type: "video".into(),
             size_bytes: 100,
             modified_at: 10,
@@ -957,14 +1042,15 @@ mod tests {
     }
 
     fn config() -> AppConfig {
-        let mut config = AppConfig::default();
-        config.libraries = vec![LibraryFolder {
-            id: "tv".into(),
-            name: "TV".into(),
-            path: "tv".into(),
-            media_type: "tv".into(),
-        }];
-        config
+        AppConfig {
+            libraries: vec![LibraryFolder {
+                id: "tv".into(),
+                name: "TV".into(),
+                path: "tv".into(),
+                media_type: "tv".into(),
+            }],
+            ..AppConfig::default()
+        }
     }
 
     #[test]
@@ -973,8 +1059,16 @@ mod tests {
         let items = aggregate_backlog_items(
             &config,
             vec![
-                row("tv/Fallout/Season 01/Fallout - S01E01.mkv", "UNPROCESSED", Some(&series_metadata("Fallout"))),
-                row("tv/Fallout/Season 01/Fallout - S01E02.mkv", "REVIEWED", Some(&series_metadata("Fallout"))),
+                row(
+                    "tv/Fallout/Season 01/Fallout - S01E01.mkv",
+                    "UNPROCESSED",
+                    Some(&series_metadata("Fallout")),
+                ),
+                row(
+                    "tv/Fallout/Season 01/Fallout - S01E02.mkv",
+                    "REVIEWED",
+                    Some(&series_metadata("Fallout")),
+                ),
             ],
         )
         .expect("grouped backlog items");
@@ -991,7 +1085,12 @@ mod tests {
         let config = config();
         let items = aggregate_backlog_items(
             &config,
-            vec![row_with_library("movies/Dune (2021).mkv", "movies", "UNPROCESSED", None)],
+            vec![row_with_library(
+                "movies/Dune (2021).mkv",
+                "movies",
+                "UNPROCESSED",
+                None,
+            )],
         )
         .expect("backlog items");
 
@@ -1006,8 +1105,16 @@ mod tests {
         let items = aggregate_backlog_items(
             &config,
             vec![
-                row("Fallout/Season 01/Fallout - S01E01.mkv", "UNPROCESSED", None),
-                row("Fallout/Season 01/Fallout - S01E02.mkv", "UNPROCESSED", None),
+                row(
+                    "Fallout/Season 01/Fallout - S01E01.mkv",
+                    "UNPROCESSED",
+                    None,
+                ),
+                row(
+                    "Fallout/Season 01/Fallout - S01E02.mkv",
+                    "UNPROCESSED",
+                    None,
+                ),
             ],
         )
         .expect("grouped backlog items");
@@ -1024,8 +1131,18 @@ mod tests {
         let items = aggregate_backlog_items(
             &config,
             vec![
-                row_with_library("tv/Will Trent/Season 04/Will Trent - S04E02.mkv", "unknown", "UNPROCESSED", None),
-                row_with_library("tv/Will Trent/Season 04/Will Trent - S04E03.mkv", "unknown", "UNPROCESSED", None),
+                row_with_library(
+                    "tv/Will Trent/Season 04/Will Trent - S04E02.mkv",
+                    "unknown",
+                    "UNPROCESSED",
+                    None,
+                ),
+                row_with_library(
+                    "tv/Will Trent/Season 04/Will Trent - S04E03.mkv",
+                    "unknown",
+                    "UNPROCESSED",
+                    None,
+                ),
             ],
         )
         .expect("heuristic grouped backlog items");
@@ -1035,11 +1152,4 @@ mod tests {
         assert_eq!(items[0].group_label.as_deref(), Some("Will Trent"));
         assert_eq!(items[0].member_count, 2);
     }
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|value| value.as_secs())
-        .unwrap_or(0)
 }

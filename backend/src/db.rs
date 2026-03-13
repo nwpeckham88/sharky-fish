@@ -1,10 +1,10 @@
-use crate::internet_metadata::InternetMetadataMatch;
 use crate::filesystem_audit::FileSystemFacts;
+use crate::internet_metadata::InternetMetadataMatch;
 use crate::library::{LibrarySortBy, LibrarySortDirection};
 use crate::messages::{MediaProbe, ProcessingDecision, ReviewProposal};
 use anyhow::Result;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{FromRow, Row, SqlitePool};
+use sqlx::{FromRow, Row, SqliteConnection, SqlitePool};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -67,8 +67,6 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     .await?;
 
     ensure_column(pool, "job_analysis", "proposal_json", "TEXT").await?;
-    ensure_column(pool, "managed_items", "review_note", "TEXT").await?;
-    ensure_column(pool, "managed_items", "review_updated_at", "INTEGER").await?;
 
     // Composite index for queue polling.
     sqlx::query(
@@ -90,6 +88,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             file_path       TEXT PRIMARY KEY,
             size_bytes      INTEGER NOT NULL,
             modified_at     INTEGER NOT NULL,
+            device_id       INTEGER NOT NULL DEFAULT 0,
+            inode           INTEGER NOT NULL DEFAULT 0,
+            link_count      INTEGER NOT NULL DEFAULT 1,
             format          TEXT NOT NULL,
             duration_secs   REAL NOT NULL,
             video_codec     TEXT,
@@ -101,6 +102,50 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
             probe_json      TEXT NOT NULL,
             updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
         )",
+    )
+    .execute(pool)
+    .await?;
+
+    ensure_column(
+        pool,
+        "media_metadata",
+        "device_id",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "media_metadata",
+        "inode",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
+    ensure_column(
+        pool,
+        "media_metadata",
+        "link_count",
+        "INTEGER NOT NULL DEFAULT 1",
+    )
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS download_checksum_cache (
+            file_path       TEXT PRIMARY KEY,
+            size_bytes      INTEGER NOT NULL,
+            modified_at     INTEGER NOT NULL,
+            device_id       INTEGER NOT NULL DEFAULT 0,
+            inode           INTEGER NOT NULL DEFAULT 0,
+            link_count      INTEGER NOT NULL DEFAULT 1,
+            checksum_blake3 TEXT NOT NULL,
+            updated_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_download_checksum_cache_updated
+         ON download_checksum_cache (updated_at DESC)",
     )
     .execute(pool)
     .await?;
@@ -167,9 +212,22 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     .execute(pool)
     .await?;
 
-    ensure_column(pool, "library_index", "device_id", "INTEGER NOT NULL DEFAULT 0").await?;
+    ensure_column(
+        pool,
+        "library_index",
+        "device_id",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    .await?;
     ensure_column(pool, "library_index", "inode", "INTEGER NOT NULL DEFAULT 0").await?;
-    ensure_column(pool, "library_index", "link_count", "INTEGER NOT NULL DEFAULT 1").await?;
+    ensure_column(
+        pool,
+        "library_index",
+        "link_count",
+        "INTEGER NOT NULL DEFAULT 1",
+    )
+    .await?;
+    ensure_column(pool, "library_index", "checksum_blake3", "TEXT").await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_library_index_modified
@@ -181,6 +239,13 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_library_index_library_id
          ON library_index (library_id, modified_at DESC)",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_library_index_checksum
+         ON library_index (checksum_blake3)",
     )
     .execute(pool)
     .await?;
@@ -222,6 +287,9 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     )
     .execute(pool)
     .await?;
+
+    ensure_column(pool, "managed_items", "review_note", "TEXT").await?;
+    ensure_column(pool, "managed_items", "review_updated_at", "INTEGER").await?;
 
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_managed_items_status_modified
@@ -306,6 +374,9 @@ pub struct CachedMediaMetadata {
     pub file_path: String,
     pub size_bytes: i64,
     pub modified_at: i64,
+    pub device_id: i64,
+    pub inode: i64,
+    pub link_count: i64,
     pub format: String,
     pub duration_secs: f64,
     pub video_codec: Option<String>,
@@ -316,6 +387,32 @@ pub struct CachedMediaMetadata {
     pub stream_count: i64,
     pub probe_json: String,
     pub updated_at: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
+pub struct DownloadChecksumCacheRow {
+    pub file_path: String,
+    pub size_bytes: i64,
+    pub modified_at: i64,
+    pub device_id: i64,
+    pub inode: i64,
+    pub link_count: i64,
+    pub checksum_blake3: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct InsertJobBundleInput<'a> {
+    pub file_path: &'a str,
+    pub status: &'a str,
+    pub group_key: Option<&'a str>,
+    pub group_label: Option<&'a str>,
+    pub group_kind: &'a str,
+    pub probe: &'a MediaProbe,
+    pub decision: &'a ProcessingDecision,
+    pub proposal: Option<&'a ReviewProposal>,
+    pub requires_two_pass: bool,
+    pub transcode_payload: &'a str,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, FromRow)]
@@ -421,35 +518,41 @@ pub struct ManagedItemRow {
 pub struct LibraryInodeRecord {
     pub relative_path: String,
     pub file_name: String,
+    pub library_id: Option<String>,
     pub device_id: i64,
     pub inode: i64,
+    pub checksum_blake3: Option<String>,
 }
 
-/// Insert a new job and return its id.
-pub async fn insert_job(
-    pool: &SqlitePool,
+async fn insert_job_with_connection(
+    connection: &mut SqliteConnection,
     file_path: &str,
     status: &str,
     group_key: Option<&str>,
     group_label: Option<&str>,
     group_kind: &str,
 ) -> Result<i64> {
-    let id = sqlx::query(
-		"INSERT INTO jobs (file_path, status, group_key, group_label, group_kind) VALUES (?, ?, ?, ?, ?)",
-	)
-        .bind(file_path)
-        .bind(status)
-        .bind(group_key)
-        .bind(group_label)
-        .bind(group_kind)
-        .execute(pool)
-        .await?
-        .last_insert_rowid();
-    Ok(id)
+    sqlx::query(
+        "INSERT INTO jobs (file_path, status, group_key, group_label, group_kind)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(file_path)
+    .bind(status)
+    .bind(group_key)
+    .bind(group_label)
+    .bind(group_kind)
+    .execute(&mut *connection)
+    .await?;
+
+    let row = sqlx::query("SELECT last_insert_rowid() AS id")
+        .fetch_one(&mut *connection)
+        .await?;
+    let job_id: i64 = row.try_get("id")?;
+    Ok(job_id)
 }
 
-pub async fn upsert_job_analysis(
-    pool: &SqlitePool,
+async fn upsert_job_analysis_with_connection(
+    connection: &mut SqliteConnection,
     job_id: i64,
     probe: &MediaProbe,
     decision: &ProcessingDecision,
@@ -460,8 +563,8 @@ pub async fn upsert_job_analysis(
     let proposal_json = proposal.map(serde_json::to_string).transpose()?;
 
     sqlx::query(
-        "INSERT INTO job_analysis (job_id, probe_json, decision_json, proposal_json, updated_at)
-         VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        "INSERT INTO job_analysis (job_id, probe_json, decision_json, proposal_json)
+         VALUES (?, ?, ?, ?)
          ON CONFLICT(job_id) DO UPDATE SET
             probe_json = excluded.probe_json,
             decision_json = excluded.decision_json,
@@ -472,31 +575,10 @@ pub async fn upsert_job_analysis(
     .bind(probe_json)
     .bind(decision_json)
     .bind(proposal_json)
-    .execute(pool)
+    .execute(&mut *connection)
     .await?;
 
     Ok(())
-}
-
-/// Insert a task for a given job.
-pub async fn insert_task(
-    pool: &SqlitePool,
-    job_id: i64,
-    step_order: i64,
-    task_type: &str,
-    payload: Option<&str>,
-) -> Result<i64> {
-    let id = sqlx::query(
-        "INSERT INTO tasks (job_id, step_order, task_type, payload) VALUES (?, ?, ?, ?)",
-    )
-    .bind(job_id)
-    .bind(step_order)
-    .bind(task_type)
-    .bind(payload)
-    .execute(pool)
-    .await?
-    .last_insert_rowid();
-    Ok(id)
 }
 
 /// Update job status.
@@ -705,7 +787,7 @@ pub async fn fetch_media_metadata(
     file_path: &str,
 ) -> Result<Option<CachedMediaMetadata>> {
     let row = sqlx::query_as::<_, CachedMediaMetadata>(
-        "SELECT file_path, size_bytes, modified_at, format, duration_secs, video_codec, audio_codec, width, height, audio_channels, stream_count, probe_json, updated_at
+        "SELECT file_path, size_bytes, modified_at, device_id, inode, link_count, format, duration_secs, video_codec, audio_codec, width, height, audio_channels, stream_count, probe_json, updated_at
          FROM media_metadata WHERE file_path = ?",
     )
     .bind(file_path)
@@ -718,8 +800,7 @@ pub async fn fetch_media_metadata(
 pub async fn upsert_media_metadata(
     pool: &SqlitePool,
     file_path: &str,
-    size_bytes: u64,
-    modified_at: u64,
+    filesystem: &FileSystemFacts,
     probe: &MediaProbe,
 ) -> Result<()> {
     let video_stream = probe
@@ -734,12 +815,15 @@ pub async fn upsert_media_metadata(
 
     sqlx::query(
         "INSERT INTO media_metadata (
-            file_path, size_bytes, modified_at, format, duration_secs, video_codec, audio_codec,
+                file_path, size_bytes, modified_at, device_id, inode, link_count, format, duration_secs, video_codec, audio_codec,
             width, height, audio_channels, stream_count, probe_json, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
          ON CONFLICT(file_path) DO UPDATE SET
             size_bytes = excluded.size_bytes,
             modified_at = excluded.modified_at,
+                device_id = excluded.device_id,
+                inode = excluded.inode,
+                link_count = excluded.link_count,
             format = excluded.format,
             duration_secs = excluded.duration_secs,
             video_codec = excluded.video_codec,
@@ -752,8 +836,11 @@ pub async fn upsert_media_metadata(
             updated_at = CURRENT_TIMESTAMP",
     )
     .bind(file_path)
-    .bind(size_bytes as i64)
-    .bind(modified_at as i64)
+    .bind(filesystem.size_bytes as i64)
+    .bind(filesystem.modified_at as i64)
+    .bind(filesystem.device_id as i64)
+    .bind(filesystem.inode as i64)
+    .bind(filesystem.link_count as i64)
     .bind(&probe.format)
     .bind(probe.duration_secs)
     .bind(video_stream.map(|stream| stream.codec_name.clone()))
@@ -771,6 +858,165 @@ pub async fn upsert_media_metadata(
     .await?;
 
     Ok(())
+}
+
+pub async fn list_download_checksum_cache(
+    pool: &SqlitePool,
+) -> Result<Vec<DownloadChecksumCacheRow>> {
+    let rows = sqlx::query_as::<_, DownloadChecksumCacheRow>(
+        "SELECT file_path, size_bytes, modified_at, device_id, inode, link_count, checksum_blake3, updated_at
+         FROM download_checksum_cache",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows)
+}
+
+pub async fn fetch_download_checksum_cache(
+    pool: &SqlitePool,
+    file_path: &str,
+) -> Result<Option<DownloadChecksumCacheRow>> {
+    let row = sqlx::query_as::<_, DownloadChecksumCacheRow>(
+        "SELECT file_path, size_bytes, modified_at, device_id, inode, link_count, checksum_blake3, updated_at
+         FROM download_checksum_cache
+         WHERE file_path = ?",
+    )
+    .bind(file_path)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row)
+}
+
+pub async fn upsert_download_checksum_cache(
+    pool: &SqlitePool,
+    file_path: &str,
+    filesystem: &FileSystemFacts,
+    checksum_blake3: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO download_checksum_cache (
+            file_path, size_bytes, modified_at, device_id, inode, link_count, checksum_blake3, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+         ON CONFLICT(file_path) DO UPDATE SET
+            size_bytes = excluded.size_bytes,
+            modified_at = excluded.modified_at,
+            device_id = excluded.device_id,
+            inode = excluded.inode,
+            link_count = excluded.link_count,
+            checksum_blake3 = excluded.checksum_blake3,
+            updated_at = CURRENT_TIMESTAMP",
+    )
+    .bind(file_path)
+    .bind(filesystem.size_bytes as i64)
+    .bind(filesystem.modified_at as i64)
+    .bind(filesystem.device_id as i64)
+    .bind(filesystem.inode as i64)
+    .bind(filesystem.link_count as i64)
+    .bind(checksum_blake3)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn delete_download_checksum_cache(pool: &SqlitePool, file_path: &str) -> Result<()> {
+    sqlx::query("DELETE FROM download_checksum_cache WHERE file_path = ?")
+        .bind(file_path)
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+async fn insert_task_with_connection(
+    connection: &mut SqliteConnection,
+    job_id: i64,
+    step_order: i64,
+    task_type: &str,
+    payload: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO tasks (job_id, step_order, task_type, payload)
+         VALUES (?, ?, ?, ?)",
+    )
+    .bind(job_id)
+    .bind(step_order)
+    .bind(task_type)
+    .bind(payload)
+    .execute(&mut *connection)
+    .await?;
+
+    Ok(())
+}
+
+pub async fn insert_job_bundle(pool: &SqlitePool, input: &InsertJobBundleInput<'_>) -> Result<i64> {
+    let mut connection = pool.acquire().await?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *connection)
+        .await?;
+
+    let result = async {
+        let job_id = insert_job_with_connection(
+            &mut connection,
+            input.file_path,
+            input.status,
+            input.group_key,
+            input.group_label,
+            input.group_kind,
+        )
+        .await?;
+
+        let mut persisted_decision = input.decision.clone();
+        persisted_decision.job_id = job_id;
+        upsert_job_analysis_with_connection(
+            &mut connection,
+            job_id,
+            input.probe,
+            &persisted_decision,
+            input.proposal,
+        )
+        .await?;
+
+        if input.requires_two_pass {
+            insert_task_with_connection(&mut connection, job_id, 1, "AUDIO_SCAN", None).await?;
+            insert_task_with_connection(
+                &mut connection,
+                job_id,
+                2,
+                "TRANSCODE",
+                Some(input.transcode_payload),
+            )
+            .await?;
+        } else {
+            insert_task_with_connection(
+                &mut connection,
+                job_id,
+                1,
+                "TRANSCODE",
+                Some(input.transcode_payload),
+            )
+            .await?;
+        }
+
+        Ok::<i64, anyhow::Error>(job_id)
+    }
+    .await;
+
+    match result {
+        Ok(job_id) => {
+            sqlx::query("COMMIT").execute(&mut *connection).await?;
+            Ok(job_id)
+        }
+        Err(error) => {
+            let rollback_error = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+            if let Err(rollback_error) = rollback_error {
+                return Err(error.context(format!("transaction rollback failed: {rollback_error}")));
+            }
+            Err(error)
+        }
+    }
 }
 
 pub async fn insert_library_event(
@@ -909,6 +1155,7 @@ pub async fn rename_selected_internet_metadata(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_library_index_entry(
     pool: &SqlitePool,
     relative_path: &str,
@@ -921,13 +1168,14 @@ pub async fn upsert_library_index_entry(
     device_id: u64,
     inode: u64,
     link_count: u64,
+    checksum_blake3: Option<&str>,
     library_id: Option<&str>,
 ) -> Result<()> {
     sqlx::query(
         "INSERT INTO library_index (
             relative_path, file_path, file_name, extension, media_type,
-            size_bytes, modified_at, device_id, inode, link_count, library_id, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            size_bytes, modified_at, device_id, inode, link_count, checksum_blake3, library_id, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
          ON CONFLICT(relative_path) DO UPDATE SET
             file_path = excluded.file_path,
             file_name = excluded.file_name,
@@ -938,6 +1186,7 @@ pub async fn upsert_library_index_entry(
             device_id = excluded.device_id,
             inode = excluded.inode,
             link_count = excluded.link_count,
+            checksum_blake3 = excluded.checksum_blake3,
             library_id = excluded.library_id,
             updated_at = CURRENT_TIMESTAMP",
     )
@@ -951,6 +1200,7 @@ pub async fn upsert_library_index_entry(
     .bind(device_id as i64)
     .bind(inode as i64)
     .bind(link_count as i64)
+    .bind(checksum_blake3)
     .bind(library_id)
     .execute(pool)
     .await?;
@@ -973,6 +1223,7 @@ pub async fn clear_library_index(pool: &SqlitePool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn list_library_index(
     pool: &SqlitePool,
     query_like: Option<&str>,
@@ -1016,14 +1267,14 @@ pub async fn list_library_index(
     );
 
     let rows = sqlx::query_as::<_, LibraryIndexRow>(&query)
-    .bind(library_id)
-    .bind(query_like)
-    .bind(media_type)
-    .bind(managed_status)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(pool)
-    .await?;
+        .bind(library_id)
+        .bind(query_like)
+        .bind(media_type)
+        .bind(managed_status)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(pool)
+        .await?;
 
     Ok(rows)
 }
@@ -1105,7 +1356,7 @@ pub async fn list_library_index_candidates(
 
 pub async fn list_library_inode_records(pool: &SqlitePool) -> Result<Vec<LibraryInodeRecord>> {
     let rows = sqlx::query_as::<_, LibraryInodeRecord>(
-        "SELECT relative_path, file_name, device_id, inode
+        "SELECT relative_path, file_name, library_id, device_id, inode, checksum_blake3
          FROM library_index
          WHERE device_id > 0 AND inode > 0",
     )
@@ -1114,18 +1365,37 @@ pub async fn list_library_inode_records(pool: &SqlitePool) -> Result<Vec<Library
 
     Ok(rows)
 }
-fn library_index_order_clause(sort_by: LibrarySortBy, sort_direction: LibrarySortDirection) -> &'static str {
+fn library_index_order_clause(
+    sort_by: LibrarySortBy,
+    sort_direction: LibrarySortDirection,
+) -> &'static str {
     match (sort_by, sort_direction) {
-        (LibrarySortBy::ModifiedAt, LibrarySortDirection::Asc) => "l.modified_at ASC, l.relative_path ASC",
-        (LibrarySortBy::ModifiedAt, LibrarySortDirection::Desc) => "l.modified_at DESC, l.relative_path ASC",
-        (LibrarySortBy::SizeBytes, LibrarySortDirection::Asc) => "l.size_bytes ASC, l.relative_path ASC",
-        (LibrarySortBy::SizeBytes, LibrarySortDirection::Desc) => "l.size_bytes DESC, l.relative_path ASC",
-        (LibrarySortBy::FileName, LibrarySortDirection::Asc) => "l.file_name ASC, l.relative_path ASC",
-        (LibrarySortBy::FileName, LibrarySortDirection::Desc) => "l.file_name DESC, l.relative_path ASC",
+        (LibrarySortBy::ModifiedAt, LibrarySortDirection::Asc) => {
+            "l.modified_at ASC, l.relative_path ASC"
+        }
+        (LibrarySortBy::ModifiedAt, LibrarySortDirection::Desc) => {
+            "l.modified_at DESC, l.relative_path ASC"
+        }
+        (LibrarySortBy::SizeBytes, LibrarySortDirection::Asc) => {
+            "l.size_bytes ASC, l.relative_path ASC"
+        }
+        (LibrarySortBy::SizeBytes, LibrarySortDirection::Desc) => {
+            "l.size_bytes DESC, l.relative_path ASC"
+        }
+        (LibrarySortBy::FileName, LibrarySortDirection::Asc) => {
+            "l.file_name ASC, l.relative_path ASC"
+        }
+        (LibrarySortBy::FileName, LibrarySortDirection::Desc) => {
+            "l.file_name DESC, l.relative_path ASC"
+        }
         (LibrarySortBy::RelativePath, LibrarySortDirection::Asc) => "l.relative_path ASC",
         (LibrarySortBy::RelativePath, LibrarySortDirection::Desc) => "l.relative_path DESC",
-        (LibrarySortBy::MediaType, LibrarySortDirection::Asc) => "l.media_type ASC, l.relative_path ASC",
-        (LibrarySortBy::MediaType, LibrarySortDirection::Desc) => "l.media_type DESC, l.relative_path ASC",
+        (LibrarySortBy::MediaType, LibrarySortDirection::Asc) => {
+            "l.media_type ASC, l.relative_path ASC"
+        }
+        (LibrarySortBy::MediaType, LibrarySortDirection::Desc) => {
+            "l.media_type DESC, l.relative_path ASC"
+        }
         (LibrarySortBy::ManagedStatus, LibrarySortDirection::Asc) => {
             "COALESCE(m.managed_status, 'UNPROCESSED') ASC, l.relative_path ASC"
         }
@@ -1282,6 +1552,7 @@ pub async fn fetch_managed_item(
     Ok(row)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn upsert_managed_item(
     pool: &SqlitePool,
     relative_path: &str,

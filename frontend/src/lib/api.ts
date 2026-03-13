@@ -353,6 +353,7 @@ export interface DownloadsSummary {
 	total_items: number;
 	total_bytes: number;
 	linked_import_count: number;
+	checksum_duplicate_count: number;
 	orphan_count: number;
 	possibly_duplicated_count: number;
 	hard_linked_count: number;
@@ -366,8 +367,10 @@ export interface DownloadItem {
 	modified_at: number;
 	path_root_kind: string;
 	filesystem: FileSystemFacts;
+	checksum_blake3: string;
 	classification: string;
 	linked_library_paths_count: number;
+	checksum_library_paths_count: number;
 	duplicate_library_paths_count: number;
 }
 
@@ -379,9 +382,17 @@ export interface DownloadsItemsResponse {
 	summary: DownloadsSummary;
 }
 
+export interface DownloadsLibraryMatch {
+	path: string;
+	library_id: string | null;
+}
+
 export interface DownloadsLinkedPathsResponse {
 	path: string;
-	linked_paths: string[];
+	linked_paths: DownloadsLibraryMatch[];
+	checksum_paths: DownloadsLibraryMatch[];
+	heuristic_paths: DownloadsLibraryMatch[];
+	checksum_blake3: string;
 }
 
 export interface DeleteDownloadResponse {
@@ -824,7 +835,7 @@ export async function fetchDownloadsSummary(): Promise<DownloadsSummary> {
 
 export async function fetchDownloadItems(input: {
 	query?: string;
-	classification?: 'all' | 'linked_import' | 'download_orphan' | 'possibly_duplicated';
+	classification?: 'all' | 'linked_import' | 'checksum_duplicate' | 'download_orphan' | 'possibly_duplicated';
 	limit?: number;
 	offset?: number;
 } = {}): Promise<DownloadsItemsResponse> {

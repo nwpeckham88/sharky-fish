@@ -165,14 +165,32 @@ fn render_jellyfin_nfo(
 
     if let (Some(season), Some(episode)) = (season, episode) {
         xml.push_str("<episodedetails>\n");
-        push_xml_tag(&mut xml, 1, "title", &format!("{} - S{:02}E{:02}", selected.title, season, episode));
+        push_xml_tag(
+            &mut xml,
+            1,
+            "title",
+            &format!("{} - S{:02}E{:02}", selected.title, season, episode),
+        );
         push_xml_tag(&mut xml, 1, "showtitle", &selected.title);
         push_xml_tag(&mut xml, 1, "season", &season.to_string());
         push_xml_tag(&mut xml, 1, "episode", &episode.to_string());
-        push_xml_tag_if_some(&mut xml, 1, "year", selected.year.map(|value| value.to_string()).as_deref());
+        push_xml_tag_if_some(
+            &mut xml,
+            1,
+            "year",
+            selected.year.map(|value| value.to_string()).as_deref(),
+        );
         push_unique_ids(&mut xml, selected);
         push_xml_tag_if_some(&mut xml, 1, "plot", selected.overview.as_deref());
-        push_xml_tag_if_some(&mut xml, 1, "rating", selected.rating.map(|value| format!("{value:.1}")).as_deref());
+        push_xml_tag_if_some(
+            &mut xml,
+            1,
+            "rating",
+            selected
+                .rating
+                .map(|value| format!("{value:.1}"))
+                .as_deref(),
+        );
         for genre in &selected.genres {
             push_xml_tag(&mut xml, 1, "genre", genre);
         }
@@ -183,10 +201,23 @@ fn render_jellyfin_nfo(
     xml.push_str("<movie>\n");
     push_xml_tag(&mut xml, 1, "title", &selected.title);
     push_xml_tag(&mut xml, 1, "originaltitle", &selected.title);
-    push_xml_tag_if_some(&mut xml, 1, "year", selected.year.map(|value| value.to_string()).as_deref());
+    push_xml_tag_if_some(
+        &mut xml,
+        1,
+        "year",
+        selected.year.map(|value| value.to_string()).as_deref(),
+    );
     push_unique_ids(&mut xml, selected);
     push_xml_tag_if_some(&mut xml, 1, "plot", selected.overview.as_deref());
-    push_xml_tag_if_some(&mut xml, 1, "rating", selected.rating.map(|value| format!("{value:.1}")).as_deref());
+    push_xml_tag_if_some(
+        &mut xml,
+        1,
+        "rating",
+        selected
+            .rating
+            .map(|value| format!("{value:.1}"))
+            .as_deref(),
+    );
     for genre in &selected.genres {
         push_xml_tag(&mut xml, 1, "genre", genre);
     }
@@ -195,9 +226,19 @@ fn render_jellyfin_nfo(
 }
 
 fn push_unique_ids(xml: &mut String, selected: &InternetMetadataMatch) {
-    if let Some(imdb_id) = selected.imdb_id.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(imdb_id) = selected
+        .imdb_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         push_xml_tag(xml, 1, "id", imdb_id);
-        push_xml_tag_with_attrs(xml, 1, "uniqueid", &[('t', "type=\"imdb\" default=\"true\"")], imdb_id);
+        push_xml_tag_with_attrs(
+            xml,
+            1,
+            "uniqueid",
+            &[('t', "type=\"imdb\" default=\"true\"")],
+            imdb_id,
+        );
     }
     if let Some(tvdb_id) = selected.tvdb_id {
         push_xml_tag_with_attrs(

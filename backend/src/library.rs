@@ -64,8 +64,9 @@ pub struct LibraryResponse {
     pub scan: LibraryScanStatus,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LibrarySortBy {
+    #[default]
     ModifiedAt,
     SizeBytes,
     FileName,
@@ -87,15 +88,10 @@ impl LibrarySortBy {
     }
 }
 
-impl Default for LibrarySortBy {
-    fn default() -> Self {
-        Self::ModifiedAt
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum LibrarySortDirection {
     Asc,
+    #[default]
     Desc,
 }
 
@@ -105,12 +101,6 @@ impl LibrarySortDirection {
             "asc" => Self::Asc,
             _ => Self::Desc,
         }
-    }
-}
-
-impl Default for LibrarySortDirection {
-    fn default() -> Self {
-        Self::Desc
     }
 }
 
@@ -181,7 +171,10 @@ pub async fn list_from_index(
 
     let managed_status = options.managed_status.clone();
 
-    let (items, total_items) = if matches!(managed_status, Some(LibraryManagedStatusFilter::OrganizeNeeded)) {
+    let (items, total_items) = if matches!(
+        managed_status,
+        Some(LibraryManagedStatusFilter::OrganizeNeeded)
+    ) {
         let mut entries = db::list_library_index_candidates(
             pool,
             query_like.as_deref(),
@@ -207,7 +200,9 @@ pub async fn list_from_index(
             query_like.as_deref(),
             options.library_id.as_deref(),
             media_type.as_deref(),
-            managed_status.as_ref().and_then(LibraryManagedStatusFilter::as_db_value),
+            managed_status
+                .as_ref()
+                .and_then(LibraryManagedStatusFilter::as_db_value),
             options.sort_by,
             options.sort_direction,
             options.limit as i64,
@@ -220,7 +215,9 @@ pub async fn list_from_index(
             query_like.as_deref(),
             options.library_id.as_deref(),
             media_type.as_deref(),
-            managed_status.as_ref().and_then(LibraryManagedStatusFilter::as_db_value),
+            managed_status
+                .as_ref()
+                .and_then(LibraryManagedStatusFilter::as_db_value),
         )
         .await?;
 
@@ -333,7 +330,7 @@ fn sort_library_entries(
                 .cmp(&right.media_type)
                 .then_with(|| left.relative_path.cmp(&right.relative_path)),
             LibrarySortBy::ManagedStatus => normalized_status(left)
-                .cmp(&normalized_status(right))
+                .cmp(normalized_status(right))
                 .then_with(|| left.relative_path.cmp(&right.relative_path)),
         };
 

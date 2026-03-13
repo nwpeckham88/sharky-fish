@@ -239,8 +239,8 @@ pub async fn improve_system_prompt(
 
     let json: serde_json::Value = resp.json().await?;
     let content = extract_llm_content(&json)?;
-    let parsed: PromptImprovementOutput = serde_json::from_str(content)
-        .context("failed to parse improved prompt JSON output")?;
+    let parsed: PromptImprovementOutput =
+        serde_json::from_str(content).context("failed to parse improved prompt JSON output")?;
     Ok(parsed.prompt.trim().to_string())
 }
 
@@ -460,7 +460,7 @@ fn build_ollama_request(
     (url, body)
 }
 
-fn extract_llm_content<'a>(json: &'a serde_json::Value) -> Result<&'a str> {
+fn extract_llm_content(json: &serde_json::Value) -> Result<&str> {
     json.pointer("/candidates/0/content/parts/0/text")
         .or_else(|| json.pointer("/choices/0/message/content"))
         .or_else(|| json.pointer("/message/content"))

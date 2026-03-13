@@ -98,7 +98,8 @@ pub async fn preview_or_apply(
                 .map(Path::to_path_buf)
                 .unwrap_or_else(PathBuf::new);
             let source_container_str = source_container.to_string_lossy().replace('\\', "/");
-            let target_container = movie_target_container(&library_folder.path, &request.selected, id_mode);
+            let target_container =
+                movie_target_container(&library_folder.path, &request.selected, id_mode);
             let target_container = sanitize_relative_path(&target_container)?;
             let target_container_str = target_container.to_string_lossy().replace('\\', "/");
             let target_container_abs = library_root.join(&target_container);
@@ -166,7 +167,9 @@ pub async fn preview_or_apply(
     };
     let mut metadata_sidecar_written = false;
     if apply && request.write_nfo {
-        let (season, episode) = episode_numbers.map(|(s, e)| (Some(s), Some(e))).unwrap_or((None, None));
+        let (season, episode) = episode_numbers
+            .map(|(s, e)| (Some(s), Some(e)))
+            .unwrap_or((None, None));
         sidecar::write_jellyfin_nfo(
             library_root,
             &target_relative_str,
@@ -234,7 +237,14 @@ pub fn preview_target_relative_path(
     let target_relative = if library_folder.media_type == "tv" {
         let (season, episode) =
             infer_or_validate_episode_numbers(&current_relative_str, None, None)?;
-        build_tv_target(&library_folder.path, selected, season, episode, &extension, "none")
+        build_tv_target(
+            &library_folder.path,
+            selected,
+            season,
+            episode,
+            &extension,
+            "none",
+        )
     } else {
         build_movie_target(&library_folder.path, selected, &extension, "none")
     };
@@ -259,7 +269,11 @@ async fn apply_movie_folder_organization(
 
     let source_dir_relative = current_relative.parent().unwrap_or_else(|| Path::new(""));
     let source_dir_abs = library_root.join(source_dir_relative);
-    let target_dir_relative = PathBuf::from(movie_target_container(&library_folder.path, selected, "none"));
+    let target_dir_relative = PathBuf::from(movie_target_container(
+        &library_folder.path,
+        selected,
+        "none",
+    ));
     let target_dir_abs = library_root.join(&target_dir_relative);
 
     let source_stem = current_relative
@@ -571,7 +585,7 @@ fn infer_or_validate_episode_numbers(
 }
 
 pub fn infer_episode_numbers(relative_path: &str) -> Option<(u32, u32)> {
-	parse_sxxexx(relative_path)
+    parse_sxxexx(relative_path)
 }
 
 fn parse_sxxexx(input: &str) -> Option<(u32, u32)> {

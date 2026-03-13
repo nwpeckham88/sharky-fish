@@ -128,14 +128,25 @@ pub async fn get_or_probe_library_metadata(
     let file_path = full_path.display().to_string();
     let filesystem = filesystem_audit::file_system_facts(&fs_metadata);
 
-    if let Some(cached) = db::fetch_media_metadata(pool, &file_path).await? {
-        if cached.size_bytes as u64 == size_bytes && cached.modified_at as u64 == modified_at {
-            return from_cached(&sanitized, size_bytes, modified_at, cached, true, filesystem);
-        }
+    if let Some(cached) = db::fetch_media_metadata(pool, &file_path).await?
+        && cached.size_bytes as u64 == size_bytes
+        && cached.modified_at as u64 == modified_at
+        && cached.device_id as u64 == filesystem.device_id
+        && cached.inode as u64 == filesystem.inode
+        && cached.link_count as u64 == filesystem.link_count
+    {
+        return from_cached(
+            &sanitized,
+            size_bytes,
+            modified_at,
+            cached,
+            true,
+            filesystem,
+        );
     }
 
     let probe = probe_media(&full_path).await?;
-    db::upsert_media_metadata(pool, &file_path, size_bytes, modified_at, &probe).await?;
+    db::upsert_media_metadata(pool, &file_path, &filesystem, &probe).await?;
 
     Ok(from_probe(
         sanitized.to_string_lossy().replace('\\', "/"),

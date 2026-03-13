@@ -1,19 +1,22 @@
 <script lang="ts">
+	import { goto } from '$app/navigation';
 	import { onMount } from 'svelte';
 	import {
 		deleteDownloadItem,
 		fetchDownloadItems,
 		fetchDownloadLinkedPaths,
 		type DownloadItem,
+		type DownloadsLibraryMatch,
 		type DownloadsSummary
 	} from '$lib/api';
 	import { formatBytes, formatTimestamp } from '$lib/status';
 
-	type DownloadsFilter = 'all' | 'linked_import' | 'download_orphan' | 'possibly_duplicated';
+	type DownloadsFilter = 'all' | 'linked_import' | 'checksum_duplicate' | 'download_orphan' | 'possibly_duplicated';
 
 	const filters: Array<{ value: DownloadsFilter; label: string }> = [
 		{ value: 'all', label: 'All' },
 		{ value: 'linked_import', label: 'Linked Imports' },
+		{ value: 'checksum_duplicate', label: 'Checksum Duplicates' },
 		{ value: 'download_orphan', label: 'Orphans' },
 		{ value: 'possibly_duplicated', label: 'Possible Duplicates' }
 	];
@@ -23,6 +26,7 @@
 		total_items: 0,
 		total_bytes: 0,
 		linked_import_count: 0,
+		checksum_duplicate_count: 0,
 		orphan_count: 0,
 		possibly_duplicated_count: 0,
 		hard_linked_count: 0
@@ -31,7 +35,14 @@
 	let error = $state('');
 	let query = $state('');
 	let filter = $state<DownloadsFilter>('all');
-	let linkedPaths = $state<Record<string, string[]>>({});
+	type MatchGroups = {
+		linked_paths: DownloadsLibraryMatch[];
+		checksum_paths: DownloadsLibraryMatch[];
+		heuristic_paths: DownloadsLibraryMatch[];
+		checksum_blake3: string;
+	};
+
+	let linkedPaths = $state<Record<string, MatchGroups>>({});
 	let linkedLoading = $state<Record<string, boolean>>({});
 	let deleteBusy = $state<Record<string, boolean>>({});
 	let status = $state('');
@@ -68,6 +79,40 @@
 		}, 180);
 	}
 
+	async function loadLinkedPaths(item: DownloadItem) {
+		const existing = linkedPaths[item.relative_path];
+		if (existing) return existing;
+
+		linkedLoading = { ...linkedLoading, [item.relative_path]: true };
+		try {
+			const response = await fetchDownloadLinkedPaths(item.relative_path);
+			linkedPaths = { ...linkedPaths, [item.relative_path]: response };
+			return response;
+		} finally {
+			linkedLoading = { ...linkedLoading, [item.relative_path]: false };
+		}
+	}
+
+	function bestLibraryPathForMatch(match: MatchGroups): DownloadsLibraryMatch | null {
+		return match.linked_paths[0] ?? match.checksum_paths[0] ?? match.heuristic_paths[0] ?? null;
+	}
+
+	function libraryHref(match: DownloadsLibraryMatch): string {
+		const params = new URLSearchParams({ path: match.path });
+		if (match.library_id) {
+			params.set('library', match.library_id);
+		}
+		return `/library?${params.toString()}`;
+	}
+
+	function organizeHref(match: DownloadsLibraryMatch): string {
+		const params = new URLSearchParams({ path: match.path, autopreview: '1' });
+		if (match.library_id) {
+			params.set('library', match.library_id);
+		}
+		return `/organize?${params.toString()}`;
+	}
+
 	async function openLinkedPaths(item: DownloadItem) {
 		if (linkedPaths[item.relative_path]) {
 			const next = { ...linkedPaths };
@@ -78,12 +123,40 @@
 
 		linkedLoading = { ...linkedLoading, [item.relative_path]: true };
 		try {
-			const response = await fetchDownloadLinkedPaths(item.relative_path);
-			linkedPaths = { ...linkedPaths, [item.relative_path]: response.linked_paths };
+			const response = await loadLinkedPaths(item);
+			linkedPaths = { ...linkedPaths, [item.relative_path]: response };
 		} catch (loadError) {
 			status = loadError instanceof Error ? loadError.message : 'Failed to load linked library paths';
-		} finally {
-			linkedLoading = { ...linkedLoading, [item.relative_path]: false };
+		}
+	}
+
+	async function openBestLibraryMatch(item: DownloadItem) {
+		status = '';
+		try {
+			const response = await loadLinkedPaths(item);
+			const targetMatch = bestLibraryPathForMatch(response);
+			if (!targetMatch) {
+				status = 'No library match is available for this download yet.';
+				return;
+			}
+			await goto(libraryHref(targetMatch));
+		} catch (loadError) {
+			status = loadError instanceof Error ? loadError.message : 'Failed to resolve the best library match';
+		}
+	}
+
+	async function openBestOrganizeMatch(item: DownloadItem) {
+		status = '';
+		try {
+			const response = await loadLinkedPaths(item);
+			const targetMatch = bestLibraryPathForMatch(response);
+			if (!targetMatch) {
+				status = 'No library match is available to organize yet.';
+				return;
+			}
+			await goto(organizeHref(targetMatch));
+		} catch (loadError) {
+			status = loadError instanceof Error ? loadError.message : 'Failed to resolve the best organize target';
 		}
 	}
 
@@ -110,9 +183,24 @@
 
 	function classificationLabel(value: string): string {
 		if (value === 'linked_import') return 'Linked Import';
+		if (value === 'checksum_duplicate') return 'Checksum Duplicate';
 		if (value === 'download_orphan') return 'Orphan';
 		if (value === 'possibly_duplicated') return 'Possible Duplicate';
 		return value;
+	}
+
+	function shortChecksum(value: string): string {
+		return value.length > 16 ? `${value.slice(0, 16)}…` : value;
+	}
+
+	function bestMatchLabel(item: DownloadItem): string {
+		if (item.classification === 'linked_import') return 'Open Linked Import';
+		if (item.classification === 'checksum_duplicate') return 'Open Exact Duplicate';
+		return 'Open Best Match';
+	}
+
+	function canOpenBestMatch(item: DownloadItem): boolean {
+		return item.linked_library_paths_count > 0 || item.checksum_library_paths_count > 0 || item.duplicate_library_paths_count > 0;
 	}
 </script>
 
@@ -121,7 +209,7 @@
 		<p class="section-label">Downloads Audit</p>
 		<h2 class="mt-2 text-3xl text-[color:var(--ink-strong)]">Review download-folder hygiene before deleting anything</h2>
 		<p class="mt-3 text-sm leading-6 text-[color:var(--ink-muted)]">
-			This page compares the ingest root against the indexed library by inode so you can see which downloads are still sharing storage with imported library items.
+			This page compares the ingest root against the indexed library by inode and BLAKE3 checksum so you can separate hard-linked imports from exact duplicate content.
 		</p>
 	</div>
 
@@ -135,9 +223,10 @@
 	</div>
 </section>
 
-<section class="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+<section class="mb-5 grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
 	<div class="stat-card"><div class="section-label">Downloads</div><div class="mt-1 text-2xl font-semibold text-[color:var(--ink-strong)]">{summary.total_items}</div></div>
 	<div class="stat-card"><div class="section-label">Linked Imports</div><div class="mt-1 text-2xl font-semibold text-[color:var(--ink-strong)]">{summary.linked_import_count}</div></div>
+	<div class="stat-card"><div class="section-label">Checksum Duplicates</div><div class="mt-1 text-2xl font-semibold text-[color:var(--accent-deep)]">{summary.checksum_duplicate_count}</div></div>
 	<div class="stat-card"><div class="section-label">Orphans</div><div class="mt-1 text-2xl font-semibold text-[color:var(--danger)]">{summary.orphan_count}</div></div>
 	<div class="stat-card"><div class="section-label">Footprint</div><div class="mt-1 text-2xl font-semibold text-[color:var(--ink-strong)]">{formatBytes(summary.total_bytes)}</div><div class="mt-1 text-xs text-[color:var(--ink-muted)]">{summary.hard_linked_count} currently hard-linked</div></div>
 </section>
@@ -188,8 +277,14 @@
 						<p class="mt-1 break-all font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</p>
 					</div>
 					<div class="flex flex-wrap gap-2">
+						<button class="rounded-lg bg-[color:var(--accent)] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50" onclick={() => openBestLibraryMatch(item)} disabled={linkedLoading[item.relative_path] || !canOpenBestMatch(item)}>
+							{linkedLoading[item.relative_path] ? 'Resolving…' : bestMatchLabel(item)}
+						</button>
+						<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => openBestOrganizeMatch(item)} disabled={linkedLoading[item.relative_path] || !canOpenBestMatch(item)}>
+							{linkedLoading[item.relative_path] ? 'Resolving…' : 'Open In Organize'}
+						</button>
 						<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => openLinkedPaths(item)} disabled={linkedLoading[item.relative_path]}>
-							{linkedLoading[item.relative_path] ? 'Loading…' : linkedPaths[item.relative_path] ? 'Hide Library Links' : 'Open Matching Library Items'}
+							{linkedLoading[item.relative_path] ? 'Loading…' : linkedPaths[item.relative_path] ? 'Hide Library Matches' : 'Open Library Matches'}
 						</button>
 						<button class="rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-1.5 text-xs font-semibold text-[color:var(--danger)] disabled:opacity-50" onclick={() => removeItem(item)} disabled={deleteBusy[item.relative_path]}>
 							{deleteBusy[item.relative_path] ? 'Deleting…' : 'Delete'}
@@ -197,12 +292,19 @@
 					</div>
 				</div>
 
-				<div class="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+				<div class="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
 					<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5"><div class="section-label">Size</div><div class="mt-0.5 font-semibold text-[color:var(--ink-strong)]">{formatBytes(item.size_bytes)}</div></div>
 					<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5"><div class="section-label">Modified</div><div class="mt-0.5 font-semibold text-[color:var(--ink-strong)]">{formatTimestamp(item.modified_at)}</div></div>
 					<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5"><div class="section-label">Inode</div><div class="mt-0.5 font-semibold text-[color:var(--ink-strong)]">{item.filesystem.inode}</div><div class="mt-0.5 text-xs text-[color:var(--ink-muted)]">Device {item.filesystem.device_id}</div></div>
-					<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5"><div class="section-label">Library Matches</div><div class="mt-0.5 font-semibold text-[color:var(--ink-strong)]">{item.linked_library_paths_count}</div><div class="mt-0.5 text-xs text-[color:var(--ink-muted)]">{item.duplicate_library_paths_count} name heuristics</div></div>
+					<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5"><div class="section-label">Checksum</div><div class="mt-0.5 font-mono text-[11px] font-semibold text-[color:var(--ink-strong)]">{shortChecksum(item.checksum_blake3)}</div><div class="mt-0.5 text-xs text-[color:var(--ink-muted)]">BLAKE3 content hash</div></div>
+					<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5"><div class="section-label">Library Matches</div><div class="mt-0.5 font-semibold text-[color:var(--ink-strong)]">{item.linked_library_paths_count} inode</div><div class="mt-0.5 text-xs text-[color:var(--ink-muted)]">{item.checksum_library_paths_count} checksum · {item.duplicate_library_paths_count} name heuristics</div></div>
 				</div>
+
+				{#if item.classification === 'checksum_duplicate'}
+					<div class="mt-3 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">
+						This download has the same checksum as indexed library content, even though it is not sharing the same inode.
+					</div>
+				{/if}
 
 				{#if item.filesystem.is_hard_linked}
 					<div class="mt-3 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">
@@ -212,16 +314,49 @@
 
 				{#if linkedPaths[item.relative_path]}
 					<div class="mt-3 rounded-lg border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.45)] px-3 py-3">
-						<div class="section-label mb-2">Matching Library Paths</div>
-						{#if linkedPaths[item.relative_path].length === 0}
-							<div class="text-xs text-[color:var(--ink-muted)]">No linked library paths were found for this inode.</div>
-						{:else}
-							<div class="space-y-1.5">
-								{#each linkedPaths[item.relative_path] as path (path)}
-									<a href={`/library?path=${encodeURIComponent(path)}`} class="block break-all font-mono text-[11px] text-[color:var(--accent-deep)] hover:underline">{path}</a>
-								{/each}
+						<div class="section-label mb-2">Library Matches</div>
+						<div class="rounded-lg border border-[color:var(--line)] bg-white/40 px-3 py-2 text-xs text-[color:var(--ink-muted)]">
+							<div class="font-semibold text-[color:var(--ink-strong)]">BLAKE3</div>
+							<div class="mt-1 break-all font-mono">{linkedPaths[item.relative_path].checksum_blake3}</div>
+						</div>
+						<div class="mt-3 grid gap-3 lg:grid-cols-3">
+							<div>
+								<div class="mb-2 text-[10px] font-bold uppercase tracking-[0.12em] text-[color:var(--ink-muted)]">Same Inode</div>
+								{#if linkedPaths[item.relative_path].linked_paths.length === 0}
+									<div class="text-xs text-[color:var(--ink-muted)]">No hard-link matches.</div>
+								{:else}
+									<div class="space-y-1.5">
+										{#each linkedPaths[item.relative_path].linked_paths as match (match.path)}
+											<a href={libraryHref(match)} class="block break-all font-mono text-[11px] text-[color:var(--accent-deep)] hover:underline">{match.path}</a>
+										{/each}
+									</div>
+								{/if}
 							</div>
-						{/if}
+							<div>
+								<div class="mb-2 text-[10px] font-bold uppercase tracking-[0.12em] text-[color:var(--ink-muted)]">Same Checksum</div>
+								{#if linkedPaths[item.relative_path].checksum_paths.length === 0}
+									<div class="text-xs text-[color:var(--ink-muted)]">No checksum matches.</div>
+								{:else}
+									<div class="space-y-1.5">
+										{#each linkedPaths[item.relative_path].checksum_paths as match (match.path)}
+											<a href={libraryHref(match)} class="block break-all font-mono text-[11px] text-[color:var(--accent-deep)] hover:underline">{match.path}</a>
+										{/each}
+									</div>
+								{/if}
+							</div>
+							<div>
+								<div class="mb-2 text-[10px] font-bold uppercase tracking-[0.12em] text-[color:var(--ink-muted)]">Name Heuristics</div>
+								{#if linkedPaths[item.relative_path].heuristic_paths.length === 0}
+									<div class="text-xs text-[color:var(--ink-muted)]">No heuristic matches.</div>
+								{:else}
+									<div class="space-y-1.5">
+										{#each linkedPaths[item.relative_path].heuristic_paths as match (match.path)}
+											<a href={libraryHref(match)} class="block break-all font-mono text-[11px] text-[color:var(--accent-deep)] hover:underline">{match.path}</a>
+										{/each}
+									</div>
+								{/if}
+							</div>
+						</div>
 					</div>
 				{/if}
 			</div>

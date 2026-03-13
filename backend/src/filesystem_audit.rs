@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs::Metadata;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
@@ -65,6 +66,32 @@ pub async fn stat_path(path: &Path) -> Result<FileSystemFacts> {
     Ok(file_system_facts(&metadata))
 }
 
+pub async fn blake3_checksum(path: &Path) -> Result<String> {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || blake3_checksum_sync(&path))
+        .await
+        .context("failed to join checksum task")?
+}
+
+fn blake3_checksum_sync(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open {} for checksum", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 1024 * 1024];
+
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("failed to read {} for checksum", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
 pub fn collect_media_files(root: &Path, root_kind: &str) -> Result<Vec<AuditedFile>> {
     let mut items = Vec::new();
     if !root.exists() {
@@ -121,7 +148,9 @@ pub fn joined_path(root: &Path, relative_path: &str) -> Result<PathBuf> {
         match component {
             std::path::Component::Normal(value) => sanitized.push(value),
             std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => anyhow::bail!("parent directory traversal is not allowed"),
+            std::path::Component::ParentDir => {
+                anyhow::bail!("parent directory traversal is not allowed")
+            }
             std::path::Component::RootDir | std::path::Component::Prefix(_) => {
                 anyhow::bail!("invalid path component")
             }

@@ -55,8 +55,10 @@ export function createEventSource(
 		try {
 			const data: SseEvent = JSON.parse(msg.data);
 			onEvent(data);
-		} catch {
-			// ignore malformed messages
+		} catch (error) {
+			if (import.meta.env.DEV) {
+				console.warn('Ignoring malformed SSE message', { error, payload: msg.data });
+			}
 		}
 	};
 

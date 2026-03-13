@@ -6,13 +6,15 @@ use crate::downloads;
 use crate::filesystem_audit;
 use crate::internet_metadata;
 use crate::library;
+use crate::library::{
+    LibraryListOptions, LibraryManagedStatusFilter, LibrarySortBy, LibrarySortDirection,
+};
 use crate::library_index;
 use crate::managed_items;
 use crate::messages::{IdentifiedMedia, LibraryChange, ReviewExecutionMode, SseEvent};
 use crate::metadata;
 use crate::organizer;
 use crate::review;
-use crate::library::{LibraryListOptions, LibraryManagedStatusFilter, LibrarySortBy, LibrarySortDirection};
 use axum::{
     Router,
     extract::{Query, State},
@@ -175,8 +177,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/library/metadata", get(get_library_metadata))
         .route("/api/downloads/summary", get(get_downloads_summary))
         .route("/api/downloads/items", get(list_download_items))
-        .route("/api/downloads/linked-paths", get(get_download_linked_paths))
-        .route("/api/downloads/delete", axum::routing::post(delete_download_item))
+        .route(
+            "/api/downloads/linked-paths",
+            get(get_download_linked_paths),
+        )
+        .route(
+            "/api/downloads/delete",
+            axum::routing::post(delete_download_item),
+        )
         .route(
             "/api/library/internet",
             get(get_library_internet_metadata).post(save_selected_library_internet_metadata),
@@ -360,8 +368,8 @@ struct OrganizeLibraryFileRequest {
 struct SelectedInternetMetadataResponse {
     path: String,
     selected: internet_metadata::InternetMetadataMatch,
-	metadata_sidecar_written: bool,
-	metadata_sidecar_warning: Option<String>,
+    metadata_sidecar_written: bool,
+    metadata_sidecar_warning: Option<String>,
 }
 
 async fn list_jobs(
@@ -430,13 +438,15 @@ async fn list_backlog_items(
     match managed_items::list_filtered(
         &state.pool,
         &config,
-        managed_status,
-        missing_metadata_only,
-        missing_sidecar_only,
-        needs_attention_only,
-        organize_needed_only,
-        limit,
-        offset,
+        managed_items::ListFilteredOptions {
+            managed_status,
+            missing_metadata_only,
+            missing_sidecar_only,
+            needs_attention_only,
+            organize_needed_only,
+            limit,
+            offset,
+        },
     )
     .await
     {
@@ -459,7 +469,13 @@ async fn approve_job(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> impl IntoResponse {
-    transition_job_status(state, id, Some(ReviewExecutionMode::ProcessOnly), "APPROVED").await
+    transition_job_status(
+        state,
+        id,
+        Some(ReviewExecutionMode::ProcessOnly),
+        "APPROVED",
+    )
+    .await
 }
 
 async fn approve_job_mode(
@@ -479,7 +495,13 @@ async fn approve_job_group(
     State(state): State<Arc<AppState>>,
     axum::extract::Path(id): axum::extract::Path<i64>,
 ) -> impl IntoResponse {
-    transition_job_group_status(state, id, Some(ReviewExecutionMode::ProcessOnly), "APPROVED").await
+    transition_job_group_status(
+        state,
+        id,
+        Some(ReviewExecutionMode::ProcessOnly),
+        "APPROVED",
+    )
+    .await
 }
 
 async fn approve_job_group_mode(
@@ -561,7 +583,11 @@ async fn mark_job_group_re_source(
     };
 
     let Some(group_key) = job.group_key.as_ref().filter(|value| !value.is_empty()) else {
-        return (StatusCode::BAD_REQUEST, "job is not part of a TV show group").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "job is not part of a TV show group",
+        )
+            .into_response();
     };
 
     let pending_jobs = match db::list_jobs(&state.pool, 500, 0).await {
@@ -615,7 +641,11 @@ async fn mark_job_group_keep_original(
     };
 
     let Some(group_key) = job.group_key.as_ref().filter(|value| !value.is_empty()) else {
-        return (StatusCode::BAD_REQUEST, "job is not part of a TV show group").into_response();
+        return (
+            StatusCode::BAD_REQUEST,
+            "job is not part of a TV show group",
+        )
+            .into_response();
     };
 
     let pending_jobs = match db::list_jobs(&state.pool, 500, 0).await {
@@ -820,7 +850,10 @@ async fn complete_review_jobs(
         if matches!(job.status.as_str(), "PROCESSING" | "COMPLETED") {
             return Err((
                 StatusCode::CONFLICT,
-                format!("job {} can no longer be changed from {}", job.id, job.status),
+                format!(
+                    "job {} can no longer be changed from {}",
+                    job.id, job.status
+                ),
             ));
         }
     }
@@ -829,12 +862,13 @@ async fn complete_review_jobs(
         let analysis = db::fetch_job_with_analysis(&state.pool, job.id)
             .await
             .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-        let relative_path = job_relative_path(&state.library_path, &job.file_path).ok_or_else(|| {
-            (
-                StatusCode::BAD_REQUEST,
-                format!("job {} is not rooted in the managed library", job.id),
-            )
-        })?;
+        let relative_path =
+            job_relative_path(&state.library_path, &job.file_path).ok_or_else(|| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("job {} is not rooted in the managed library", job.id),
+                )
+            })?;
 
         let review_note = analysis.as_ref().and_then(|item| match managed_status {
             "RE_SOURCE" => item
@@ -1022,22 +1056,20 @@ async fn persist_job_transition(
         return;
     };
 
-    if let Ok(Some(job_with_analysis)) = db::fetch_job_with_analysis(&state.pool, job.id).await {
-        if let Some(decision) = job_with_analysis.decision {
-            if let Err(error) = managed_items::persist_processing_decision(
-                &state.pool,
-                &state.library_path,
-                &relative_path,
-                next_status,
-                &decision,
-                None,
-                review_updated_at,
-            )
-            .await
-            {
-                tracing::warn!(err = %error, path = relative_path, "failed to persist managed status change");
-            }
-        }
+    if let Ok(Some(job_with_analysis)) = db::fetch_job_with_analysis(&state.pool, job.id).await
+        && let Some(decision) = job_with_analysis.decision
+        && let Err(error) = managed_items::persist_processing_decision(
+            &state.pool,
+            &state.library_path,
+            &relative_path,
+            next_status,
+            &decision,
+            None,
+            review_updated_at,
+        )
+        .await
+    {
+        tracing::warn!(err = %error, path = relative_path, "failed to persist managed status change");
     }
 }
 
@@ -1122,7 +1154,7 @@ async fn update_bulk_intake_managed_status(
             Ok(()) => success_count += 1,
             Err(error) => failures.push(BulkFailure {
                 path: trimmed,
-                error: error,
+                error,
             }),
         }
     }
@@ -1210,7 +1242,9 @@ async fn create_intake_review_job_for_path(
     let proposal = review::build_review_proposal(
         &config,
         relative_path,
-        managed_item.as_ref().and_then(|item| item.library_id.as_deref()),
+        managed_item
+            .as_ref()
+            .and_then(|item| item.library_id.as_deref()),
         selected_metadata.as_ref(),
         metadata.filesystem.clone(),
         &metadata.probe,
@@ -1220,14 +1254,16 @@ async fn create_intake_review_job_for_path(
     let job_id = queue::enqueue_job(
         &state.pool,
         &state.sse_tx,
-        config.auto_approve_ai_jobs,
         &media,
         &mut decision,
-        Some(&proposal),
-        Some("AWAITING_APPROVAL"),
-        Some(group.key.as_str()),
-        Some(group.label.as_str()),
-        group.kind.as_str(),
+        queue::EnqueueJobOptions {
+            auto_approve: config.auto_approve_ai_jobs,
+            proposal: Some(&proposal),
+            initial_status_override: Some("AWAITING_APPROVAL"),
+            group_key: Some(group.key.as_str()),
+            group_label: Some(group.label.as_str()),
+            group_kind: group.kind.as_str(),
+        },
     )
     .await
     .map_err(|error| HandlerError {
@@ -1251,7 +1287,9 @@ async fn create_intake_review_job_for_path(
 
     if let Ok(Some(job)) = db::fetch_job_with_analysis(&state.pool, job_id).await {
         let mut jobs = enrich_jobs_with_filesystem(vec![job]).await;
-        return Ok(jobs.pop().expect("created job missing from enrichment result"));
+        return Ok(jobs
+            .pop()
+            .expect("created job missing from enrichment result"));
     }
 
     let fallback = db::fetch_job(&state.pool, job_id)
@@ -1280,12 +1318,13 @@ async fn create_intake_review_job_for_path(
     })
 }
 
-async fn enrich_jobs_with_filesystem(mut jobs: Vec<db::JobWithAnalysis>) -> Vec<db::JobWithAnalysis> {
+async fn enrich_jobs_with_filesystem(
+    mut jobs: Vec<db::JobWithAnalysis>,
+) -> Vec<db::JobWithAnalysis> {
     for job in &mut jobs {
-        job.filesystem = match filesystem_audit::stat_path(Path::new(&job.file_path)).await {
-            Ok(facts) => Some(facts),
-            Err(_) => None,
-        };
+        job.filesystem = filesystem_audit::stat_path(Path::new(&job.file_path))
+            .await
+            .ok();
     }
 
     jobs
@@ -1442,7 +1481,12 @@ async fn get_download_linked_paths(
     State(state): State<Arc<AppState>>,
     Query(params): Query<DownloadsQuery>,
 ) -> impl IntoResponse {
-    let Some(path) = params.path.as_deref().map(str::trim).filter(|value| !value.is_empty()) else {
+    let Some(path) = params
+        .path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
         return (StatusCode::BAD_REQUEST, "path is required").into_response();
     };
 
@@ -1822,17 +1866,19 @@ async fn save_selected_library_internet_metadata_for_path(
         Err(error) => {
             tracing::warn!(err = %error, path = path.trim(), "failed to persist managed item sidecar");
             managed_items::SelectedMetadataPersistOutcome {
-				metadata_sidecar_written: false,
-				metadata_sidecar_warning: Some("Metadata was saved, but the Jellyfin .nfo could not be refreshed.".into()),
-			}
+                metadata_sidecar_written: false,
+                metadata_sidecar_warning: Some(
+                    "Metadata was saved, but the Jellyfin .nfo could not be refreshed.".into(),
+                ),
+            }
         }
     };
 
     Ok(SelectedInternetMetadataResponse {
         path: path.trim().to_string(),
         selected: selected.clone(),
-		metadata_sidecar_written: persist_outcome.metadata_sidecar_written,
-		metadata_sidecar_warning: persist_outcome.metadata_sidecar_warning,
+        metadata_sidecar_written: persist_outcome.metadata_sidecar_written,
+        metadata_sidecar_warning: persist_outcome.metadata_sidecar_warning,
     })
 }
 
@@ -1869,8 +1915,8 @@ async fn get_selected_library_internet_metadata(
     Json(SelectedInternetMetadataResponse {
         path: row.relative_path,
         selected,
-		metadata_sidecar_written: false,
-		metadata_sidecar_warning: None,
+        metadata_sidecar_written: false,
+        metadata_sidecar_warning: None,
     })
     .into_response()
 }
@@ -1943,17 +1989,17 @@ async fn organize_library_file(
     .await
     {
         Ok(result) => {
-            if result.applied && result.changed {
-                if let Err(error) = managed_items::reconcile_after_organize(
+            if result.applied
+                && result.changed
+                && let Err(error) = managed_items::reconcile_after_organize(
                     &state.pool,
                     &state.library_path,
                     relative_path,
                     &result.target_relative_path,
                 )
                 .await
-                {
-                    tracing::warn!(err = %error, from = relative_path, to = %result.target_relative_path, "failed to reconcile managed item after organize");
-                }
+            {
+                tracing::warn!(err = %error, from = relative_path, to = %result.target_relative_path, "failed to reconcile managed item after organize");
             }
             Json(result).into_response()
         }

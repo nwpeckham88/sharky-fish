@@ -5,7 +5,7 @@ use crate::messages::{IngestEvent, LibraryChange, SseEvent};
 use anyhow::Result;
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher as _};
 use sqlx::SqlitePool;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, broadcast, mpsc};
@@ -45,26 +45,23 @@ impl WatcherActor {
     pub async fn run(self) -> Result<()> {
         let (notify_tx, mut notify_rx) = mpsc::channel::<notify::Result<Event>>(256);
 
-        // Spawn the blocking watcher on a dedicated thread since `notify` uses
-        // synchronous callbacks.
+        std::fs::create_dir_all(&self.ingest_path)?;
+        std::fs::create_dir_all(&self.library_path)?;
+
         let ingest_path = self.ingest_path.clone();
         let library_path = self.library_path.clone();
-        let _watcher = tokio::task::spawn_blocking(move || -> Result<RecommendedWatcher> {
-            let _ = std::fs::create_dir_all(&ingest_path);
-            let _ = std::fs::create_dir_all(&library_path);
-            let mut watcher = notify::recommended_watcher(move |res: notify::Result<Event>| {
-                let _ = notify_tx.blocking_send(res);
-            })?;
-            watcher.watch(&ingest_path, RecursiveMode::Recursive)?;
-            if library_path != ingest_path {
-                watcher.watch(&library_path, RecursiveMode::Recursive)?;
+        let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
+            if notify_tx.try_send(res).is_err() {
+                warn!("watcher: dropping filesystem event because the event buffer is full");
             }
-            info!(path = %ingest_path.display(), "watcher: monitoring ingest directory");
-            info!(path = %library_path.display(), "watcher: monitoring library directory");
-            // Keep watcher alive by blocking this thread.
-            std::thread::park();
-            Ok(watcher)
-        });
+        })?;
+        watcher.watch(&ingest_path, RecursiveMode::Recursive)?;
+        if library_path != ingest_path {
+            watcher.watch(&library_path, RecursiveMode::Recursive)?;
+        }
+
+        info!(path = %ingest_path.display(), "watcher: monitoring ingest directory");
+        info!(path = %library_path.display(), "watcher: monitoring library directory");
 
         // Event processing loop on the async runtime.
         while let Some(event_result) = notify_rx.recv().await {
@@ -147,6 +144,6 @@ fn change_label(kind: &EventKind) -> Option<&'static str> {
     }
 }
 
-fn is_media_file(path: &PathBuf) -> bool {
-    library_index::detect_media_type(path.as_path()).is_some()
+fn is_media_file(path: &Path) -> bool {
+    library_index::detect_media_type(path).is_some()
 }
