@@ -24,4 +24,4 @@ frontend/.vite/
 coverage/
 tmp/
 Gaps.md
-Handoff*.md
+*Handoff*.md
