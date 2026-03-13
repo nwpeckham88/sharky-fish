@@ -273,6 +273,11 @@ export interface LibraryMetadata {
 	filesystem: FileSystemFacts;
 }
 
+export interface LibraryArtwork {
+	poster_path: string | null;
+	backdrop_path: string | null;
+}
+
 export interface InternetMetadataMatch {
 	provider: string;
 	title: string;
@@ -805,6 +810,24 @@ export async function fetchLibraryMetadata(relativePath: string): Promise<Librar
 	const res = await fetch(`${BASE}/library/metadata?${params.toString()}`);
 	if (!res.ok) throw new Error(`Failed to fetch metadata for ${relativePath}: ${res.status}`);
 	return res.json();
+}
+
+export async function fetchLibraryArtwork(
+	relativePath: string,
+	libraryId?: string | null
+): Promise<LibraryArtwork> {
+	const params = new URLSearchParams({ path: relativePath });
+	if (libraryId) {
+		params.set('library_id', libraryId);
+	}
+	const res = await fetch(`${BASE}/library/artwork?${params.toString()}`);
+	if (!res.ok) throw new Error(`Failed to fetch artwork for ${relativePath}: ${res.status}`);
+	return res.json();
+}
+
+export function buildLibraryArtworkUrl(relativePath: string): string {
+	const params = new URLSearchParams({ path: relativePath });
+	return `${BASE}/library/artwork/file?${params.toString()}`;
 }
 
 export async function fetchLibraryInternetMetadata(relativePath: string): Promise<InternetMetadataResponse> {

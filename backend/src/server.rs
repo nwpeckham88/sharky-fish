@@ -19,7 +19,7 @@ use crate::review;
 use axum::{
     Router,
     extract::{Query, State},
-    http::StatusCode,
+    http::{StatusCode, header},
     response::{
         IntoResponse, Json,
         sse::{Event, KeepAlive, Sse},
@@ -31,7 +31,7 @@ use futures::stream::Stream;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::convert::Infallible;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, Semaphore, broadcast};
@@ -177,6 +177,8 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/library/events", get(list_library_events))
         .route("/api/library/metadata", get(get_library_metadata))
+        .route("/api/library/artwork", get(get_library_artwork))
+        .route("/api/library/artwork/file", get(get_library_artwork_file))
         .route("/api/downloads/summary", get(get_downloads_summary))
         .route("/api/downloads/items", get(list_download_items))
         .route("/api/downloads/qbittorrent/status", get(get_qbittorrent_status))
@@ -299,6 +301,23 @@ struct LibraryQuery {
 #[derive(Deserialize)]
 struct LibraryMetadataQuery {
     path: String,
+}
+
+#[derive(Deserialize)]
+struct LibraryArtworkQuery {
+    path: String,
+    library_id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LibraryArtworkFileQuery {
+    path: String,
+}
+
+#[derive(Serialize, Default)]
+struct LibraryArtworkResponse {
+    poster_path: Option<String>,
+    backdrop_path: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1478,6 +1497,183 @@ async fn get_library_metadata(
     {
         Ok(response) => Json(response).into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+async fn get_library_artwork(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<LibraryArtworkQuery>,
+) -> impl IntoResponse {
+    let config = { state.config.read().await.clone() };
+
+    match resolve_local_artwork(
+        &state.library_path,
+        &config,
+        &params.path,
+        params.library_id.as_deref(),
+    )
+    .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error).into_response(),
+    }
+}
+
+async fn get_library_artwork_file(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<LibraryArtworkFileQuery>,
+) -> impl IntoResponse {
+    let Some(relative_path) = sanitize_library_relative_path(&params.path) else {
+        return (StatusCode::BAD_REQUEST, "invalid artwork path").into_response();
+    };
+
+    let Some(file_name) = relative_path.file_name().and_then(|value| value.to_str()) else {
+        return (StatusCode::BAD_REQUEST, "invalid artwork path").into_response();
+    };
+
+    if !is_allowed_artwork_file_name(file_name) {
+        return (StatusCode::BAD_REQUEST, "unsupported artwork path").into_response();
+    }
+
+    let absolute_path = state.library_path.join(&relative_path);
+    match tokio::fs::read(&absolute_path).await {
+        Ok(bytes) => {
+            let content_type = artwork_content_type(file_name);
+            (
+                StatusCode::OK,
+                [
+                    (header::CONTENT_TYPE, content_type),
+                    (header::CACHE_CONTROL, "public, max-age=300"),
+                ],
+                bytes,
+            )
+                .into_response()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            StatusCode::NOT_FOUND.into_response()
+        }
+        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+    }
+}
+
+async fn resolve_local_artwork(
+    library_root: &Path,
+    config: &AppConfig,
+    relative_path: &str,
+    library_id: Option<&str>,
+) -> Result<LibraryArtworkResponse, String> {
+    let Some(relative_media_path) = sanitize_library_relative_path(relative_path) else {
+        return Err("invalid library path".into());
+    };
+
+    let artwork_dir = artwork_directory_for_item(config, &relative_media_path, library_id)
+        .ok_or_else(|| "unable to resolve artwork directory".to_string())?;
+
+    let poster_path = find_first_existing_artwork(library_root, &artwork_dir, "poster").await;
+    let backdrop_path = find_first_existing_artwork(library_root, &artwork_dir, "backdrop").await;
+
+    Ok(LibraryArtworkResponse {
+        poster_path,
+        backdrop_path,
+    })
+}
+
+fn sanitize_library_relative_path(path: &str) -> Option<PathBuf> {
+    let trimmed = path.trim().replace('\\', "/");
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let candidate = Path::new(&trimmed);
+    if candidate.is_absolute() {
+        return None;
+    }
+
+    let mut cleaned = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            Component::Normal(value) => cleaned.push(value),
+            Component::CurDir => {}
+            Component::ParentDir | Component::Prefix(_) | Component::RootDir => return None,
+        }
+    }
+
+    if cleaned.as_os_str().is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn artwork_directory_for_item(
+    config: &AppConfig,
+    relative_path: &Path,
+    library_id: Option<&str>,
+) -> Option<PathBuf> {
+    let media_type = library_id
+        .and_then(|id| config.libraries.iter().find(|library| library.id == id))
+        .map(|library| library.media_type.as_str())
+        .or_else(|| {
+            let normalized = relative_path.to_string_lossy().replace('\\', "/");
+            config
+                .libraries
+                .iter()
+                .find(|library| {
+                    let prefix = library.path.trim_matches('/');
+                    !prefix.is_empty()
+                        && (normalized == prefix || normalized.starts_with(&format!("{prefix}/")))
+                })
+                .map(|library| library.media_type.as_str())
+        })
+        .unwrap_or("movie");
+
+    if media_type == "tv" {
+        let season_dir = relative_path.parent().unwrap_or(relative_path);
+        let show_dir = season_dir.parent().unwrap_or(season_dir);
+        return Some(show_dir.to_path_buf());
+    }
+
+    Some(relative_path.parent().unwrap_or_else(|| Path::new("")).to_path_buf())
+}
+
+async fn find_first_existing_artwork(
+    library_root: &Path,
+    artwork_dir: &Path,
+    base_name: &str,
+) -> Option<String> {
+    for extension in ["jpg", "png", "webp", "jpeg"] {
+        let candidate = artwork_dir.join(format!("{base_name}.{extension}"));
+        let absolute = library_root.join(&candidate);
+        if tokio::fs::metadata(&absolute).await.is_ok() {
+            return Some(candidate.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    None
+}
+
+fn is_allowed_artwork_file_name(file_name: &str) -> bool {
+    let normalized = file_name.to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "poster.jpg"
+            | "poster.jpeg"
+            | "poster.png"
+            | "poster.webp"
+            | "backdrop.jpg"
+            | "backdrop.jpeg"
+            | "backdrop.png"
+            | "backdrop.webp"
+    )
+}
+
+fn artwork_content_type(file_name: &str) -> &'static str {
+    let normalized = file_name.to_ascii_lowercase();
+    if normalized.ends_with(".png") {
+        "image/png"
+    } else if normalized.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "image/jpeg"
     }
 }
 

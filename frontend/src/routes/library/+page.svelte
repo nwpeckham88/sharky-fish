@@ -6,7 +6,10 @@
 		autoSelectLibraryInternetMetadataBulk,
 		createBulkIntakeReviews,
 		createIntakeReview,
+		fetchConfig,
 		fetchLibrary,
+		fetchLibraryArtwork,
+		saveConfig,
 		triggerLibraryRescan,
 		fetchLibraryMetadata,
 		fetchLibraryInternetMetadata,
@@ -20,11 +23,13 @@
 		fetchLibraries,
 		updateBulkIntakeManagedStatus,
 		updateIntakeManagedStatus,
+		buildLibraryArtworkUrl,
 		type LibrarySortBy,
 		type LibrarySortDirection,
 		type BacklogFilter,
 		type LibraryEntry,
 		type LibraryFolder,
+		type LibraryArtwork,
 		type LibraryMetadata,
 		type InternetMetadataMatch,
 		type InternetMetadataResponse,
@@ -34,7 +39,8 @@
 		type LibraryScanStatus,
 		type LibraryChangeEvent,
 		type LibraryMediaFilter,
-		type LibraryManagedStatusFilter
+		type LibraryManagedStatusFilter,
+		type LibraryViewMode
 	} from '$lib/api';
 	import { jobStore, libraryState, managedItemStore, refreshManagedItemStore } from '$lib/stores.svelte';
 	import { formatBytes, formatTimestamp, statusLabel, statusTone } from '$lib/status';
@@ -174,6 +180,15 @@
 		})[0];
 	}
 
+	type ExpandedItemState = {
+		loading: boolean;
+		loaded: boolean;
+		error: string;
+		selectedMatch: InternetMetadataMatch | null;
+		relatedPaths: string[];
+		artwork: LibraryArtwork | null;
+	};
+
 	let library = $state<LibraryEntry[]>([]);
 	let librarySummary = $state<LibrarySummary>({
 		total_items: 0, total_bytes: 0, video_items: 0, audio_items: 0, other_items: 0
@@ -222,6 +237,9 @@
 	let sortBy = $state<LibrarySortBy>('modified_at');
 	let sortDirection = $state<LibrarySortDirection>('desc');
 	let advancedMode = $state(false);
+	let libraryViewMode = $state<LibraryViewMode>('compact');
+	let libraryViewModeSaving = $state(false);
+	let libraryViewModeError = $state('');
 	let requestedPath = $state<string | null>(null);
 	let requestedShow = $state<string | null>(null);
 	let requestedBulkMode = $state(false);
@@ -242,6 +260,8 @@
 	// Bulk selection
 	let selectedPaths = $state<Set<string>>(new Set());
 	let bulkMode = $state(false);
+	let expandedItems = $state<Set<string>>(new Set());
+	let expandedItemDetails = $state<Record<string, ExpandedItemState>>({});
 	let expandedShows = $state<Set<string>>(new Set());
 
 	const shapingViewMeta = $derived([
@@ -333,7 +353,9 @@
 			managedStatusFilter = urlStatus;
 		}
 		try {
-			libraryFolders = await fetchLibraries();
+				const [config, libraries] = await Promise.all([fetchConfig(), fetchLibraries()]);
+				libraryViewMode = config.library_view_mode ?? 'compact';
+				libraryFolders = libraries;
 		} catch { libraryFolders = []; }
 		await Promise.all([refreshManagedItemStore(), loadLibrary(), loadLibraryEvents()]);
 	});
@@ -360,6 +382,19 @@
 			void loadMetadata(selectedItem);
 		}
 		scheduleLibraryRefresh();
+	});
+
+	$effect(() => {
+		if (libraryViewMode !== 'expanded') {
+			return;
+		}
+
+		for (const item of library) {
+			const detail = expandedItemDetails[item.relative_path];
+			if (!detail || (!detail.loading && !detail.loaded)) {
+				void loadExpandedItemData(item);
+			}
+		}
 	});
 
 	async function loadLibrary() {
@@ -531,6 +566,7 @@
 				: saved.metadata_sidecar_written
 					? 'Selected metadata saved and Jellyfin .nfo updated.'
 					: 'Selected metadata saved.';
+			void loadExpandedItemData(selectedItem, true);
 		} catch (error) {
 			internetSaveError = error instanceof Error ? error.message : 'Failed to save selected match';
 		} finally {
@@ -734,6 +770,98 @@
 		return `${linkCount} hard links share this inode`;
 	}
 
+	function metadataSelectionNeeded(item: LibraryEntry): boolean {
+		const status = item.managed_status ?? 'UNPROCESSED';
+		return !item.has_selected_metadata && status !== 'KEPT_ORIGINAL' && status !== 'PROCESSED';
+	}
+
+	function detailState(path: string): ExpandedItemState | null {
+		return expandedItemDetails[path] ?? null;
+	}
+
+	function itemIsExpanded(path: string): boolean {
+		return libraryViewMode === 'expanded' || expandedItems.has(path);
+	}
+
+	function itemArtworkSrc(detail: ExpandedItemState | null): string | null {
+		if (detail?.artwork?.poster_path) {
+			return buildLibraryArtworkUrl(detail.artwork.poster_path);
+		}
+		if (detail?.artwork?.backdrop_path) {
+			return buildLibraryArtworkUrl(detail.artwork.backdrop_path);
+		}
+		return detail?.selectedMatch?.poster_url ?? null;
+	}
+
+	async function loadExpandedItemData(item: LibraryEntry, force = false) {
+		const existing = expandedItemDetails[item.relative_path];
+		if (existing?.loading || (existing?.loaded && !force)) {
+			return;
+		}
+
+		expandedItemDetails = {
+			...expandedItemDetails,
+			[item.relative_path]: {
+				loading: true,
+				loaded: false,
+				error: '',
+				selectedMatch: existing?.selectedMatch ?? null,
+				relatedPaths: existing?.relatedPaths ?? [],
+				artwork: existing?.artwork ?? null
+			}
+		};
+
+		try {
+			const [selected, artwork] = await Promise.all([
+				fetchSelectedLibraryInternetMetadata(item.relative_path).catch(() => null),
+				fetchLibraryArtwork(item.relative_path, item.library_id).catch(() => ({ poster_path: null, backdrop_path: null }))
+			]);
+			const selectedMatch = selected?.selected ?? null;
+			const relatedPaths = selectedMatch
+				? (await fetchRelatedLibraryInternetMetadataPaths(item.relative_path).catch(() => ({ paths: [] }))).paths
+				: [];
+
+			expandedItemDetails = {
+				...expandedItemDetails,
+				[item.relative_path]: {
+					loading: false,
+					loaded: true,
+					error: '',
+					selectedMatch,
+					relatedPaths,
+					artwork
+				}
+			};
+		} catch (error) {
+			expandedItemDetails = {
+				...expandedItemDetails,
+				[item.relative_path]: {
+					loading: false,
+					loaded: true,
+					error: error instanceof Error ? error.message : 'Failed to load inline details',
+					selectedMatch: existing?.selectedMatch ?? null,
+					relatedPaths: existing?.relatedPaths ?? [],
+					artwork: existing?.artwork ?? null
+				}
+			};
+		}
+	}
+
+	function toggleItemExpansion(item: LibraryEntry) {
+		if (libraryViewMode === 'expanded') {
+			return;
+		}
+
+		const next = new Set(expandedItems);
+		if (next.has(item.relative_path)) {
+			next.delete(item.relative_path);
+		} else {
+			next.add(item.relative_path);
+			void loadExpandedItemData(item);
+		}
+		expandedItems = next;
+	}
+
 	function pageRangeLabel(): string {
 		if (totalLibrary === 0) return '0-0';
 		return `${offset + 1}-${Math.min(offset + pageSize, totalLibrary)}`;
@@ -796,6 +924,7 @@
 		selectedItem = null;
 		selectedMetadata = null;
 		selectedPaths = new Set();
+		expandedItems = new Set();
 		expandedShows = new Set();
 		void syncLibraryUrl();
 		void loadLibrary();
@@ -825,6 +954,7 @@
 	async function reloadLibrary(resetOffset = false) {
 		if (resetOffset) offset = 0;
 		selectedPaths = new Set();
+		expandedItems = new Set();
 		await syncLibraryUrl();
 		await loadLibrary();
 	}
@@ -907,6 +1037,26 @@
 	function toggleAdvancedMode() {
 		advancedMode = !advancedMode;
 		void syncLibraryUrl();
+	}
+
+	async function setLibraryViewMode(mode: LibraryViewMode) {
+		if (libraryViewMode === mode) {
+			return;
+		}
+
+		libraryViewMode = mode;
+		libraryViewModeError = '';
+		libraryViewModeSaving = true;
+		try {
+			const config = await fetchConfig();
+			config.library_view_mode = mode;
+			await saveConfig(config);
+		} catch (error) {
+			libraryViewModeError =
+				error instanceof Error ? error.message : 'Failed to save library view preference';
+		} finally {
+			libraryViewModeSaving = false;
+		}
 	}
 
 	function stripLibraryPrefix(relativePath: string, libraryPath: string): string {
@@ -1047,6 +1197,14 @@
 	<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {bulkMode ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => { bulkMode = !bulkMode; if (!bulkMode) clearSelection(); }}>
 		Select
 	</button>
+	<div class="flex gap-1.5 rounded-xl border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-1">
+		<button class="rounded-lg px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {libraryViewMode === 'compact' ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => setLibraryViewMode('compact')} disabled={libraryViewModeSaving}>
+			Compact
+		</button>
+		<button class="rounded-lg px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {libraryViewMode === 'expanded' ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => setLibraryViewMode('expanded')} disabled={libraryViewModeSaving}>
+			Expanded
+		</button>
+	</div>
 	<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.12em] transition-colors {advancedMode ? 'bg-[color:var(--olive)] text-white border-[color:var(--olive)]' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={toggleAdvancedMode}>
 		{advancedMode ? 'Advanced On' : 'Advanced Mode'}
 	</button>
@@ -1054,6 +1212,16 @@
 		{pageRangeLabel()} of {totalLibrary}
 	</div>
 </section>
+
+{#if libraryViewModeSaving || libraryViewModeError}
+	<section class="mb-4 rounded-xl border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2.5 text-xs text-[color:var(--ink-muted)]">
+		{#if libraryViewModeSaving}
+			Saving library view preference…
+		{:else if libraryViewModeError}
+			<span class="text-[color:var(--danger)]">{libraryViewModeError}</span>
+		{/if}
+	</section>
+{/if}
 
 {#if advancedMode}
 	<section class="mb-5 grid gap-3 rounded-[1rem] border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-4 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
@@ -1191,34 +1359,93 @@
 							{#if expandedShows.has(group.show)}
 								<div class="bg-[color:rgba(244,236,223,0.5)]">
 									{#each group.items as item (item.relative_path)}
-										<button class="block w-full px-8 py-2.5 text-left text-sm hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''}" onclick={() => loadMetadata(item)}>
-											<div class="flex flex-wrap items-center gap-2">
-												<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
-												<span class="status-chip {statusTone(item.managed_status ?? 'UNPROCESSED')}">{statusLabel(item.managed_status ?? 'UNPROCESSED')}</span>
-												{#if !item.has_selected_metadata && (item.managed_status ?? 'UNPROCESSED') !== 'KEPT_ORIGINAL' && (item.managed_status ?? 'UNPROCESSED') !== 'PROCESSED'}
-													<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">needs metadata</span>
-												{:else if item.has_selected_metadata}
-													<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">metadata selected</span>
-												{/if}
-												{#if item.has_sidecar}
-													<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">nfo</span>
-												{:else}
-													<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">missing nfo</span>
-												{/if}
-												{#if item.organize_needed}
-													<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">organize needed</span>
+										{@const detail = detailState(item.relative_path)}
+										{@const artworkSrc = itemArtworkSrc(detail)}
+										<div class="border-t border-[color:rgba(123,105,81,0.1)] first:border-t-0">
+											<div class="flex items-start justify-between gap-3 px-8 py-3 text-left text-sm hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''}">
+												<button class="min-w-0 flex-1 text-left" onclick={() => loadMetadata(item)}>
+													<div class="flex flex-wrap items-center gap-2">
+														<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
+														<span class="status-chip {statusTone(item.managed_status ?? 'UNPROCESSED')}">{statusLabel(item.managed_status ?? 'UNPROCESSED')}</span>
+														{#if metadataSelectionNeeded(item)}
+															<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">needs metadata</span>
+														{:else if item.has_selected_metadata}
+															<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">metadata selected</span>
+														{/if}
+														{#if item.has_sidecar}
+															<span class="rounded-full border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">nfo</span>
+														{:else}
+															<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">missing nfo</span>
+														{/if}
+														{#if item.organize_needed}
+															<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">organize needed</span>
+														{/if}
+													</div>
+													<div class="mt-0.5 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
+												</button>
+												{#if libraryViewMode === 'compact'}
+													<button class="shrink-0 rounded-md border border-[color:var(--line)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-[color:var(--ink-strong)]" onclick={() => toggleItemExpansion(item)}>
+														{itemIsExpanded(item.relative_path) ? 'Collapse' : 'Expand'}
+													</button>
 												{/if}
 											</div>
-											<div class="mt-0.5 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
-											{#if item.review_note}
-												<div class="mt-2 rounded-lg border border-[color:rgba(106,142,72,0.2)] bg-[color:rgba(106,142,72,0.08)] px-3 py-2 text-xs text-[color:var(--olive)]">
-													{#if item.review_updated_at}
-														<div class="mb-1 text-[11px] text-[color:var(--ink-muted)]">Reviewed {formatTimestamp(item.review_updated_at)}</div>
-													{/if}
-													{item.review_note}
+											{#if itemIsExpanded(item.relative_path)}
+												<div class="px-8 pb-4">
+													<div class="grid gap-4 rounded-[1rem] border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.72)] p-4 lg:grid-cols-[10rem_minmax(0,1fr)]">
+														<div class="overflow-hidden rounded-xl border border-[color:var(--line)] bg-[color:rgba(234,223,201,0.5)]">
+															{#if artworkSrc}
+																<img src={artworkSrc} alt={`${item.file_name} artwork`} class="h-44 w-full object-cover" />
+															{:else}
+																<div class="flex h-44 items-center justify-center px-4 text-center text-xs font-semibold uppercase tracking-[0.12em] text-[color:var(--ink-muted)]">No artwork yet</div>
+															{/if}
+														</div>
+														<div>
+															{#if detail?.loading}
+																<div class="rounded-lg border border-[color:var(--line)] px-4 py-6 text-sm text-[color:var(--ink-muted)]">Loading inline details…</div>
+															{:else if detail?.error}
+																<div class="rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-4 py-3 text-sm text-[color:var(--danger)]">{detail.error}</div>
+															{:else}
+																<div class="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+																	<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
+																		<div class="section-label">Selected Metadata</div>
+																		{#if detail?.selectedMatch}
+																			<div class="mt-1 font-semibold text-[color:var(--ink-strong)]">{detail.selectedMatch.title}{detail.selectedMatch.year ? ` (${detail.selectedMatch.year})` : ''}</div>
+																			<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{detail.selectedMatch.provider.toUpperCase()}</div>
+																		{:else}
+																			<div class="mt-1 text-sm text-[color:var(--ink-muted)]">No provider match selected yet.</div>
+																		{/if}
+																	</div>
+																	<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
+																		<div class="section-label">Filesystem</div>
+																		<div class="mt-1 font-semibold text-[color:var(--ink-strong)]">{formatBytes(item.size_bytes)}</div>
+																		<div class="mt-1 text-xs text-[color:var(--ink-muted)]">Modified {formatTimestamp(item.modified_at)}</div>
+																		<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{item.filesystem.is_hard_linked ? hardLinkSummary(item.filesystem.link_count) : 'Single directory entry'}</div>
+																	</div>
+																	<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
+																		<div class="section-label">Placement</div>
+																		<div class="mt-1 break-all font-mono text-[11px] text-[color:var(--ink-strong)]">{item.relative_path}</div>
+																		{#if item.organize_target_path}
+																			<div class="mt-2 break-all font-mono text-[11px] text-[color:var(--ink-strong)]">Target: {item.organize_target_path}</div>
+																		{/if}
+																	</div>
+																	<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
+																		<div class="section-label">Library Facts</div>
+																		<div class="mt-1 text-sm font-semibold text-[color:var(--ink-strong)]">{item.has_sidecar ? 'Jellyfin NFO present' : 'Missing Jellyfin NFO'}</div>
+																		<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{artworkSrc ? (detail?.artwork?.poster_path || detail?.artwork?.backdrop_path ? 'Local artwork found beside media' : 'Using remote artwork fallback') : 'No artwork available'}</div>
+																		{#if detail?.relatedPaths.length}
+																			<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{detail.relatedPaths.length} related path{detail.relatedPaths.length === 1 ? '' : 's'} share this selection</div>
+																		{/if}
+																	</div>
+																</div>
+																{#if detail?.selectedMatch?.overview}
+																	<p class="mt-3 text-sm leading-6 text-[color:var(--ink-muted)]">{detail.selectedMatch.overview}</p>
+																{/if}
+															{/if}
+														</div>
+													</div>
 												</div>
 											{/if}
-										</button>
+										</div>
 									{/each}
 								</div>
 							{/if}
@@ -1253,23 +1480,34 @@
 						<tr><td colspan={visibleColumnCount} class="px-4 py-14 text-center text-[color:var(--ink-muted)]">No entries match the current filter.</td></tr>
 					{:else}
 						{#each filteredLibrary as item (item.relative_path)}
-							<tr class="cursor-pointer border-b border-[color:rgba(123,105,81,0.14)] last:border-b-0 hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''} {selectedPaths.has(item.relative_path) ? 'bg-[color:rgba(214,180,111,0.08)]' : ''}" onclick={() => { if (bulkMode) { toggleSelect(item.relative_path); } else { loadMetadata(item); } }}>
+							{@const detail = detailState(item.relative_path)}
+							{@const artworkSrc = itemArtworkSrc(detail)}
+							<tr class="cursor-pointer border-b border-[color:rgba(123,105,81,0.14)] hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''} {selectedPaths.has(item.relative_path) ? 'bg-[color:rgba(214,180,111,0.08)]' : ''}" onclick={() => { if (bulkMode) { toggleSelect(item.relative_path); } else { loadMetadata(item); } }}>
 								{#if bulkMode}
 									<td class="w-10 px-3 py-3" onclick={(e) => { e.stopPropagation(); toggleSelect(item.relative_path); }}>
 										<input type="checkbox" checked={selectedPaths.has(item.relative_path)} class="accent-[color:var(--accent)]" />
 									</td>
 								{/if}
-								<td class="px-4 py-3">
-									<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
-									<div class="mt-0.5 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
+								<td class="px-4 py-3 align-top">
+									<div class="flex items-start justify-between gap-3">
+										<div class="min-w-0">
+											<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
+											<div class="mt-0.5 truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
+										</div>
+										{#if libraryViewMode === 'compact'}
+											<button class="shrink-0 rounded-md border border-[color:var(--line)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-[color:var(--ink-strong)]" onclick={(event) => { event.stopPropagation(); toggleItemExpansion(item); }}>
+												{itemIsExpanded(item.relative_path) ? 'Collapse' : 'Expand'}
+											</button>
+										{/if}
+									</div>
 								</td>
-								<td class="px-4 py-3">
+								<td class="px-4 py-3 align-top">
 									<span class="status-chip {item.media_type === 'video' ? 'processing' : item.media_type === 'audio' ? 'completed' : ''}">{item.media_type}</span>
 								</td>
-								<td class="px-4 py-3">
-									<div class="flex flex-wrap items-center gap-2">
+								<td class="px-4 py-3 align-top">
+									<div class="flex max-w-[18rem] flex-wrap items-center gap-2">
 										<span class="status-chip {statusTone(item.managed_status ?? 'UNPROCESSED')}">{statusLabel(item.managed_status ?? 'UNPROCESSED')}</span>
-										{#if !item.has_selected_metadata && (item.managed_status ?? 'UNPROCESSED') !== 'KEPT_ORIGINAL' && (item.managed_status ?? 'UNPROCESSED') !== 'PROCESSED'}
+										{#if metadataSelectionNeeded(item)}
 											<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">needs metadata</span>
 										{:else if item.has_selected_metadata}
 											<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">metadata selected</span>
@@ -1285,20 +1523,20 @@
 									</div>
 								</td>
 								{#if !activeLibraryId && libraryFolders.length > 0}
-									<td class="px-4 py-3">
+									<td class="px-4 py-3 align-top">
 										{#if item.library_id}
 											{@const lib = libraryFolders.find((l) => l.id === item.library_id)}
 											{#if lib}
 												<span class="rounded-full bg-[color:rgba(214,180,111,0.15)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--ink-strong)]">{lib.name}</span>
 											{/if}
 										{:else}
-											<span class="text-[color:var(--ink-muted)] text-xs">—</span>
+											<span class="text-xs text-[color:var(--ink-muted)]">—</span>
 										{/if}
 									</td>
 								{/if}
-								<td class="px-4 py-3 text-[color:var(--ink-strong)]">{formatBytes(item.size_bytes)}</td>
-								<td class="px-4 py-3 text-[color:var(--ink-muted)]">{formatTimestamp(item.modified_at)}</td>
-								<td class="px-4 py-3" onclick={(e) => e.stopPropagation()}>
+								<td class="px-4 py-3 align-top text-[color:var(--ink-strong)]">{formatBytes(item.size_bytes)}</td>
+								<td class="px-4 py-3 align-top text-[color:var(--ink-muted)]">{formatTimestamp(item.modified_at)}</td>
+								<td class="px-4 py-3 align-top" onclick={(e) => e.stopPropagation()}>
 									<div class="flex flex-wrap gap-2">
 										{#if (item.managed_status ?? 'UNPROCESSED') === 'UNPROCESSED'}
 											<button class="rounded-md bg-[color:var(--accent)] px-2.5 py-1.5 text-[10px] font-semibold text-white disabled:opacity-50" onclick={() => createReview(item)} disabled={!!rowActionBusy[item.relative_path]}>
@@ -1323,6 +1561,89 @@
 									</div>
 								</td>
 							</tr>
+							{#if itemIsExpanded(item.relative_path)}
+								<tr class="border-b border-[color:rgba(123,105,81,0.14)] bg-[color:rgba(244,236,223,0.42)] last:border-b-0">
+									<td colspan={visibleColumnCount} class="px-4 pb-4 pt-1">
+										<div class="grid gap-4 rounded-[1rem] border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.72)] p-4 lg:grid-cols-[10rem_minmax(0,1fr)]">
+											<div class="overflow-hidden rounded-xl border border-[color:var(--line)] bg-[color:rgba(234,223,201,0.5)]">
+												{#if artworkSrc}
+													<img src={artworkSrc} alt={`${item.file_name} artwork`} class="h-48 w-full object-cover" />
+												{:else}
+													<div class="flex h-48 items-center justify-center px-4 text-center text-xs font-semibold uppercase tracking-[0.12em] text-[color:var(--ink-muted)]">No artwork yet</div>
+												{/if}
+											</div>
+											<div>
+												{#if detail?.loading}
+													<div class="rounded-lg border border-[color:var(--line)] px-4 py-6 text-sm text-[color:var(--ink-muted)]">Loading inline details…</div>
+												{:else if detail?.error}
+													<div class="rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-4 py-3 text-sm text-[color:var(--danger)]">{detail.error}</div>
+												{:else}
+													<div class="flex flex-wrap items-center gap-2">
+														<span class="status-chip {statusTone(item.managed_status ?? 'UNPROCESSED')}">{statusLabel(item.managed_status ?? 'UNPROCESSED')}</span>
+														{#if detail?.selectedMatch}
+															<span class="rounded-full bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">{detail.selectedMatch.provider}</span>
+														{/if}
+														{#if metadataSelectionNeeded(item)}
+															<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">awaiting metadata selection</span>
+														{/if}
+													</div>
+													<div class="mt-3 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+														<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
+															<div class="section-label">Selected Metadata</div>
+															{#if detail?.selectedMatch}
+																<div class="mt-1 font-semibold text-[color:var(--ink-strong)]">{detail.selectedMatch.title}{detail.selectedMatch.year ? ` (${detail.selectedMatch.year})` : ''}</div>
+																<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{detail.selectedMatch.provider.toUpperCase()} {detail.selectedMatch.media_kind ? `· ${detail.selectedMatch.media_kind}` : ''}</div>
+															{:else}
+																<div class="mt-1 text-sm text-[color:var(--ink-muted)]">No provider match has been selected for this item yet.</div>
+															{/if}
+														</div>
+														<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
+															<div class="section-label">Filesystem</div>
+															<div class="mt-1 font-semibold text-[color:var(--ink-strong)]">{formatBytes(item.size_bytes)}</div>
+															<div class="mt-1 text-xs text-[color:var(--ink-muted)]">Modified {formatTimestamp(item.modified_at)}</div>
+															<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{item.filesystem.is_hard_linked ? hardLinkSummary(item.filesystem.link_count) : 'Single directory entry'}</div>
+														</div>
+														<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
+															<div class="section-label">Placement</div>
+															<div class="mt-1 text-xs text-[color:var(--ink-muted)]">Current</div>
+															<div class="break-all font-mono text-[11px] text-[color:var(--ink-strong)]">{item.relative_path}</div>
+															{#if item.organize_target_path}
+																<div class="mt-2 text-xs text-[color:var(--ink-muted)]">Target</div>
+																<div class="break-all font-mono text-[11px] text-[color:var(--ink-strong)]">{item.organize_target_path}</div>
+															{/if}
+														</div>
+														<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5">
+															<div class="section-label">Library Facts</div>
+															<div class="mt-1 text-sm font-semibold text-[color:var(--ink-strong)]">{libraryFolders.find((library) => library.id === item.library_id)?.name ?? 'Unassigned'}</div>
+															<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{item.has_sidecar ? 'Jellyfin NFO present' : 'Missing Jellyfin NFO'}</div>
+															<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{artworkSrc ? (detail?.artwork?.poster_path || detail?.artwork?.backdrop_path ? 'Local artwork found beside media' : 'Using remote artwork fallback') : 'No artwork available'}</div>
+														</div>
+													</div>
+													{#if detail?.selectedMatch?.overview}
+														<p class="mt-3 text-sm leading-6 text-[color:var(--ink-muted)]">{detail.selectedMatch.overview}</p>
+													{/if}
+													{#if detail?.relatedPaths.length}
+														<div class="mt-3 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">
+															<div class="font-semibold uppercase tracking-[0.12em]">Related Library Paths</div>
+															{#each detail.relatedPaths as path (path)}
+																<div class="mt-1 break-all font-mono text-[11px] text-[color:var(--ink-strong)]">{path}</div>
+															{/each}
+														</div>
+													{/if}
+													{#if item.review_note}
+														<div class="mt-3 rounded-lg border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-3 py-2 text-xs text-[color:var(--olive)]">
+															{#if item.review_updated_at}
+																<div class="mb-1 text-[11px] text-[color:var(--ink-muted)]">Reviewed {formatTimestamp(item.review_updated_at)}</div>
+															{/if}
+															{item.review_note}
+														</div>
+													{/if}
+												{/if}
+											</div>
+										</div>
+									</td>
+								</tr>
+							{/if}
 						{/each}
 					{/if}
 				</tbody>
