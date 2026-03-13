@@ -58,6 +58,29 @@ pub struct AppConfig {
     /// several minutes to scans on large NAS libraries. Defaults to false.
     #[serde(default)]
     pub scan_compute_checksums: bool,
+    /// Optional qBittorrent API integration used for transfer visibility.
+    #[serde(default)]
+    pub qbittorrent: QbittorrentConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QbittorrentConfig {
+    /// Enable qBittorrent API polling.
+    #[serde(default)]
+    pub enabled: bool,
+    /// qBittorrent WebUI base URL, e.g. http://qbittorrent:8080.
+    #[serde(default = "default_qbittorrent_base_url")]
+    pub base_url: String,
+    /// qBittorrent username.
+    pub username: Option<String>,
+    /// qBittorrent password.
+    pub password: Option<String>,
+    /// API timeout for each request.
+    #[serde(default = "default_qbittorrent_timeout_secs")]
+    pub request_timeout_secs: u64,
+    /// Maximum torrents returned in API responses.
+    #[serde(default = "default_qbittorrent_max_torrents")]
+    pub max_torrents: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +197,18 @@ fn default_metadata_provider() -> String {
     "omdb".into()
 }
 
+fn default_qbittorrent_base_url() -> String {
+    "http://qbittorrent:8080".into()
+}
+
+fn default_qbittorrent_timeout_secs() -> u64 {
+    8
+}
+
+fn default_qbittorrent_max_torrents() -> usize {
+    100
+}
+
 /// A named library folder mapped to a subdirectory inside `data_path`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LibraryFolder {
@@ -269,6 +304,7 @@ impl Default for AppConfig {
             libraries: Vec::new(),
             internet_metadata: InternetMetadataConfig::default(),
             scan_compute_checksums: false,
+            qbittorrent: QbittorrentConfig::default(),
         }
     }
 }
@@ -281,6 +317,19 @@ impl Default for InternetMetadataConfig {
             tvdb_pin: None,
             user_agent: "sharky-fish/0.1".into(),
             default_provider: default_metadata_provider(),
+        }
+    }
+}
+
+impl Default for QbittorrentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: default_qbittorrent_base_url(),
+            username: None,
+            password: None,
+            request_timeout_secs: default_qbittorrent_timeout_secs(),
+            max_torrents: default_qbittorrent_max_torrents(),
         }
     }
 }

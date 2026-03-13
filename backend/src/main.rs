@@ -10,6 +10,7 @@ mod managed_items;
 mod messages;
 mod metadata;
 mod organizer;
+mod qbittorrent;
 mod review;
 mod server;
 mod sidecar;

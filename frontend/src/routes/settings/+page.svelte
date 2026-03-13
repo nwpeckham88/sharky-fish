@@ -4,6 +4,7 @@
 		fetchConfig,
 		saveConfig,
 		testLlmConnection,
+		testQbittorrentConnection,
 		improveSystemPrompt,
 		fetchLibraries,
 		addLibrary,
@@ -18,8 +19,10 @@
 	let loading = $state(true);
 	let saving = $state(false);
 	let testingLlm = $state(false);
+	let testingQbittorrent = $state(false);
 	let improvingPrompt = $state(false);
 	let llmTestResult = $state<{ ok: boolean; message: string } | null>(null);
+	let qbittorrentTestResult = $state<{ ok: boolean; message: string } | null>(null);
 	let toast = $state<{ msg: string; ok: boolean } | null>(null);
 	let promptIdea = $state('');
 	let improvedPromptDraft = $state('');
@@ -76,6 +79,31 @@
 		} finally {
 			testingLlm = false;
 		}
+	}
+
+	async function runQbittorrentTest() {
+		if (!config || !canTestQbittorrentConnection()) return;
+		testingQbittorrent = true;
+		qbittorrentTestResult = null;
+		try {
+			const result = await testQbittorrentConnection(config.qbittorrent);
+			qbittorrentTestResult = { ok: result.ok, message: result.message };
+		} catch (error) {
+			qbittorrentTestResult = {
+				ok: false,
+				message: error instanceof Error ? error.message : 'Failed to test qBittorrent connection'
+			};
+		} finally {
+			testingQbittorrent = false;
+		}
+	}
+
+	function canTestQbittorrentConnection(): boolean {
+		if (!config) return false;
+		const baseUrl = config.qbittorrent.base_url.trim();
+		const username = (config.qbittorrent.username ?? '').trim();
+		const password = (config.qbittorrent.password ?? '').trim();
+		return baseUrl.length > 0 && username.length > 0 && password.length > 0;
 	}
 
 	function resetToGeminiDefaults() {
@@ -646,12 +674,13 @@ ${normalizedContext}`;
 			<div>
 				<span class="mb-2 block text-xs font-semibold uppercase tracking-[0.16em] text-[color:var(--ink-muted)]">Dry Run Output</span>
 				<div class="rounded-lg border border-[color:var(--line)] bg-[color:var(--paper-deep)] p-4 min-h-[16rem]">
-					<p class="text-sm text-[color:var(--ink-muted)]">Select a file from the library and click "Dry Run" to test the prompt against an actual media file without executing any transcoding.</p>
+					<p class="text-sm text-[color:var(--ink-muted)]">Prompt dry-run is planned for a future update. For now, use Backlog and Review to evaluate live AI decisions with real files.</p>
 				</div>
 				<div class="mt-3 flex gap-2">
-					<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm font-semibold text-[color:var(--ink-strong)]">Select File…</button>
-					<button class="rounded-lg bg-[color:var(--accent)] px-4 py-2 text-sm font-semibold text-white">Dry Run</button>
+					<button disabled class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm font-semibold text-[color:var(--ink-muted)] disabled:cursor-not-allowed disabled:opacity-60">Select File…</button>
+					<button disabled class="rounded-lg bg-[color:var(--accent)] px-4 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-60">Dry Run</button>
 				</div>
+				<p class="mt-2 text-xs text-[color:var(--ink-muted)]">Coming soon: run planner simulations against a chosen library item without queueing work.</p>
 			</div>
 		</div>
 
@@ -789,6 +818,64 @@ ${normalizedContext}`;
 						<input type="text" bind:value={config.internet_metadata.user_agent} class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
 					</label>
 					<p class="text-xs text-[color:var(--ink-muted)]">Lookup behavior: one configured API key = only that provider searched. Both configured = only default provider searched.</p>
+				</div>
+			</div>
+
+			<!-- qBittorrent API -->
+			<div class="rounded-[1rem] border border-[color:var(--line)] p-5 md:col-span-2">
+				<h3 class="section-label mb-4">qBittorrent API (Optional)</h3>
+				<div class="space-y-4">
+					<label class="flex items-start gap-3">
+						<input type="checkbox" bind:checked={config.qbittorrent.enabled} class="mt-1 rounded border-[color:var(--line)] accent-[color:var(--accent)]" />
+						<span>
+							<span class="block text-sm font-semibold text-[color:var(--ink-strong)]">Enable qBittorrent monitoring</span>
+							<span class="block text-xs text-[color:var(--ink-muted)]">When enabled, Sharky Fish polls the qBittorrent WebUI API for transfer rates, active torrents, and download paths.</span>
+						</span>
+					</label>
+					<div class="grid gap-4 md:grid-cols-2">
+						<label class="block md:col-span-2">
+							<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Base URL</span>
+							<input type="text" bind:value={config.qbittorrent.base_url} placeholder="http://qbittorrent:8080" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
+						</label>
+						<label class="block">
+							<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Username</span>
+							<input
+								type="text"
+								value={config.qbittorrent.username ?? ''}
+								oninput={(e) => { if (config) config.qbittorrent.username = (e.target as HTMLInputElement).value || null; }}
+								class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]"
+							/>
+						</label>
+						<label class="block">
+							<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Password</span>
+							<input
+								type="password"
+								value={config.qbittorrent.password ?? ''}
+								oninput={(e) => { if (config) config.qbittorrent.password = (e.target as HTMLInputElement).value || null; }}
+								class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]"
+							/>
+						</label>
+						<label class="block">
+							<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Timeout (seconds)</span>
+							<input type="number" bind:value={config.qbittorrent.request_timeout_secs} min="2" max="60" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]" />
+						</label>
+						<label class="block">
+							<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Max Torrents</span>
+							<input type="number" bind:value={config.qbittorrent.max_torrents} min="1" max="500" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]" />
+						</label>
+					</div>
+					<div class="flex flex-wrap items-center gap-2 pt-1">
+						<button onclick={runQbittorrentTest} disabled={testingQbittorrent || !canTestQbittorrentConnection()} class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm font-semibold text-[color:var(--ink-strong)] disabled:opacity-50">
+							{testingQbittorrent ? 'Testing…' : 'Test qBittorrent Connection'}
+						</button>
+						{#if qbittorrentTestResult}
+							<span class="rounded-lg px-3 py-2 text-xs font-semibold {qbittorrentTestResult.ok ? 'bg-[color:var(--olive)]/15 text-[color:var(--olive)]' : 'bg-red-500/15 text-red-400'}">{qbittorrentTestResult.message}</span>
+						{/if}
+					</div>
+					{#if !canTestQbittorrentConnection()}
+						<p class="text-xs text-[color:var(--ink-muted)]">Enter base URL, username, and password to enable connection testing.</p>
+					{/if}
+					<p class="text-xs text-[color:var(--ink-muted)]">Use the same in-container downloads path mapping across qBittorrent, the *arr stack, and Sharky Fish.</p>
 				</div>
 			</div>
 

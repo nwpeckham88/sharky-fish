@@ -5,9 +5,11 @@
 		deleteDownloadItem,
 		fetchDownloadItems,
 		fetchDownloadLinkedPaths,
+		fetchQbittorrentStatus,
 		type DownloadItem,
 		type DownloadsLibraryMatch,
-		type DownloadsSummary
+		type DownloadsSummary,
+		type QbittorrentStatusResponse
 	} from '$lib/api';
 	import { formatBytes, formatTimestamp } from '$lib/status';
 
@@ -47,10 +49,30 @@
 	let deleteBusy = $state<Record<string, boolean>>({});
 	let status = $state('');
 	let queryTimer: ReturnType<typeof setTimeout> | undefined;
+	let qbStatus = $state<QbittorrentStatusResponse | null>(null);
+	let qbLoading = $state(false);
 
 	onMount(async () => {
-		await loadItems();
+		await Promise.all([loadItems(), loadQbittorrentStatus()]);
 	});
+
+	async function loadQbittorrentStatus() {
+		qbLoading = true;
+		try {
+			qbStatus = await fetchQbittorrentStatus();
+		} catch {
+			qbStatus = {
+				enabled: true,
+				connected: false,
+				base_url: '',
+				transfer: null,
+				torrents: [],
+				error: 'Failed to query qBittorrent status'
+			};
+		} finally {
+			qbLoading = false;
+		}
+	}
 
 	async function loadItems() {
 		loading = true;
@@ -229,6 +251,57 @@
 	<div class="stat-card"><div class="section-label">Checksum Duplicates</div><div class="mt-1 text-2xl font-semibold text-[color:var(--accent-deep)]">{summary.checksum_duplicate_count}</div></div>
 	<div class="stat-card"><div class="section-label">Orphans</div><div class="mt-1 text-2xl font-semibold text-[color:var(--danger)]">{summary.orphan_count}</div></div>
 	<div class="stat-card"><div class="section-label">Footprint</div><div class="mt-1 text-2xl font-semibold text-[color:var(--ink-strong)]">{formatBytes(summary.total_bytes)}</div><div class="mt-1 text-xs text-[color:var(--ink-muted)]">{summary.hard_linked_count} currently hard-linked</div></div>
+</section>
+
+<section class="mb-5 surface-card p-5">
+	<div class="flex flex-wrap items-start justify-between gap-3">
+		<div>
+			<p class="section-label">qBittorrent</p>
+			<h3 class="mt-1 text-lg font-semibold text-[color:var(--ink-strong)]">Transfer Monitor</h3>
+			<p class="mt-1 text-xs text-[color:var(--ink-muted)]">Optional API feed for download/upload activity and current torrent paths.</p>
+		</div>
+		<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={loadQbittorrentStatus} disabled={qbLoading}>
+			{qbLoading ? 'Refreshing…' : 'Refresh'}
+		</button>
+	</div>
+
+	{#if !qbStatus}
+		<div class="mt-3 text-sm text-[color:var(--ink-muted)]">No qBittorrent status loaded yet.</div>
+	{:else if !qbStatus.enabled}
+		<div class="mt-3 rounded-lg border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.45)] px-3 py-2 text-sm text-[color:var(--ink-muted)]">qBittorrent monitoring is disabled in Settings → System Profile.</div>
+	{:else if qbStatus.error || !qbStatus.connected}
+		<div class="mt-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-sm text-[color:var(--danger)]">
+			Unable to read qBittorrent API at <span class="font-mono">{qbStatus.base_url || '(not configured)'}</span>{qbStatus.error ? `: ${qbStatus.error}` : ''}
+		</div>
+	{:else}
+		{#if qbStatus.transfer}
+			<div class="mt-3 grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
+				<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5"><div class="section-label">Download Rate</div><div class="mt-1 font-semibold text-[color:var(--ink-strong)]">{formatBytes(qbStatus.transfer.dl_info_speed)}/s</div></div>
+				<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5"><div class="section-label">Upload Rate</div><div class="mt-1 font-semibold text-[color:var(--ink-strong)]">{formatBytes(qbStatus.transfer.up_info_speed)}/s</div></div>
+				<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5"><div class="section-label">Downloaded</div><div class="mt-1 font-semibold text-[color:var(--ink-strong)]">{formatBytes(qbStatus.transfer.dl_info_data)}</div></div>
+				<div class="rounded-lg border border-[color:var(--line)] px-3 py-2.5"><div class="section-label">Uploaded</div><div class="mt-1 font-semibold text-[color:var(--ink-strong)]">{formatBytes(qbStatus.transfer.up_info_data)}</div><div class="mt-0.5 text-xs text-[color:var(--ink-muted)]">{qbStatus.transfer.connection_status} · DHT {qbStatus.transfer.dht_nodes}</div></div>
+			</div>
+		{/if}
+		<div class="mt-3 rounded-lg border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.45)] px-3 py-3">
+			<div class="section-label mb-2">Recent Torrents ({qbStatus.torrents.length})</div>
+			{#if qbStatus.torrents.length === 0}
+				<div class="text-xs text-[color:var(--ink-muted)]">No torrents returned.</div>
+			{:else}
+				<div class="space-y-2">
+					{#each qbStatus.torrents.slice(0, 12) as torrent (torrent.hash)}
+						<div class="rounded-lg border border-[color:var(--line)] bg-white/40 px-3 py-2">
+							<div class="flex flex-wrap items-center justify-between gap-2">
+								<div class="font-semibold text-[color:var(--ink-strong)]">{torrent.name}</div>
+								<div class="text-xs text-[color:var(--ink-muted)]">{Math.round((torrent.progress ?? 0) * 100)}% · {torrent.state}</div>
+							</div>
+							<div class="mt-1 text-xs text-[color:var(--ink-muted)]">↓ {formatBytes(torrent.dlspeed)}/s · ↑ {formatBytes(torrent.upspeed)}/s · {formatBytes(torrent.total_size || torrent.size)}</div>
+							<div class="mt-1 break-all font-mono text-[11px] text-[color:var(--ink-muted)]">{torrent.content_path || torrent.save_path}</div>
+						</div>
+					{/each}
+				</div>
+			{/if}
+		</div>
+	{/if}
 </section>
 
 <section class="mb-5 flex flex-wrap items-center gap-3">

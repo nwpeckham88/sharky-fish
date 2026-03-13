@@ -1,6 +1,6 @@
 use crate::actors::brain;
 use crate::actors::queue;
-use crate::config::{AppConfig, LibraryFolder, LlmConfig};
+use crate::config::{AppConfig, LibraryFolder, LlmConfig, QbittorrentConfig};
 use crate::db;
 use crate::downloads;
 use crate::filesystem_audit;
@@ -14,6 +14,7 @@ use crate::managed_items;
 use crate::messages::{IdentifiedMedia, LibraryChange, ReviewExecutionMode, SseEvent};
 use crate::metadata;
 use crate::organizer;
+use crate::qbittorrent;
 use crate::review;
 use axum::{
     Router,
@@ -178,6 +179,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/library/metadata", get(get_library_metadata))
         .route("/api/downloads/summary", get(get_downloads_summary))
         .route("/api/downloads/items", get(list_download_items))
+        .route("/api/downloads/qbittorrent/status", get(get_qbittorrent_status))
         .route(
             "/api/downloads/linked-paths",
             get(get_download_linked_paths),
@@ -222,6 +224,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/config/llm/test",
             axum::routing::post(test_llm_connection),
+        )
+        .route(
+            "/api/config/qbittorrent/test",
+            axum::routing::post(test_qbittorrent_connection),
         )
         .route(
             "/api/config/prompt/improve",
@@ -1500,6 +1506,14 @@ async fn list_download_items(
     }
 }
 
+async fn get_qbittorrent_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let qb_cfg = {
+        let cfg = state.config.read().await;
+        cfg.qbittorrent.clone()
+    };
+    Json(qbittorrent::fetch_status(&qb_cfg).await).into_response()
+}
+
 async fn get_download_linked_paths(
     State(state): State<Arc<AppState>>,
     Query(params): Query<DownloadsQuery>,
@@ -2080,6 +2094,13 @@ struct LlmTestResponse {
     message: String,
 }
 
+#[derive(Serialize)]
+struct QbittorrentTestResponse {
+    ok: bool,
+    base_url: String,
+    message: String,
+}
+
 async fn test_llm_connection(Json(llm): Json<LlmConfig>) -> impl IntoResponse {
     match brain::test_llm_connection(&llm).await {
         Ok(message) => Json(LlmTestResponse {
@@ -2095,6 +2116,27 @@ async fn test_llm_connection(Json(llm): Json<LlmConfig>) -> impl IntoResponse {
                 ok: false,
                 provider: llm.provider,
                 model: llm.model,
+                message: error.to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+async fn test_qbittorrent_connection(Json(qbittorrent): Json<QbittorrentConfig>) -> impl IntoResponse {
+    let base_url = qbittorrent.base_url.clone();
+    match qbittorrent::test_connection(&qbittorrent).await {
+        Ok(message) => Json(QbittorrentTestResponse {
+            ok: true,
+            base_url,
+            message,
+        })
+        .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(QbittorrentTestResponse {
+                ok: false,
+                base_url,
                 message: error.to_string(),
             }),
         )

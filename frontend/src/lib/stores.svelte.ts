@@ -50,6 +50,15 @@ export const managedItemStore = $state<{
 	loading: true
 });
 
+let managedSummaryRefreshTimer: ReturnType<typeof setTimeout> | undefined;
+
+function scheduleManagedSummaryRefresh(delayMs = 250) {
+	if (managedSummaryRefreshTimer) clearTimeout(managedSummaryRefreshTimer);
+	managedSummaryRefreshTimer = setTimeout(() => {
+		void refreshManagedItemStore();
+	}, delayMs);
+}
+
 
 export function getReviewState() {
 	const awaitingApproval = jobStore.jobs.filter((job) => job.status === 'AWAITING_APPROVAL');
@@ -147,12 +156,14 @@ export function handleSseEvent(event: SseEvent) {
 			},
 			...jobStore.jobs.filter((job) => job.id !== event.job_id)
 		];
+		scheduleManagedSummaryRefresh();
 		return;
 	}
 	if (event.type === 'job_status') {
 		jobStore.jobs = jobStore.jobs.map((job) =>
 			job.id === event.job_id ? { ...job, status: event.status } : job
 		);
+		scheduleManagedSummaryRefresh();
 		return;
 	}
 	if (event.type === 'library_change') {
@@ -165,6 +176,7 @@ export function handleSseEvent(event: SseEvent) {
 		libraryState.latestChange = change;
 		libraryState.recentChanges = [change, ...libraryState.recentChanges].slice(0, 24);
 		libraryState.changeCount++;
+		scheduleManagedSummaryRefresh(500);
 		return;
 	}
 	if (event.type === 'library_scan_progress') {
@@ -191,6 +203,7 @@ export function handleSseEvent(event: SseEvent) {
 			job.id === event.job_id ? { ...job, status: event.success ? 'COMPLETED' : 'FAILED' } : job
 		);
 		delete progressStore[event.job_id];
+		scheduleManagedSummaryRefresh();
 	}
 }
 

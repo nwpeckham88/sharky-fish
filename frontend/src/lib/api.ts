@@ -450,6 +450,15 @@ export interface InternetMetadataConfig {
 	default_provider: 'omdb' | 'tvdb';
 }
 
+export interface QbittorrentConfig {
+	enabled: boolean;
+	base_url: string;
+	username: string | null;
+	password: string | null;
+	request_timeout_secs: number;
+	max_torrents: number;
+}
+
 export interface AppConfig {
 	data_path: string;
 	ingest_path: string;
@@ -470,6 +479,38 @@ export interface AppConfig {
 	libraries: LibraryFolder[];
 	internet_metadata: InternetMetadataConfig;
 	scan_compute_checksums: boolean;
+	qbittorrent: QbittorrentConfig;
+}
+
+export interface QbittorrentTransferInfo {
+	dl_info_speed: number;
+	up_info_speed: number;
+	dl_info_data: number;
+	up_info_data: number;
+	connection_status: string;
+	dht_nodes: number;
+}
+
+export interface QbittorrentTorrent {
+	hash: string;
+	name: string;
+	state: string;
+	progress: number;
+	dlspeed: number;
+	upspeed: number;
+	size: number;
+	total_size: number;
+	save_path: string;
+	content_path: string;
+}
+
+export interface QbittorrentStatusResponse {
+	enabled: boolean;
+	connected: boolean;
+	base_url: string;
+	transfer: QbittorrentTransferInfo | null;
+	torrents: QbittorrentTorrent[];
+	error: string | null;
 }
 
 export interface ImprovePromptRequest {
@@ -496,6 +537,12 @@ export interface LlmTestResponse {
 	ok: boolean;
 	provider: string;
 	model: string;
+	message: string;
+}
+
+export interface QbittorrentTestResponse {
+	ok: boolean;
+	base_url: string;
 	message: string;
 }
 
@@ -854,6 +901,12 @@ export async function fetchDownloadItems(input: {
 	return res.json();
 }
 
+export async function fetchQbittorrentStatus(): Promise<QbittorrentStatusResponse> {
+	const res = await fetch(`${BASE}/downloads/qbittorrent/status`);
+	if (!res.ok) throw new Error(`Failed to fetch qBittorrent status: ${res.status}`);
+	return res.json();
+}
+
 export async function fetchDownloadLinkedPaths(path: string): Promise<DownloadsLinkedPathsResponse> {
 	const params = new URLSearchParams({ path });
 	const res = await fetch(`${BASE}/downloads/linked-paths?${params.toString()}`);
@@ -898,6 +951,21 @@ export async function testLlmConnection(llm: LlmConfig): Promise<LlmTestResponse
 	});
 	const data = await res.json();
 	if (!res.ok) throw new Error(data?.message || `Failed to test LLM connection: ${res.status}`);
+	return data;
+}
+
+export async function testQbittorrentConnection(
+	qbittorrent: QbittorrentConfig
+): Promise<QbittorrentTestResponse> {
+	const res = await fetch(`${BASE}/config/qbittorrent/test`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(qbittorrent)
+	});
+	const data = await res.json();
+	if (!res.ok) {
+		throw new Error(data?.message || `Failed to test qBittorrent connection: ${res.status}`);
+	}
 	return data;
 }
 
