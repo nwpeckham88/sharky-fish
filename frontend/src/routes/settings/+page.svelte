@@ -792,13 +792,19 @@ ${normalizedContext}`;
 				</div>
 			</div>
 
-			<!-- Storage (read-only, set via container volumes) -->
+			<!-- Storage -->
 			<div class="rounded-[1rem] border border-[color:var(--line)] p-5">
-				<h3 class="section-label mb-4">Storage <span class="text-xs font-normal text-[color:var(--ink-muted)]">(set via container volumes)</span></h3>
-				<div class="space-y-2 text-sm">
-					<div class="flex justify-between"><span class="text-[color:var(--ink-muted)]">Library</span><span class="font-mono text-[color:var(--ink-strong)]">{config.data_path}</span></div>
-					<div class="flex justify-between"><span class="text-[color:var(--ink-muted)]">Ingest</span><span class="font-mono text-[color:var(--ink-strong)]">{config.ingest_path}</span></div>
-					<div class="flex justify-between"><span class="text-[color:var(--ink-muted)]">Config</span><span class="font-mono text-[color:var(--ink-strong)]">{config.config_path}</span></div>
+				<h3 class="section-label mb-4">Storage</h3>
+				<div class="space-y-4">
+					<div class="space-y-2 text-sm">
+						<div class="flex justify-between"><span class="text-[color:var(--ink-muted)]">Library root</span><span class="font-mono text-[color:var(--ink-strong)]">{config.data_path}</span></div>
+						<div class="flex justify-between"><span class="text-[color:var(--ink-muted)]">Config</span><span class="font-mono text-[color:var(--ink-strong)]">{config.config_path}</span></div>
+					</div>
+					<label class="block">
+						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Downloads folder <span class="font-normal">(path inside container)</span></span>
+						<input type="text" bind:value={config.ingest_path} placeholder="/ingest" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 font-mono text-sm text-[color:var(--ink-strong)]" />
+						<span class="mt-1 block text-xs text-[color:var(--ink-muted)]">The folder your download client writes completed files to. Mount it into this container and set the same in-container path used by qBittorrent and the *arr stack whenever you want consistent imports and hardlinks. Also watched for new files entering the processing pipeline. Requires a container restart to take effect.</span>
+					</label>
 				</div>
 			</div>
 
