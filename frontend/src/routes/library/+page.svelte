@@ -224,6 +224,8 @@
 	let advancedMode = $state(false);
 	let requestedPath = $state<string | null>(null);
 	let requestedShow = $state<string | null>(null);
+	let requestedBulkMode = $state(false);
+	let requestedSelectPage = $state(false);
 	let queryTimer: ReturnType<typeof setTimeout> | undefined;
 	let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -321,6 +323,8 @@
 		sortBy = parseSortBy(page.url.searchParams.get('sort'));
 		sortDirection = parseSortDirection(page.url.searchParams.get('dir'));
 		advancedMode = page.url.searchParams.get('advanced') === '1';
+		requestedBulkMode = page.url.searchParams.get('bulk') === '1';
+		requestedSelectPage = page.url.searchParams.get('select') === 'page';
 		if (urlView) {
 			typeFilter = shapingViewFilters[urlView].typeFilter;
 			managedStatusFilter = shapingViewFilters[urlView].managedStatusFilter;
@@ -372,6 +376,14 @@
 				sortDirection
 			});
 			library = response.items;
+			if (requestedBulkMode) {
+				bulkMode = true;
+				if (requestedSelectPage) {
+					selectedPaths = new Set(response.items.map((item) => item.relative_path));
+				}
+				requestedBulkMode = false;
+				requestedSelectPage = false;
+			}
 			librarySummary = response.summary;
 			roots = response.roots;
 			scanStatus = response.scan;

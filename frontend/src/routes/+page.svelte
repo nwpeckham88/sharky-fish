@@ -69,6 +69,9 @@
 	let statusBusy = $state<Record<string, boolean>>({});
 	let rescanLoading = $state(false);
 	let rescanError = $state('');
+	let shortcutBusy = $state<'review_batch' | null>(null);
+	let shortcutStatus = $state('');
+	let shortcutError = $state('');
 	let refreshTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const reviewJobs = $derived(getReviewState().awaitingApproval);
@@ -78,6 +81,7 @@
 	const scanStatus = $derived(libraryState.scan);
 	const hasLibraries = $derived(libraries.length > 0);
 	const scanRunning = $derived(scanStatus.status === 'running');
+	const showFirstRunChecklist = $derived(!hasLibraries || scanRunning || librarySummary.total_items === 0);
 
 	onMount(async () => {
 		await Promise.all([
@@ -133,12 +137,55 @@
 	async function runRescan() {
 		rescanLoading = true;
 		rescanError = '';
+		shortcutError = '';
 		try {
 			await triggerLibraryRescan();
 		} catch (error) {
 			rescanError = error instanceof Error ? error.message : 'Failed to trigger rescan';
 		} finally {
 			rescanLoading = false;
+		}
+	}
+
+	async function launchFirstReviewBatch() {
+		shortcutBusy = 'review_batch';
+		shortcutStatus = '';
+		shortcutError = '';
+		try {
+			const unprocessed = await fetchBacklogItems('unprocessed', 200);
+			const paths = Array.from(
+				new Set(
+					unprocessed
+						.flatMap((item) => item.group_kind === 'tv_show' ? item.member_paths : [item.relative_path])
+						.filter((path) => path.trim().length > 0)
+				)
+			).slice(0, 25);
+
+			if (paths.length === 0) {
+				shortcutStatus = 'No unprocessed items are available for an initial review batch.';
+				return;
+			}
+
+			const response = await createBulkIntakeReviews(paths);
+			if (response.jobs.length > 0) {
+				const existingIds = new Set(response.jobs.map((job) => job.id));
+				jobStore.jobs = [...response.jobs, ...jobStore.jobs.filter((job) => !existingIds.has(job.id))];
+			}
+
+			await Promise.all([
+				refreshManagedItemStore(),
+				loadBacklog(activeBacklogFilter)
+			]);
+
+			shortcutStatus = response.failure_count === 0
+				? `Created ${response.success_count} review job(s) and opened Review.`
+				: `Created ${response.success_count} review job(s); ${response.failure_count} need follow-up. Opening Review.`;
+
+			await goto('/intake');
+		} catch (error) {
+			shortcutError = error instanceof Error ? error.message : 'Failed to create the first review batch';
+		} finally {
+			shortcutBusy = null;
 		}
 	}
 
@@ -380,7 +427,7 @@
 				label: 'Needs Metadata',
 				count: managedItemStore.summary.missing_metadata_count,
 				detail: 'Bulk-select matches before organizing or reviewing.',
-				href: '/library?view=missing_metadata'
+				href: '/library?view=missing_metadata&bulk=1&select=page'
 			},
 			{
 				label: 'Organize Needed',
@@ -493,7 +540,87 @@
 			detail: reviewItemCount > 0 ? `${reviewItemCount} items are waiting in Review.` : executionCounts.approved + executionCounts.processing > 0 ? `${executionCounts.approved + executionCounts.processing} jobs are downstream in execution.` : 'Review and execution are both clear.'
 		}
 	]);
+	const shortcutActions = $derived.by(() => {
+		const actions: Array<{
+			title: string;
+			detail: string;
+			href?: string;
+			action?: 'review_batch';
+			cta: string;
+		}> = [];
+
+		if (managedItemStore.summary.missing_metadata_count > 0) {
+			actions.push({
+				title: 'Bulk metadata selection',
+				detail: 'Open Library already filtered to missing metadata, with the current page preselected for bulk actions.',
+				href: '/library?view=missing_metadata&bulk=1&select=page',
+				cta: 'Open bulk metadata'
+			});
+		}
+
+		if (managedItemStore.summary.unprocessed_count > 0) {
+			actions.push({
+				title: 'Launch the first review batch',
+				detail: 'Create up to 25 AI review jobs from the unprocessed queue and move straight into Review.',
+				action: 'review_batch',
+				cta: 'Start review batch'
+			});
+		}
+
+		if (managedItemStore.summary.organize_needed_count > 0) {
+			actions.push({
+				title: 'Open organize-needed queue',
+				detail: 'Jump into the library items that already have metadata but still need canonical placement.',
+				href: '/library?view=organize_needed',
+				cta: 'Open organize queue'
+			});
+		}
+
+		return actions.slice(0, 3);
+	});
 </script>
+
+{#if showFirstRunChecklist}
+	<section class="sticky top-4 z-10 mb-6 rounded-[1rem] border border-[color:var(--accent)]/25 bg-[linear-gradient(135deg,rgba(164,79,45,0.12),rgba(214,180,111,0.08))] p-5 shadow-[0_12px_40px_rgba(69,53,32,0.08)] backdrop-blur">
+		<div class="flex flex-wrap items-start justify-between gap-4">
+			<div>
+				<p class="section-label">First-Run Checklist</p>
+				<h2 class="mt-1 text-xl text-[color:var(--ink-strong)]">Complete setup before you start shaping a huge library</h2>
+				<p class="mt-2 max-w-3xl text-sm leading-6 text-[color:var(--ink-muted)]">This checklist stays pinned until libraries are configured and the first scan has finished, so operators always have a clear next move on a fresh instance.</p>
+			</div>
+			<div class="flex flex-wrap gap-2">
+				<a href="/settings" class="rounded-full border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-4 py-2 text-sm font-semibold text-[color:var(--ink-strong)] no-underline">Configure libraries</a>
+				<button onclick={runRescan} disabled={rescanLoading || scanRunning || !hasLibraries} class="rounded-full bg-[color:var(--accent)] px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+					{rescanLoading ? 'Starting scan…' : scanRunning ? 'Scan running…' : 'Run first scan'}
+				</button>
+			</div>
+		</div>
+
+		<div class="mt-4 grid gap-3 lg:grid-cols-4">
+			{#each workflowSteps as step, index (step.title)}
+				<div class="rounded-[1rem] border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.72)] p-4">
+					<div class="flex items-start justify-between gap-3">
+						<div>
+							<div class="text-xs font-semibold uppercase tracking-[0.16em] text-[color:var(--ink-muted)]">Step {index + 1}</div>
+							<div class="mt-2 text-sm font-semibold text-[color:var(--ink-strong)]">{step.title}</div>
+						</div>
+						<span class={`status-chip ${step.complete ? 'completed' : 'processing'}`}>{step.complete ? 'Done' : 'Pending'}</span>
+					</div>
+					<p class="mt-2 text-sm text-[color:var(--ink-muted)]">{step.detail}</p>
+				</div>
+			{/each}
+		</div>
+
+		{#if scanRunning}
+			<div class="mt-4 h-2.5 overflow-hidden rounded-full bg-[color:rgba(123,105,81,0.16)]">
+				<div class="h-full rounded-full bg-[linear-gradient(90deg,var(--accent),var(--accent-soft),var(--olive))] transition-all duration-300" style={`width: ${scanStatus.total_items > 0 ? Math.min(100, (scanStatus.scanned_items / scanStatus.total_items) * 100) : 10}%`}></div>
+			</div>
+		{/if}
+		{#if rescanError}
+			<div class="mt-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-sm text-[color:var(--danger)]">{rescanError}</div>
+		{/if}
+	</section>
+{/if}
 
 <section class="mb-6 grid gap-4 md:grid-cols-[minmax(0,1.3fr)_minmax(18rem,0.7fr)]">
 	<div class="surface-card p-6">
@@ -612,6 +739,44 @@
 					</div>
 				{/each}
 			</div>
+		</div>
+
+		<div class="surface-card p-6">
+			<div class="mb-4 flex items-center justify-between gap-3">
+				<div>
+					<p class="section-label">Recommended Shortcuts</p>
+					<p class="text-lg text-[color:var(--ink-strong)]">Do the next useful bulk action</p>
+				</div>
+			</div>
+			{#if shortcutError}
+				<div class="mb-3 rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-sm text-[color:var(--danger)]">{shortcutError}</div>
+			{/if}
+			{#if shortcutStatus}
+				<div class="mb-3 rounded-lg border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-3 py-2 text-sm text-[color:var(--olive)]">{shortcutStatus}</div>
+			{/if}
+			{#if shortcutActions.length === 0}
+				<p class="text-sm text-[color:var(--ink-muted)]">No immediate bulk shortcuts are needed right now. Work from the queue cards below as conditions change.</p>
+			{:else}
+				<div class="space-y-3">
+					{#each shortcutActions as shortcut (shortcut.title)}
+						<div class="rounded-[1rem] border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-4">
+							<div class="flex flex-wrap items-start justify-between gap-3">
+								<div>
+									<div class="text-sm font-semibold text-[color:var(--ink-strong)]">{shortcut.title}</div>
+									<div class="mt-1 text-xs leading-5 text-[color:var(--ink-muted)]">{shortcut.detail}</div>
+								</div>
+								{#if shortcut.action === 'review_batch'}
+									<button onclick={launchFirstReviewBatch} disabled={shortcutBusy === 'review_batch'} class="rounded-full bg-[color:var(--accent)] px-4 py-2 text-sm font-semibold text-white disabled:opacity-50">
+										{shortcutBusy === 'review_batch' ? 'Creating batch…' : shortcut.cta}
+									</button>
+								{:else if shortcut.href}
+									<a href={shortcut.href} class="rounded-full bg-[color:var(--accent)] px-4 py-2 text-sm font-semibold text-white no-underline">{shortcut.cta}</a>
+								{/if}
+							</div>
+						</div>
+					{/each}
+				</div>
+			{/if}
 		</div>
 
 		<div class="surface-card p-6">
