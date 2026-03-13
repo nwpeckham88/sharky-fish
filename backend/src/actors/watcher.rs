@@ -45,9 +45,6 @@ impl WatcherActor {
     pub async fn run(self) -> Result<()> {
         let (notify_tx, mut notify_rx) = mpsc::channel::<notify::Result<Event>>(256);
 
-        std::fs::create_dir_all(&self.ingest_path)?;
-        std::fs::create_dir_all(&self.library_path)?;
-
         let ingest_path = self.ingest_path.clone();
         let library_path = self.library_path.clone();
         let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |res| {
@@ -55,13 +52,20 @@ impl WatcherActor {
                 warn!("watcher: dropping filesystem event because the event buffer is full");
             }
         })?;
-        watcher.watch(&ingest_path, RecursiveMode::Recursive)?;
+
+        let mut watched_any = false;
+        watched_any |= watch_path(&mut watcher, &ingest_path, "ingest");
         if library_path != ingest_path {
-            watcher.watch(&library_path, RecursiveMode::Recursive)?;
+            watched_any |= watch_path(&mut watcher, &library_path, "library");
         }
 
-        info!(path = %ingest_path.display(), "watcher: monitoring ingest directory");
-        info!(path = %library_path.display(), "watcher: monitoring library directory");
+        if !watched_any {
+            warn!(
+                ingest = %ingest_path.display(),
+                library = %library_path.display(),
+                "watcher: no paths could be monitored; check container volume mounts and permissions"
+            );
+        }
 
         // Event processing loop on the async runtime.
         while let Some(event_result) = notify_rx.recv().await {
@@ -146,4 +150,24 @@ fn change_label(kind: &EventKind) -> Option<&'static str> {
 
 fn is_media_file(path: &Path) -> bool {
     library_index::detect_media_type(path).is_some()
+}
+
+fn watch_path(watcher: &mut RecommendedWatcher, path: &Path, label: &str) -> bool {
+    if !path.exists() {
+        if let Err(error) = std::fs::create_dir_all(path) {
+            warn!(path = %path.display(), kind = label, err = %error, "watcher: cannot create path");
+            return false;
+        }
+    }
+
+    match watcher.watch(path, RecursiveMode::Recursive) {
+        Ok(()) => {
+            info!(path = %path.display(), kind = label, "watcher: monitoring path");
+            true
+        }
+        Err(error) => {
+            warn!(path = %path.display(), kind = label, err = %error, "watcher: cannot monitor path");
+            false
+        }
+    }
 }

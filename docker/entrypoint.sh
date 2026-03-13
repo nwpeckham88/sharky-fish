@@ -26,9 +26,12 @@ if [ -d /dev/dri ]; then
     done
 fi
 
-# Ensure config directory is writable.
-mkdir -p /config
-chown sharky:sharky /config
+# Ensure runtime directories exist and are writable by the service user.
+for dir in /config /data /ingest; do
+    mkdir -p "$dir" 2>/dev/null || true
+    chown sharky:sharky "$dir" 2>/dev/null || \
+        echo "sharky-fish: warning - cannot chown $dir (check host volume ownership/permissions)"
+done
 
 # Drop privileges and run the application.
 exec gosu sharky /usr/local/bin/sharky-fish "$@"
