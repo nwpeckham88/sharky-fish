@@ -71,7 +71,7 @@ pub async fn lookup_for_library_path_with_query(
     relative_path: &str,
     query_override: Option<&str>,
 ) -> Result<InternetMetadataResponse> {
-    let search_candidates = if let Some(query) = query_override
+    let mut search_candidates = if let Some(query) = query_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
@@ -79,6 +79,14 @@ pub async fn lookup_for_library_path_with_query(
     } else {
         extract_search_candidates(relative_path)
     };
+    let media_hint = infer_media_hint(config, relative_path);
+
+    // TV file names are commonly noisy (`Show - S01E02 - Episode Title ...`).
+    // Prefer show-level folder candidates first to make TMDb matching reliable.
+    if query_override.is_none() && media_hint.as_deref() == Some("series") {
+        search_candidates.reverse();
+    }
+
     let (query, parsed_year) = search_candidates
         .first()
         .map(|candidate| (candidate.query.clone(), candidate.parsed_year))
@@ -90,7 +98,6 @@ pub async fn lookup_for_library_path_with_query(
                 .to_string();
             (fallback, None)
         });
-    let media_hint = infer_media_hint(config, relative_path);
 
     let client = Client::builder()
         .user_agent(config.internet_metadata.user_agent.clone())
@@ -387,6 +394,10 @@ fn normalize_title_and_year(input: &str) -> Option<(String, Option<u16>)> {
             skip_next_if_numeric_id = false;
         }
 
+        if is_season_episode_token(&lowered) {
+            continue;
+        }
+
         if is_metadata_noise_token(&lowered) {
             continue;
         }
@@ -457,6 +468,45 @@ fn is_external_id_token(token: &str) -> bool {
         || token.starts_with("tvdbid")
         || token.starts_with("imdbid")
         || (token.starts_with("tt") && token[2..].chars().all(|c| c.is_ascii_digit()))
+}
+
+fn is_season_episode_token(token: &str) -> bool {
+    if token == "season" || token == "episode" || token == "ep" {
+        return true;
+    }
+
+    let chars = token.as_bytes();
+
+    // Matches patterns like s01e02, s1e9, s001e010.
+    if chars.len() >= 4 && chars[0] == b's' {
+        let mut index = 1;
+        let mut season_digits = 0;
+        while index < chars.len() && chars[index].is_ascii_digit() {
+            season_digits += 1;
+            index += 1;
+        }
+        if season_digits > 0 && index < chars.len() && chars[index] == b'e' {
+            index += 1;
+            let mut episode_digits = 0;
+            while index < chars.len() && chars[index].is_ascii_digit() {
+                episode_digits += 1;
+                index += 1;
+            }
+            if episode_digits > 0 && index == chars.len() {
+                return true;
+            }
+        }
+    }
+
+    // Matches short forms like e02 and s03.
+    if token.len() >= 2
+        && (token.starts_with('e') || token.starts_with('s'))
+        && token[1..].chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+
+    false
 }
 
 fn infer_media_hint(config: &AppConfig, relative_path: &str) -> Option<String> {
