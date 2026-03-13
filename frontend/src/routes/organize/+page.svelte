@@ -28,6 +28,7 @@
 	let episode = $state<number | null>(null);
 	let idMode = $state<'none' | 'imdb' | 'tvdb'>('none');
 	let writeNfo = $state(true);
+	let writeArtwork = $state(false);
 	let previewResult = $state<OrganizeLibraryResult | null>(null);
 	let actionLoading = $state(false);
 	let actionError = $state('');
@@ -110,6 +111,7 @@
 		episode = null;
 		idMode = item.library_id === activeLibraryId && activeLibrary()?.media_type === 'tv' ? 'tvdb' : 'none';
 		writeNfo = true;
+		writeArtwork = false;
 	}
 
 	async function loadSavedSelection(path: string): Promise<boolean> {
@@ -176,6 +178,7 @@
 				episode: episode ?? undefined,
 				id_mode: idMode,
 				write_nfo: writeNfo,
+				write_artwork: writeArtwork,
 				apply: false
 			});
 		} catch (error) {
@@ -198,6 +201,7 @@
 				episode: episode ?? undefined,
 				id_mode: idMode,
 				write_nfo: writeNfo,
+				write_artwork: writeArtwork,
 				apply: true
 			});
 			previewResult = result;
@@ -205,6 +209,12 @@
 			if (result.metadata_sidecar_written) {
 				status += ' Jellyfin .nfo sidecar written.';
 			}
+				if (result.artwork_written) {
+					status += ' Local Jellyfin artwork written.';
+				}
+				if (result.artwork_warning) {
+					actionWarning = result.artwork_warning;
+				}
 			await loadLibraryItems();
 			if (selected) {
 				selected = items.find((i) => i.relative_path === result.target_relative_path) ?? null;
@@ -361,6 +371,10 @@
 								<input type="checkbox" bind:checked={writeNfo} class="accent-[color:var(--accent)]" />
 								Write Jellyfin .nfo next to media
 							</label>
+							<label class="flex items-center gap-2 text-xs text-[color:var(--ink-muted)]">
+								<input type="checkbox" bind:checked={writeArtwork} class="accent-[color:var(--accent)]" />
+								Write local poster/backdrop artwork
+							</label>
 						</div>
 
 					<div class="flex flex-wrap gap-2">
@@ -382,6 +396,14 @@
 							{#if previewResult.metadata_sidecar_path}
 								<div class="mt-2 text-[color:var(--ink-muted)]">Metadata Sidecar</div>
 								<div class="font-mono text-[color:var(--ink-strong)]">{previewResult.metadata_sidecar_path}</div>
+							{/if}
+							{#if previewResult.artwork_paths.length > 0}
+								<div class="mt-2 text-[color:var(--ink-muted)]">Artwork Files</div>
+								<div class="space-y-1">
+									{#each previewResult.artwork_paths as artworkPath (artworkPath)}
+										<div class="font-mono text-[color:var(--ink-strong)]">{artworkPath}</div>
+									{/each}
+								</div>
 							{/if}
 						</div>
 					{/if}

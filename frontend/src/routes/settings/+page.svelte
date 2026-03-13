@@ -14,7 +14,7 @@
 		type LibraryFolder
 	} from '$lib/api';
 
-	let activeTab = $state<'libraries' | 'standards' | 'prompt' | 'system'>('libraries');
+	let activeTab = $state<'libraries' | 'artwork' | 'standards' | 'prompt' | 'system'>('libraries');
 	let config = $state<AppConfig | null>(null);
 	let loading = $state(true);
 	let saving = $state(false);
@@ -374,7 +374,7 @@ ${normalizedContext}`;
 
 <!-- Tab Bar -->
 <div class="mb-5 flex gap-1.5 rounded-xl border border-[color:var(--line)] bg-[color:var(--panel-strong)] p-1 w-fit">
-	{#each [['libraries', 'Libraries'], ['standards', 'Golden Standards'], ['prompt', 'Prompt Playground'], ['system', 'System Profile']] as [key, label] (key)}
+	{#each [['libraries', 'Libraries'], ['artwork', 'Artwork'], ['standards', 'Golden Standards'], ['prompt', 'Prompt Playground'], ['system', 'System Profile']] as [key, label] (key)}
 		<button class="rounded-lg px-4 py-2 text-sm font-semibold transition-colors {activeTab === key ? 'bg-[color:var(--accent)] text-white' : 'text-[color:var(--ink-muted)] hover:text-[color:var(--ink-strong)]'}" onclick={() => { activeTab = key as typeof activeTab; }}>{label}</button>
 	{/each}
 </div>
@@ -451,6 +451,171 @@ ${normalizedContext}`;
 				{/if}
 				<button onclick={handleAddLibrary} disabled={addingLibrary} class="rounded-lg bg-[color:var(--accent)] px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{addingLibrary ? (editingLibraryId ? 'Saving…' : 'Adding…') : (editingLibraryId ? 'Save Library' : 'Add Library')}</button>
 			</div>
+		</div>
+	</section>
+
+{:else if activeTab === 'artwork'}
+	<section class="surface-card p-6">
+		<h2 class="mb-4 text-xl text-[color:var(--ink-strong)]">Artwork Downloads</h2>
+		<p class="mb-6 text-sm text-[color:var(--ink-muted)]">
+			Configure how many images of each type Sharky Fish downloads per content category, following the same model as Jellyfin's image settings. Set a value to <span class="font-mono text-[color:var(--ink-strong)]">0</span> to skip that image type entirely.
+		</p>
+
+		<!-- Legend -->
+		<div class="mb-6 grid grid-cols-2 gap-2 rounded-xl border border-[color:var(--line)] bg-[color:rgba(244,236,223,0.45)] p-4 sm:grid-cols-3 lg:grid-cols-5 xl:grid-cols-6">
+			{#each [
+				['Primary', 'Main poster / showcase image'],
+				['Backdrop', 'Full-width fanart backgrounds'],
+				['Logo', 'Transparent clearlogo / title art'],
+				['Banner', 'Wide horizontal banner (800×150)'],
+				['Thumb', 'Landscape thumbnail (16:9)'],
+				['Disc', 'Optical disc cover art'],
+				['Art', 'ClearArt — transparent character/scene art'],
+				['Screenshot', 'Episode or scene screenshot'],
+				['Box', 'Box cover art (music / games)'],
+				['Box Rear', 'Rear box art'],
+				['Menu', 'Bonus-menu art'],
+			] as [name, desc]}
+				<div class="flex flex-col gap-0.5">
+					<span class="text-xs font-semibold text-[color:var(--ink-strong)]">{name}</span>
+					<span class="text-[10px] leading-4 text-[color:var(--ink-muted)]">{desc}</span>
+				</div>
+			{/each}
+		</div>
+
+		<div class="grid gap-5 md:grid-cols-2">
+
+			<!-- Movies -->
+			<div class="rounded-[1rem] border border-[color:var(--line)] p-5">
+				<div class="mb-4 flex items-center gap-3">
+					<div class="flex h-8 w-8 items-center justify-center rounded-lg bg-[color:var(--accent)]/15">
+						<svg class="h-4 w-4 text-[color:var(--accent-deep)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><path d="M7 2v20M17 2v20M2 12h20M2 7h5M2 17h5M17 17h5M17 7h5"/></svg>
+					</div>
+					<h3 class="section-label">Movies</h3>
+				</div>
+				<div class="grid grid-cols-2 gap-3 sm:grid-cols-3">
+					{#each [
+						['primary',    'Primary'],
+						['backdrop',   'Backdrop'],
+						['logo',       'Logo'],
+						['banner',     'Banner'],
+						['thumb',      'Thumb'],
+						['disc',       'Disc'],
+						['art',        'Art'],
+						['box_art',    'Box'],
+						['box_rear',   'Box Rear'],
+						['menu',       'Menu'],
+					] as [field, label]}
+						<label class="block">
+							<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">{label}</span>
+							<input
+								type="number"
+								min="0"
+								max="10"
+								bind:value={config.artwork_download.movies[field as keyof typeof config.artwork_download.movies]}
+								class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]"
+							/>
+						</label>
+					{/each}
+				</div>
+			</div>
+
+			<!-- TV Series -->
+			<div class="rounded-[1rem] border border-[color:var(--line)] p-5">
+				<div class="mb-4 flex items-center gap-3">
+					<div class="flex h-8 w-8 items-center justify-center rounded-lg bg-[color:var(--accent)]/15">
+						<svg class="h-4 w-4 text-[color:var(--accent-deep)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="7" width="20" height="15" rx="2" ry="2"/><polyline points="17 2 12 7 7 2"/></svg>
+					</div>
+					<h3 class="section-label">TV Series</h3>
+				</div>
+				<div class="grid grid-cols-2 gap-3 sm:grid-cols-3">
+					{#each [
+						['primary',    'Primary'],
+						['backdrop',   'Backdrop'],
+						['logo',       'Logo'],
+						['banner',     'Banner'],
+						['thumb',      'Thumb'],
+						['art',        'Art'],
+					] as [field, label]}
+						<label class="block">
+							<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">{label}</span>
+							<input
+								type="number"
+								min="0"
+								max="10"
+								bind:value={config.artwork_download.series[field as keyof typeof config.artwork_download.series]}
+								class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]"
+							/>
+						</label>
+					{/each}
+				</div>
+			</div>
+
+			<!-- TV Seasons -->
+			<div class="rounded-[1rem] border border-[color:var(--line)] p-5">
+				<div class="mb-4 flex items-center gap-3">
+					<div class="flex h-8 w-8 items-center justify-center rounded-lg bg-[color:var(--accent)]/15">
+						<svg class="h-4 w-4 text-[color:var(--accent-deep)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="2" y="7" width="20" height="15" rx="2" ry="2"/><line x1="8" y1="7" x2="8" y2="22"/></svg>
+					</div>
+					<h3 class="section-label">TV Seasons</h3>
+				</div>
+				<div class="grid grid-cols-2 gap-3 sm:grid-cols-3">
+					{#each [
+						['primary',    'Primary'],
+						['backdrop',   'Backdrop'],
+						['banner',     'Banner'],
+						['thumb',      'Thumb'],
+					] as [field, label]}
+						<label class="block">
+							<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">{label}</span>
+							<input
+								type="number"
+								min="0"
+								max="10"
+								bind:value={config.artwork_download.seasons[field as keyof typeof config.artwork_download.seasons]}
+								class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]"
+							/>
+						</label>
+					{/each}
+				</div>
+			</div>
+
+			<!-- TV Episodes -->
+			<div class="rounded-[1rem] border border-[color:var(--line)] p-5">
+				<div class="mb-4 flex items-center gap-3">
+					<div class="flex h-8 w-8 items-center justify-center rounded-lg bg-[color:var(--accent)]/15">
+						<svg class="h-4 w-4 text-[color:var(--accent-deep)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+					</div>
+					<h3 class="section-label">TV Episodes</h3>
+				</div>
+				<div class="grid grid-cols-2 gap-3 sm:grid-cols-3">
+					{#each [
+						['primary',    'Primary'],
+						['backdrop',   'Backdrop'],
+						['thumb',      'Thumb'],
+						['screenshot', 'Screenshot'],
+					] as [field, label]}
+						<label class="block">
+							<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">{label}</span>
+							<input
+								type="number"
+								min="0"
+								max="10"
+								bind:value={config.artwork_download.episodes[field as keyof typeof config.artwork_download.episodes]}
+								class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]"
+							/>
+						</label>
+					{/each}
+				</div>
+			</div>
+
+		</div>
+
+		<div class="mt-5 flex items-center justify-between gap-3">
+			<p class="text-xs text-[color:var(--ink-muted)]">
+				These counts are passed to internet metadata providers (TMDb, TVDB) when building image download queues. Requires a metadata refresh to take effect on existing library items.
+			</p>
+			<button onclick={save} disabled={saving} class="shrink-0 rounded-lg bg-[color:var(--accent)] px-5 py-2.5 text-sm font-semibold text-white disabled:opacity-50">{saving ? 'Saving…' : 'Save Artwork Settings'}</button>
 		</div>
 	</section>
 

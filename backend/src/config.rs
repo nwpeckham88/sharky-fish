@@ -61,6 +61,9 @@ pub struct AppConfig {
     /// Optional qBittorrent API integration used for transfer visibility.
     #[serde(default)]
     pub qbittorrent: QbittorrentConfig,
+    /// Artwork image download counts, mirroring Jellyfin's per-type configuration.
+    #[serde(default)]
+    pub artwork_download: ArtworkDownloadConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -199,6 +202,123 @@ fn default_metadata_provider() -> String {
     "tmdb".into()
 }
 
+// ---------------------------------------------------------------------------
+// Artwork download configuration (Jellyfin-style per-type image counts)
+// ---------------------------------------------------------------------------
+
+/// How many images of each type to download per content category.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArtworkDownloadConfig {
+    /// Image counts for movies.
+    pub movies: ArtworkTypeCounts,
+    /// Image counts for TV series (top-level show).
+    pub series: ArtworkTypeCounts,
+    /// Image counts for TV seasons.
+    pub seasons: ArtworkTypeCounts,
+    /// Image counts for TV episodes.
+    pub episodes: ArtworkTypeCounts,
+}
+
+/// Per-type image counts for a single content category. All fields default to 0.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ArtworkTypeCounts {
+    /// Primary / poster image (the main showcase artwork).
+    #[serde(default)]
+    pub primary: u32,
+    /// Backdrop / fanart images (full-width background).
+    #[serde(default)]
+    pub backdrop: u32,
+    /// Logo images (transparent title / studio logos, clearlogo).
+    #[serde(default)]
+    pub logo: u32,
+    /// Banner images (wide horizontal, 800×150-style).
+    #[serde(default)]
+    pub banner: u32,
+    /// Thumb images (landscape thumbnail, 16:9).
+    #[serde(default)]
+    pub thumb: u32,
+    /// Disc / optical disc cover art.
+    #[serde(default)]
+    pub disc: u32,
+    /// ClearArt / transparent character or scene art.
+    #[serde(default)]
+    pub art: u32,
+    /// Screenshot images (for episodes / bonus content).
+    #[serde(default)]
+    pub screenshot: u32,
+    /// Box art (primarily for music/game libraries).
+    #[serde(default)]
+    pub box_art: u32,
+    /// Rear box art.
+    #[serde(default)]
+    pub box_rear: u32,
+    /// Menu / bonus menu art.
+    #[serde(default)]
+    pub menu: u32,
+}
+
+impl Default for ArtworkDownloadConfig {
+    fn default() -> Self {
+        Self {
+            movies: ArtworkTypeCounts {
+                primary: 1,
+                backdrop: 3,
+                logo: 1,
+                banner: 0,
+                thumb: 0,
+                disc: 1,
+                art: 0,
+                screenshot: 0,
+                box_art: 0,
+                box_rear: 0,
+                menu: 0,
+            },
+            series: ArtworkTypeCounts {
+                primary: 1,
+                backdrop: 3,
+                logo: 1,
+                banner: 1,
+                thumb: 0,
+                disc: 0,
+                art: 0,
+                screenshot: 0,
+                box_art: 0,
+                box_rear: 0,
+                menu: 0,
+            },
+            seasons: ArtworkTypeCounts {
+                primary: 1,
+                backdrop: 0,
+                logo: 0,
+                banner: 1,
+                thumb: 0,
+                disc: 0,
+                art: 0,
+                screenshot: 0,
+                box_art: 0,
+                box_rear: 0,
+                menu: 0,
+            },
+            episodes: ArtworkTypeCounts {
+                primary: 1,
+                backdrop: 0,
+                logo: 0,
+                banner: 0,
+                thumb: 0,
+                disc: 0,
+                art: 0,
+                screenshot: 0,
+                box_art: 0,
+                box_rear: 0,
+                menu: 0,
+            },
+        }
+    }
+}
+
+
+
 fn default_qbittorrent_base_url() -> String {
     "http://qbittorrent:8080".into()
 }
@@ -307,6 +427,7 @@ impl Default for AppConfig {
             internet_metadata: InternetMetadataConfig::default(),
             scan_compute_checksums: false,
             qbittorrent: QbittorrentConfig::default(),
+            artwork_download: ArtworkDownloadConfig::default(),
         }
     }
 }

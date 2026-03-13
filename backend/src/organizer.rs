@@ -185,7 +185,7 @@ pub async fn preview_or_apply(
         metadata_sidecar_written = true;
     }
 
-    let artwork_paths = if request.write_artwork {
+    let mut artwork_paths = if request.write_artwork {
         sidecar::planned_jellyfin_artwork_relative_paths(
             &target_relative_str,
             &request.selected.media_kind,
@@ -210,6 +210,9 @@ pub async fn preview_or_apply(
         {
             Ok(result) => {
                 artwork_written = !result.files.is_empty();
+                if !result.files.is_empty() {
+                    artwork_paths = result.files;
+                }
                 if !result.warnings.is_empty() {
                     artwork_warning = Some(result.warnings.join(" "));
                 }

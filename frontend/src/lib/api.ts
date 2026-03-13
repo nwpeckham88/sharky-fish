@@ -464,6 +464,27 @@ export interface QbittorrentConfig {
 	max_torrents: number;
 }
 
+export interface ArtworkTypeCounts {
+	primary: number;
+	backdrop: number;
+	logo: number;
+	banner: number;
+	thumb: number;
+	disc: number;
+	art: number;
+	screenshot: number;
+	box_art: number;
+	box_rear: number;
+	menu: number;
+}
+
+export interface ArtworkDownloadConfig {
+	movies: ArtworkTypeCounts;
+	series: ArtworkTypeCounts;
+	seasons: ArtworkTypeCounts;
+	episodes: ArtworkTypeCounts;
+}
+
 export interface AppConfig {
 	data_path: string;
 	ingest_path: string;
@@ -485,6 +506,7 @@ export interface AppConfig {
 	internet_metadata: InternetMetadataConfig;
 	scan_compute_checksums: boolean;
 	qbittorrent: QbittorrentConfig;
+	artwork_download: ArtworkDownloadConfig;
 }
 
 export interface QbittorrentTransferInfo {
