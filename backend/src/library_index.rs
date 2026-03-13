@@ -10,10 +10,11 @@ use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, mpsc};
 use tokio::task;
 use tokio_stream::wrappers::ReceiverStream;
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct IndexCandidate {
@@ -40,7 +41,15 @@ pub async fn run_full_rescan(
     sse_tx: broadcast::Sender<SseEvent>,
 ) -> Result<bool> {
     let started_at = unix_now();
+    info!(
+        root = %library_root.display(),
+        libraries = libraries.len(),
+        concurrency = scan_concurrency,
+        queue_capacity = scan_queue_capacity,
+        "library scan: attempting to start"
+    );
     if !db::try_begin_library_scan(&pool, started_at).await? {
+        warn!("library scan: another scan is already running — skipping");
         return Ok(false);
     }
 
@@ -58,11 +67,15 @@ pub async fn run_full_rescan(
             },
         ));
 
+        info!("library scan: clearing existing index");
         db::clear_library_index(&pool).await?;
+        info!("library scan: index cleared, starting file discovery");
 
         let concurrency = scan_concurrency.max(1);
         let queue_capacity = scan_queue_capacity.max(1);
         let mut scanned_items = 0usize;
+        let scan_start = Instant::now();
+        let mut last_progress_at = Instant::now();
 
         let (tx, rx) = mpsc::channel::<IndexCandidate>(queue_capacity);
         let discovered_total = Arc::new(AtomicUsize::new(0));
@@ -74,8 +87,10 @@ pub async fn run_full_rescan(
 
         let producer = task::spawn_blocking(move || -> Result<()> {
             if !producer_root.exists() {
+                warn!(path = %producer_root.display(), "library scan: library root does not exist — no files will be discovered");
                 return Ok(());
             }
+            debug!(path = %producer_root.display(), "library scan: walking filesystem");
 
             for entry in walkdir::WalkDir::new(&producer_root)
                 .follow_links(false)
@@ -121,7 +136,10 @@ pub async fn run_full_rescan(
                     .to_ascii_lowercase();
                 let facts = filesystem_audit::file_system_facts(&metadata);
 
-                producer_total.fetch_add(1, Ordering::Relaxed);
+                let discovered = producer_total.fetch_add(1, Ordering::Relaxed) + 1;
+                if discovered.is_multiple_of(500) {
+                    debug!(discovered, "library scan: discovery progress");
+                }
                 let candidate = IndexCandidate {
                     relative_path: relative_path.clone(),
                     file_path: path.display().to_string(),
@@ -149,8 +167,17 @@ pub async fn run_full_rescan(
                 let pool = pool.clone();
                 let library_root = scan_library_root.clone();
                 async move {
+                    let checksum_start = Instant::now();
                     let checksum_blake3 =
                         filesystem_audit::blake3_checksum(Path::new(&candidate.file_path)).await?;
+                    let checksum_elapsed = checksum_start.elapsed();
+                    if checksum_elapsed.as_secs() >= 2 {
+                        warn!(
+                            path = %candidate.file_path,
+                            secs = checksum_elapsed.as_secs(),
+                            "library scan: slow checksum (large file or slow storage?)"
+                        );
+                    }
 
                     db::upsert_library_index_entry(
                         &pool,
@@ -192,6 +219,25 @@ pub async fn run_full_rescan(
             scanned_items += 1;
             let total = discovered_total.load(Ordering::Relaxed).max(scanned_items);
 
+            if scanned_items.is_multiple_of(50) {
+                let elapsed = scan_start.elapsed();
+                let rate = if elapsed.as_secs() > 0 {
+                    scanned_items as u64 / elapsed.as_secs()
+                } else {
+                    scanned_items as u64
+                };
+                let since_last = last_progress_at.elapsed();
+                last_progress_at = Instant::now();
+                info!(
+                    scanned = scanned_items,
+                    total,
+                    elapsed_secs = elapsed.as_secs(),
+                    files_per_sec = rate,
+                    last_batch_ms = since_last.as_millis(),
+                    "library scan: progress"
+                );
+            }
+
             if scanned_items.is_multiple_of(200) {
                 db::update_library_scan_progress(&pool, scanned_items, total).await?;
                 let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(
@@ -211,11 +257,23 @@ pub async fn run_full_rescan(
         producer.await??;
 
         let total = discovered_total.load(Ordering::Relaxed).max(scanned_items);
+        info!(
+            scanned = scanned_items,
+            total,
+            elapsed_secs = scan_start.elapsed().as_secs(),
+            "library scan: all files processed, finalizing"
+        );
         db::update_library_scan_progress(&pool, scanned_items, total).await?;
         db::delete_stale_managed_items(&pool).await?;
 
         let completed_at = unix_now();
         db::complete_library_scan(&pool, completed_at, scanned_items).await?;
+        info!(
+            scanned = scanned_items,
+            total,
+            elapsed_secs = scan_start.elapsed().as_secs(),
+            "library scan: complete"
+        );
         let _ = sse_tx.send(SseEvent::LibraryIndexScanProgress(
             LibraryIndexScanProgress {
                 status: "idle".into(),
@@ -269,6 +327,7 @@ pub async fn apply_library_path_change(
     change: &str,
 ) -> Result<()> {
     let relative_path = relative_path_string(library_root, path);
+    debug!(path = %path.display(), change, "library index: applying path change");
 
     if is_excluded_relative_path(&relative_path, exclude_patterns) {
         return Ok(());
