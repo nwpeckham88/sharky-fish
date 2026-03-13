@@ -1362,14 +1362,14 @@
 										{@const detail = detailState(item.relative_path)}
 										{@const artworkSrc = itemArtworkSrc(detail)}
 										<div class="border-t border-[color:rgba(123,105,81,0.1)] first:border-t-0">
-											<div class="flex items-start justify-between gap-3 px-8 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'} text-left {libraryViewMode === 'compact' ? 'text-[13px]' : 'text-sm'} hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''}">
+											<div class="group flex items-start justify-between gap-3 px-8 {libraryViewMode === 'compact' ? 'py-1.5' : 'py-3'} text-left {libraryViewMode === 'compact' ? 'text-[12px]' : 'text-sm'} hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''}">
 												<button class="min-w-0 flex-1 text-left" onclick={() => loadMetadata(item)}>
 													<div class="flex flex-wrap items-center gap-2">
 														<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
 														<span class="status-chip {statusTone(item.managed_status ?? 'UNPROCESSED')}">{statusLabel(item.managed_status ?? 'UNPROCESSED')}</span>
 														{#if metadataSelectionNeeded(item)}
 															<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">needs metadata</span>
-														{:else if item.has_selected_metadata}
+														{:else if item.has_selected_metadata && libraryViewMode !== 'compact'}
 															<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">metadata selected</span>
 														{/if}
 														{#if libraryViewMode !== 'compact'}
@@ -1383,32 +1383,32 @@
 															<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">organize needed</span>
 														{/if}
 													</div>
-													<div class="{libraryViewMode === 'compact' ? 'mt-0' : 'mt-0.5'} truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
+													<div class="{libraryViewMode === 'compact' ? (selectedItem?.relative_path === item.relative_path ? 'mt-0 block' : 'mt-0 hidden group-hover:block') : 'mt-0.5'} truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
 												</button>
 												<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
 												<div class="shrink-0 space-y-1">
 													<div class="flex flex-wrap justify-end gap-1">
-														<button class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)]" onclick={(event) => { event.stopPropagation(); loadMetadata(item); }}>
-															Inspect
+														<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-[color:var(--line)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]" title="Inspect" aria-label="Inspect" onclick={(event) => { event.stopPropagation(); loadMetadata(item); }}>
+															V
 														</button>
 														{#if (item.managed_status ?? 'UNPROCESSED') === 'UNPROCESSED'}
-															<button class="rounded-md bg-[color:var(--accent)] px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50" onclick={(event) => { event.stopPropagation(); createReview(item); }} disabled={!!rowActionBusy[item.relative_path]}>
-																{rowActionBusy[item.relative_path] === 'review' ? '...' : 'Review'}
+															<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md bg-[color:var(--accent)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-white disabled:opacity-50" title="Create AI Review" aria-label="Create AI Review" onclick={(event) => { event.stopPropagation(); createReview(item); }} disabled={!!rowActionBusy[item.relative_path]}>
+																{rowActionBusy[item.relative_path] === 'review' ? '...' : 'AI'}
 															</button>
-															<button class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={(event) => { event.stopPropagation(); updateManagedStatus(item, 'REVIEWED'); }} disabled={!!rowActionBusy[item.relative_path]}>
-																{rowActionBusy[item.relative_path] === 'REVIEWED' ? '...' : 'Reviewed'}
+															<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-[color:var(--line)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-[color:var(--ink-strong)] disabled:opacity-50" title="Mark Reviewed" aria-label="Mark Reviewed" onclick={(event) => { event.stopPropagation(); updateManagedStatus(item, 'REVIEWED'); }} disabled={!!rowActionBusy[item.relative_path]}>
+																{rowActionBusy[item.relative_path] === 'REVIEWED' ? '...' : 'OK'}
 															</button>
 														{/if}
 														{#if item.library_id}
-															<a href={`/organize?library=${encodeURIComponent(item.library_id)}&path=${encodeURIComponent(item.relative_path)}`} class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)] no-underline" onclick={(event) => event.stopPropagation()}>
-																Organize
+															<a href={`/organize?library=${encodeURIComponent(item.library_id)}&path=${encodeURIComponent(item.relative_path)}`} class="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-[color:var(--line)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-[color:var(--ink-strong)] no-underline" title="Open Organize" aria-label="Open Organize" onclick={(event) => event.stopPropagation()}>
+																ORG
 															</a>
 														{/if}
 													</div>
 													{#if libraryViewMode === 'compact'}
 														<div class="flex justify-end">
-															<button class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]" onclick={(event) => { event.stopPropagation(); toggleItemExpansion(item); }}>
-																{itemIsExpanded(item.relative_path) ? 'Collapse' : 'Expand'}
+															<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-[color:var(--line)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]" title={itemIsExpanded(item.relative_path) ? 'Collapse Details' : 'Expand Details'} aria-label={itemIsExpanded(item.relative_path) ? 'Collapse Details' : 'Expand Details'} onclick={(event) => { event.stopPropagation(); toggleItemExpansion(item); }}>
+																{itemIsExpanded(item.relative_path) ? '-' : '+'}
 															</button>
 														</div>
 													{/if}
@@ -1509,45 +1509,45 @@
 						{#each filteredLibrary as item (item.relative_path)}
 							{@const detail = detailState(item.relative_path)}
 							{@const artworkSrc = itemArtworkSrc(detail)}
-							<tr class="cursor-pointer border-b border-[color:rgba(123,105,81,0.14)] hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''} {selectedPaths.has(item.relative_path) ? 'bg-[color:rgba(214,180,111,0.08)]' : ''}" onclick={() => { if (bulkMode) { toggleSelect(item.relative_path); } else { loadMetadata(item); } }}>
+							<tr class="group cursor-pointer border-b border-[color:rgba(123,105,81,0.14)] hover:bg-[color:rgba(214,180,111,0.08)] {selectedItem?.relative_path === item.relative_path ? 'bg-[color:rgba(214,180,111,0.12)]' : ''} {selectedPaths.has(item.relative_path) ? 'bg-[color:rgba(214,180,111,0.08)]' : ''}" onclick={() => { if (bulkMode) { toggleSelect(item.relative_path); } else { loadMetadata(item); } }}>
 								{#if bulkMode}
 									<td class="w-10 px-3 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'}" onclick={(e) => { e.stopPropagation(); toggleSelect(item.relative_path); }}>
 										<input type="checkbox" checked={selectedPaths.has(item.relative_path)} class="accent-[color:var(--accent)]" />
 									</td>
 								{/if}
-								<td class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'} align-top">
+								<td class="px-4 {libraryViewMode === 'compact' ? 'py-1.5' : 'py-3'} align-top">
 									<div class="flex items-start justify-between gap-3">
 										<div class="min-w-0">
 											<div class="font-medium text-[color:var(--ink-strong)]">{item.file_name}</div>
-											<div class="{libraryViewMode === 'compact' ? 'mt-0' : 'mt-0.5'} truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
+											<div class="{libraryViewMode === 'compact' ? (selectedItem?.relative_path === item.relative_path ? 'mt-0 block' : 'mt-0 hidden group-hover:block') : 'mt-0.5'} truncate font-mono text-[11px] text-[color:var(--ink-muted)]">{item.relative_path}</div>
 											{#if libraryViewMode === 'compact'}
 												<!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-												<div class="mt-1 flex flex-wrap items-center gap-1">
-													<button class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)]" onclick={(event) => { event.stopPropagation(); loadMetadata(item); }}>
-														Inspect
+												<div class="mt-0.5 flex flex-wrap items-center gap-1">
+													<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-[color:var(--line)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]" title="Inspect" aria-label="Inspect" onclick={(event) => { event.stopPropagation(); loadMetadata(item); }}>
+														V
 													</button>
 													{#if (item.managed_status ?? 'UNPROCESSED') === 'UNPROCESSED'}
-														<button class="rounded-md bg-[color:var(--accent)] px-2 py-1 text-[10px] font-semibold text-white disabled:opacity-50" onclick={(event) => { event.stopPropagation(); createReview(item); }} disabled={!!rowActionBusy[item.relative_path]}>
-															{rowActionBusy[item.relative_path] === 'review' ? '...' : 'Review'}
+														<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md bg-[color:var(--accent)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-white disabled:opacity-50" title="Create AI Review" aria-label="Create AI Review" onclick={(event) => { event.stopPropagation(); createReview(item); }} disabled={!!rowActionBusy[item.relative_path]}>
+															{rowActionBusy[item.relative_path] === 'review' ? '...' : 'AI'}
 														</button>
-														<button class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={(event) => { event.stopPropagation(); updateManagedStatus(item, 'REVIEWED'); }} disabled={!!rowActionBusy[item.relative_path]}>
-															{rowActionBusy[item.relative_path] === 'REVIEWED' ? '...' : 'Reviewed'}
+														<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-[color:var(--line)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-[color:var(--ink-strong)] disabled:opacity-50" title="Mark Reviewed" aria-label="Mark Reviewed" onclick={(event) => { event.stopPropagation(); updateManagedStatus(item, 'REVIEWED'); }} disabled={!!rowActionBusy[item.relative_path]}>
+															{rowActionBusy[item.relative_path] === 'REVIEWED' ? '...' : 'OK'}
 														</button>
-														<button class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={(event) => { event.stopPropagation(); updateManagedStatus(item, 'KEPT_ORIGINAL'); }} disabled={!!rowActionBusy[item.relative_path]}>
-															{rowActionBusy[item.relative_path] === 'KEPT_ORIGINAL' ? '...' : 'Keep'}
+														<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-[color:var(--line)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-[color:var(--ink-strong)] disabled:opacity-50" title="Keep Original" aria-label="Keep Original" onclick={(event) => { event.stopPropagation(); updateManagedStatus(item, 'KEPT_ORIGINAL'); }} disabled={!!rowActionBusy[item.relative_path]}>
+															{rowActionBusy[item.relative_path] === 'KEPT_ORIGINAL' ? '...' : 'K'}
 														</button>
 													{/if}
 													{#if item.library_id}
-														<a href={`/organize?library=${encodeURIComponent(item.library_id)}&path=${encodeURIComponent(item.relative_path)}`} class="rounded-md border border-[color:var(--line)] px-2 py-1 text-[10px] font-semibold text-[color:var(--ink-strong)] no-underline" onclick={(event) => event.stopPropagation()}>
-															Organize
+														<a href={`/organize?library=${encodeURIComponent(item.library_id)}&path=${encodeURIComponent(item.relative_path)}`} class="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-[color:var(--line)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-[color:var(--ink-strong)] no-underline" title="Open Organize" aria-label="Open Organize" onclick={(event) => event.stopPropagation()}>
+															ORG
 														</a>
 													{/if}
 												</div>
 											{/if}
 										</div>
 										{#if libraryViewMode === 'compact'}
-											<button class="shrink-0 rounded-md border border-[color:var(--line)] px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.1em] text-[color:var(--ink-strong)]" onclick={(event) => { event.stopPropagation(); toggleItemExpansion(item); }}>
-												{itemIsExpanded(item.relative_path) ? 'Collapse' : 'Expand'}
+											<button class="shrink-0 inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-[color:var(--line)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-[color:var(--ink-strong)]" title={itemIsExpanded(item.relative_path) ? 'Collapse Details' : 'Expand Details'} aria-label={itemIsExpanded(item.relative_path) ? 'Collapse Details' : 'Expand Details'} onclick={(event) => { event.stopPropagation(); toggleItemExpansion(item); }}>
+												{itemIsExpanded(item.relative_path) ? '-' : '+'}
 											</button>
 										{/if}
 									</div>
@@ -1555,16 +1555,16 @@
 								<td class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'} align-top">
 									<span class="status-chip {item.media_type === 'video' ? 'processing' : item.media_type === 'audio' ? 'completed' : ''}">{item.media_type}</span>
 								</td>
-								<td class="px-4 {libraryViewMode === 'compact' ? 'py-2' : 'py-3'} align-top">
+								<td class="px-4 {libraryViewMode === 'compact' ? 'py-1.5' : 'py-3'} align-top">
 									<div class="flex max-w-[18rem] flex-wrap items-center gap-2">
 										<span class="status-chip {statusTone(item.managed_status ?? 'UNPROCESSED')}">{statusLabel(item.managed_status ?? 'UNPROCESSED')}</span>
 										{#if metadataSelectionNeeded(item)}
-											<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">needs metadata</span>
-										{:else if item.has_selected_metadata}
+											<span class="rounded-full border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--danger)]">meta</span>
+										{:else if item.has_selected_metadata && libraryViewMode !== 'compact'}
 											<span class="rounded-full border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--olive)]">metadata selected</span>
 										{/if}
 										{#if item.organize_needed}
-											<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">organize needed</span>
+											<span class="rounded-full border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-2 py-0.5 text-[10px] font-bold uppercase tracking-[0.1em] text-[color:var(--accent-deep)]">{libraryViewMode === 'compact' ? 'org' : 'organize needed'}</span>
 										{/if}
 										{#if libraryViewMode !== 'compact'}
 											{#if item.has_sidecar}
