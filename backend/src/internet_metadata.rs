@@ -397,16 +397,32 @@ fn normalize_title_and_year(input: &str) -> Option<(String, Option<u16>)> {
         .filter(|t| !t.is_empty())
         .collect::<Vec<_>>();
 
-    let mut year: Option<u16> = None;
-    for token in &tokens {
+    let mut year_candidates: Vec<(usize, u16)> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
         if token.len() == 4
             && let Ok(value) = token.parse::<u16>()
             && (1900..=2099).contains(&value)
         {
-            year = Some(value);
-            break;
+            year_candidates.push((index, value));
         }
     }
+
+    let parenthesized_year = find_parenthesized_year(stem);
+    let year = if let Some(y) = parenthesized_year {
+        Some(y)
+    } else if year_candidates.len() > 1 {
+        year_candidates.last().map(|(_, y)| *y)
+    } else if let Some((_, y)) = year_candidates.first() {
+        // Keep numeric-title movies searchable (e.g. "2012") by only treating
+        // a lone year token as a year when there is other title content.
+        if tokens.len() > 1 {
+            Some(*y)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let year_str = year.map(|y| y.to_string());
     let mut normalized_tokens: Vec<String> = Vec::new();
@@ -459,6 +475,36 @@ fn normalize_title_and_year(input: &str) -> Option<(String, Option<u16>)> {
     } else {
         Some((query.to_string(), year))
     }
+}
+
+fn find_parenthesized_year(value: &str) -> Option<u16> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 6 {
+        return None;
+    }
+
+    for i in 0..bytes.len().saturating_sub(5) {
+        if bytes[i] != b'(' {
+            continue;
+        }
+
+        let year_slice = &bytes[i + 1..i + 5];
+        if !year_slice.iter().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if bytes.get(i + 5) != Some(&b')') {
+            continue;
+        }
+
+        if let Ok(year_str) = std::str::from_utf8(year_slice)
+            && let Ok(year) = year_str.parse::<u16>()
+            && (1900..=2099).contains(&year)
+        {
+            return Some(year);
+        }
+    }
+
+    None
 }
 
 fn is_metadata_noise_token(token: &str) -> bool {
