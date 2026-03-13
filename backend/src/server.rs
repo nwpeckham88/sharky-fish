@@ -35,8 +35,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{RwLock, Semaphore, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
+use tower::ServiceExt as _;
 use tower_http::cors::CorsLayer;
-use tower_http::services::{ServeDir, ServeFile};
+use tower_http::services::ServeDir;
 
 #[derive(Deserialize)]
 struct CreateIntakeReviewRequest {
@@ -231,13 +232,33 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(Arc::new(state));
 
     if Path::new("/srv/frontend/index.html").exists() {
-        app = app.fallback_service(
-            ServeDir::new("/srv/frontend")
-                .not_found_service(ServeFile::new("/srv/frontend/index.html")),
-        );
+        app = app.fallback(spa_fallback);
     }
 
     app
+}
+
+/// Serve static files from /srv/frontend. For any path not found there
+/// (i.e. SPA client-side routes), return index.html with HTTP 200 so the
+/// SvelteKit router can take over. Without this, tower_http::ServeDir sends
+/// a 404 status even when falling back to index.html.
+async fn spa_fallback(req: axum::extract::Request) -> axum::response::Response {
+    let serve = ServeDir::new("/srv/frontend");
+    match serve.oneshot(req).await {
+        Ok(res) if res.status() != StatusCode::NOT_FOUND => {
+            let (parts, body) = res.into_parts();
+            axum::response::Response::from_parts(parts, axum::body::Body::new(body))
+        }
+        _ => match tokio::fs::read_to_string("/srv/frontend/index.html").await {
+            Ok(html) => (
+                StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                html,
+            )
+                .into_response(),
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        },
+    }
 }
 
 // ---------------------------------------------------------------------------
