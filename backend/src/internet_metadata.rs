@@ -440,7 +440,7 @@ fn normalize_title_and_year(input: &str) -> Option<(String, Option<u16>)> {
         }
 
         if is_season_episode_token(&lowered) {
-            continue;
+            break;
         }
 
         if is_metadata_noise_token(&lowered) {
@@ -577,6 +577,16 @@ fn is_season_episode_token(token: &str) -> bool {
     if token.len() >= 2
         && (token.starts_with('e') || token.starts_with('s'))
         && token[1..].chars().all(|c| c.is_ascii_digit())
+    {
+        return true;
+    }
+
+    // Matches 1x01, 01x01, 001x010.
+    if let Some((season, episode)) = token.split_once('x')
+        && !season.is_empty()
+        && !episode.is_empty()
+        && season.chars().all(|c| c.is_ascii_digit())
+        && episode.chars().all(|c| c.is_ascii_digit())
     {
         return true;
     }
