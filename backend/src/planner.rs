@@ -123,10 +123,20 @@ pub enum DefaultAudioTrackPolicy {
 pub struct PlannerLocalFacts {
     pub relative_path: String,
     pub absolute_path: String,
+    pub library_id: Option<String>,
     pub fs_facts: FileSystemFacts,
     pub probe: Option<MediaProbe>,
     pub selected_metadata: Option<InternetMetadataMatch>,
     pub existing_job_id: Option<i64>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct AudioPreferenceRow {
+    scope_type: String,
+    scope_key: String,
+    default_audio_track_policy: String,
+    normalization_mode: String,
+    night_listening_layout: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +198,7 @@ struct PlannerDerivedData {
 #[derive(Debug, Clone, FromRow)]
 struct LibraryIndexFactsRow {
     file_path: String,
+    library_id: Option<String>,
     device_id: i64,
     inode: i64,
     link_count: i64,
@@ -218,7 +229,7 @@ struct SelectedMetadataRow {
 
 pub async fn gather_local_facts(pool: &SqlitePool, relative_path: &str) -> Result<PlannerLocalFacts> {
     let index_row = sqlx::query_as::<_, LibraryIndexFactsRow>(
-        "SELECT file_path, device_id, inode, link_count, size_bytes, modified_at
+        "SELECT file_path, library_id, device_id, inode, link_count, size_bytes, modified_at
          FROM library_index
          WHERE relative_path = ?
          LIMIT 1",
@@ -227,10 +238,11 @@ pub async fn gather_local_facts(pool: &SqlitePool, relative_path: &str) -> Resul
     .fetch_optional(pool)
     .await?;
 
-    let (absolute_path, fs_facts) = if let Some(row) = index_row {
+    let (absolute_path, library_id, fs_facts) = if let Some(row) = index_row {
         let link_count = row.link_count.max(1) as u64;
         (
             row.file_path,
+            row.library_id,
             FileSystemFacts {
                 device_id: row.device_id.max(0) as u64,
                 inode: row.inode.max(0) as u64,
@@ -241,7 +253,7 @@ pub async fn gather_local_facts(pool: &SqlitePool, relative_path: &str) -> Resul
             },
         )
     } else {
-        (relative_path.to_string(), FileSystemFacts::default())
+        (relative_path.to_string(), None, FileSystemFacts::default())
     };
 
     let probe = sqlx::query_as::<_, ProbeRow>(
@@ -293,6 +305,7 @@ pub async fn gather_local_facts(pool: &SqlitePool, relative_path: &str) -> Resul
     Ok(PlannerLocalFacts {
         relative_path: relative_path.to_string(),
         absolute_path,
+        library_id,
         fs_facts,
         probe,
         selected_metadata,
@@ -768,6 +781,104 @@ fn validate_ffmpeg_arguments(arguments: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn parse_audio_mode(value: &str) -> AudioNormalizationMode {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "normalize_all" | "normalize_all_tracks" => AudioNormalizationMode::NormalizeAll,
+        "normalize_primary_and_alternate" => AudioNormalizationMode::NormalizePrimaryAndAlternate,
+        _ => AudioNormalizationMode::Disabled,
+    }
+}
+
+fn parse_night_layout(value: &str) -> Option<NightListeningLayout> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "two_point_one" | "2.1" => Some(NightListeningLayout::TwoPointOne),
+        "stereo" => Some(NightListeningLayout::Stereo),
+        _ => None,
+    }
+}
+
+fn parse_default_track_policy(value: &str) -> DefaultAudioTrackPolicy {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "prefer_night_listening_default" => DefaultAudioTrackPolicy::PreferNightListeningDefault,
+        _ => DefaultAudioTrackPolicy::PreserveOriginalDefault,
+    }
+}
+
+fn is_valid_execution_mode(value: &str) -> bool {
+    matches!(value, "full_plan" | "organize_only" | "process_only")
+}
+
+fn movie_scope_key(candidate: &InternetMetadataMatch) -> String {
+    if let Some(imdb_id) = candidate.imdb_id.as_ref().filter(|value| !value.trim().is_empty()) {
+        return imdb_id.trim().to_string();
+    }
+
+    let year = candidate
+        .year
+        .map(|value| value.to_string())
+        .unwrap_or_default();
+    format!("{}|{}", candidate.title.trim().to_ascii_lowercase(), year)
+}
+
+fn planner_audio_scope_candidates(
+    local_facts: &PlannerLocalFacts,
+    metadata_resolution: &PlannerMetadataResolution,
+) -> Vec<(String, String)> {
+    let mut scopes = Vec::<(String, String)>::new();
+
+    scopes.push(("item".to_string(), local_facts.relative_path.clone()));
+
+    if let Some(candidate) = metadata_resolution.selected_candidate.as_ref() {
+        if candidate.media_kind.eq_ignore_ascii_case("series") {
+            scopes.push((
+                "series".to_string(),
+                candidate.title.trim().to_ascii_lowercase(),
+            ));
+        } else {
+            scopes.push(("movie".to_string(), movie_scope_key(candidate)));
+        }
+    }
+
+    if let Some(library_id) = local_facts
+        .library_id
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        scopes.push(("library".to_string(), library_id.trim().to_string()));
+    }
+
+    scopes.push(("library".to_string(), "default".to_string()));
+    scopes
+}
+
+async fn load_audio_preference_for_item(
+    pool: &SqlitePool,
+    local_facts: &PlannerLocalFacts,
+    metadata_resolution: &PlannerMetadataResolution,
+) -> Result<Option<AudioPreferenceRow>> {
+    for (scope_type, scope_key) in planner_audio_scope_candidates(local_facts, metadata_resolution) {
+        let row = sqlx::query_as::<_, AudioPreferenceRow>(
+            "SELECT scope_type, scope_key, default_audio_track_policy,
+                    normalization_mode, night_listening_layout
+             FROM item_audio_preferences
+             WHERE lower(scope_type) = lower(?)
+               AND lower(scope_key) = lower(?)
+             ORDER BY updated_at DESC, id DESC
+             LIMIT 1",
+        )
+        .bind(&scope_type)
+        .bind(&scope_key)
+        .fetch_optional(pool)
+        .await?;
+
+        if row.is_some() {
+            return Ok(row);
+        }
+    }
+
+    Ok(None)
+}
+
 fn re_source_reason(probe: &MediaProbe) -> Option<String> {
     let video = probe
         .streams
@@ -792,6 +903,7 @@ fn re_source_reason(probe: &MediaProbe) -> Option<String> {
 }
 
 pub async fn build_processing_proposal(
+    pool: &SqlitePool,
     config: &AppConfig,
     relative_path: &str,
     local_facts: &PlannerLocalFacts,
@@ -892,40 +1004,9 @@ pub async fn build_processing_proposal(
                 rationale = value;
             }
             llm_risk_notes = parsed.risk_notes.unwrap_or_default();
-            let mode = match parsed
-                .audio_mode
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "normalize_all" => AudioNormalizationMode::NormalizeAll,
-                "normalize_primary_and_alternate" => AudioNormalizationMode::NormalizePrimaryAndAlternate,
-                _ => AudioNormalizationMode::Disabled,
-            };
-            let layout = match parsed
-                .night_listening_layout
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "two_point_one" | "2.1" => Some(NightListeningLayout::TwoPointOne),
-                "stereo" => Some(NightListeningLayout::Stereo),
-                _ => None,
-            };
-            let policy = match parsed
-                .default_track_policy
-                .unwrap_or_default()
-                .trim()
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "prefer_night_listening_default" => {
-                    DefaultAudioTrackPolicy::PreferNightListeningDefault
-                }
-                _ => DefaultAudioTrackPolicy::PreserveOriginalDefault,
-            };
+            let mode = parse_audio_mode(&parsed.audio_mode.unwrap_or_default());
+            let layout = parse_night_layout(&parsed.night_listening_layout.unwrap_or_default());
+            let policy = parse_default_track_policy(&parsed.default_track_policy.unwrap_or_default());
             audio_strategy = PlannerAudioStrategy {
                 mode,
                 night_listening_layout: layout,
@@ -950,6 +1031,19 @@ pub async fn build_processing_proposal(
                 "Processing-stage LLM unavailable; fallback recommendation used: {error}"
             ));
         }
+    }
+
+    if let Some(preference) = load_audio_preference_for_item(pool, local_facts, metadata_resolution).await? {
+        audio_strategy.mode = parse_audio_mode(&preference.normalization_mode);
+        audio_strategy.night_listening_layout = parse_night_layout(&preference.night_listening_layout);
+        audio_strategy.default_track_policy =
+            parse_default_track_policy(&preference.default_audio_track_policy);
+        audio_strategy.rationale = format!(
+            "Applied saved audio preference ({}:{}). {}",
+            preference.scope_type,
+            preference.scope_key,
+            audio_strategy.rationale
+        );
     }
 
     let mut ffmpeg_arguments = Vec::new();
@@ -1078,6 +1172,7 @@ fn build_recommendation(
 }
 
 async fn derive_plan_data(
+    pool: &SqlitePool,
     config: &AppConfig,
     relative_path: &str,
     local_facts: &PlannerLocalFacts,
@@ -1086,9 +1181,15 @@ async fn derive_plan_data(
     let ai_intake = run_ai_intake(config, local_facts, followups).await?;
     let metadata_resolution = resolve_metadata_candidates(config, relative_path, &ai_intake).await?;
     let organization = build_organization_proposal(relative_path, &metadata_resolution);
-    let (processing, audio_strategy) =
-        build_processing_proposal(config, relative_path, local_facts, &metadata_resolution, followups)
-            .await?;
+    let (processing, audio_strategy) = build_processing_proposal(
+        pool,
+        config,
+        relative_path,
+        local_facts,
+        &metadata_resolution,
+        followups,
+    )
+    .await?;
     let recommendation = build_recommendation(&metadata_resolution, &processing);
 
     let mut warnings = metadata_resolution.warnings.clone();
@@ -1189,7 +1290,7 @@ pub async fn create_or_refresh_plan(
     source: &str,
 ) -> Result<ItemPlanEnvelope> {
     let local_facts = gather_local_facts(pool, relative_path).await?;
-    let derived = derive_plan_data(config, relative_path, &local_facts, &[]).await?;
+    let derived = derive_plan_data(pool, config, relative_path, &local_facts, &[]).await?;
 
     let local_facts_json = serde_json::to_string(&local_facts)?;
     let ai_intake_json = serde_json::to_string(&derived.ai_intake)?;
@@ -1313,7 +1414,7 @@ pub async fn apply_followup_for_item(
     followups.push(message.to_string());
 
     let local_facts = gather_local_facts(pool, relative_path).await?;
-    let derived = derive_plan_data(config, relative_path, &local_facts, &followups).await?;
+    let derived = derive_plan_data(pool, config, relative_path, &local_facts, &followups).await?;
 
     let local_facts_json = serde_json::to_string(&local_facts)?;
     let ai_intake_json = serde_json::to_string(&derived.ai_intake)?;
@@ -1415,6 +1516,10 @@ pub async fn accept_plan_for_item(
     accepted_audio_strategy_json: Option<Value>,
     execution_mode: &str,
 ) -> Result<ItemPlanEnvelope> {
+    if !is_valid_execution_mode(execution_mode) {
+        anyhow::bail!("invalid execution mode: {execution_mode}");
+    }
+
     let Some(envelope) = get_plan_envelope_for_item(pool, relative_path).await? else {
         anyhow::bail!("no plan exists for path: {relative_path}");
     };
@@ -1468,6 +1573,16 @@ pub async fn save_audio_preference(
     night_listening_layout: &str,
 ) -> Result<()> {
     sqlx::query(
+        "DELETE FROM item_audio_preferences
+         WHERE lower(scope_type) = lower(?)
+           AND lower(scope_key) = lower(?)",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
         "INSERT INTO item_audio_preferences (
             scope_type,
             scope_key,
@@ -1485,4 +1600,279 @@ pub async fn save_audio_preference(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::SqlitePool;
+
+    fn sample_local_facts(library_id: Option<&str>) -> PlannerLocalFacts {
+        PlannerLocalFacts {
+            relative_path: "movies/Example.Movie.2024.mkv".to_string(),
+            absolute_path: "/data/movies/Example.Movie.2024.mkv".to_string(),
+            library_id: library_id.map(|value| value.to_string()),
+            fs_facts: FileSystemFacts::default(),
+            probe: None,
+            selected_metadata: None,
+            existing_job_id: None,
+        }
+    }
+
+    fn sample_candidate(media_kind: &str, imdb_id: Option<&str>) -> InternetMetadataMatch {
+        InternetMetadataMatch {
+            provider: "tmdb".to_string(),
+            title: "Example Movie".to_string(),
+            year: Some(2024),
+            media_kind: media_kind.to_string(),
+            imdb_id: imdb_id.map(|value| value.to_string()),
+            tvdb_id: None,
+            overview: None,
+            rating: None,
+            genres: Vec::new(),
+            poster_url: None,
+            backdrop_url: None,
+            source_url: None,
+        }
+    }
+
+    #[test]
+    fn validate_ffmpeg_arguments_accepts_safe_placeholders() {
+        let arguments = vec![
+            "-i".to_string(),
+            "input.mkv".to_string(),
+            "-c:v".to_string(),
+            "libx264".to_string(),
+            "output.mp4".to_string(),
+        ];
+        assert!(validate_ffmpeg_arguments(&arguments).is_ok());
+    }
+
+    #[test]
+    fn validate_ffmpeg_arguments_rejects_managed_or_incomplete_flags() {
+        let blocked = vec!["-i".to_string(), "input.mkv".to_string(), "-y".to_string(), "output.mp4".to_string()];
+        assert!(validate_ffmpeg_arguments(&blocked).is_err());
+
+        let missing_input = vec!["-c:a".to_string(), "aac".to_string(), "output.m4a".to_string()];
+        assert!(validate_ffmpeg_arguments(&missing_input).is_err());
+
+        let missing_output = vec!["-i".to_string(), "input.mkv".to_string(), "-c:a".to_string(), "aac".to_string()];
+        assert!(validate_ffmpeg_arguments(&missing_output).is_err());
+    }
+
+    #[test]
+    fn audio_parsers_map_expected_values() {
+        assert!(matches!(parse_audio_mode("normalize_all"), AudioNormalizationMode::NormalizeAll));
+        assert!(matches!(parse_audio_mode("normalize_primary_and_alternate"), AudioNormalizationMode::NormalizePrimaryAndAlternate));
+        assert!(matches!(parse_audio_mode("unknown"), AudioNormalizationMode::Disabled));
+
+        assert!(matches!(parse_night_layout("stereo"), Some(NightListeningLayout::Stereo)));
+        assert!(matches!(parse_night_layout("2.1"), Some(NightListeningLayout::TwoPointOne)));
+        assert!(parse_night_layout("invalid").is_none());
+
+        assert!(matches!(
+            parse_default_track_policy("prefer_night_listening_default"),
+            DefaultAudioTrackPolicy::PreferNightListeningDefault
+        ));
+        assert!(matches!(
+            parse_default_track_policy("anything_else"),
+            DefaultAudioTrackPolicy::PreserveOriginalDefault
+        ));
+    }
+
+    #[test]
+    fn movie_scope_key_prefers_imdb_when_available() {
+        let with_imdb = sample_candidate("movie", Some("tt1234567"));
+        assert_eq!(movie_scope_key(&with_imdb), "tt1234567");
+
+        let no_imdb = sample_candidate("movie", None);
+        assert_eq!(movie_scope_key(&no_imdb), "example movie|2024");
+    }
+
+    #[test]
+    fn planner_audio_scope_candidates_orders_specific_to_global() {
+        let local_facts = sample_local_facts(Some("library-main"));
+        let metadata_resolution = PlannerMetadataResolution {
+            query_attempted: "example".to_string(),
+            candidate_count: 1,
+            selected_candidate_index: Some(0),
+            selected_candidate: Some(sample_candidate("series", None)),
+            provider_used: Some("tmdb".to_string()),
+            warnings: Vec::new(),
+        };
+
+        let scopes = planner_audio_scope_candidates(&local_facts, &metadata_resolution);
+        assert_eq!(
+            scopes,
+            vec![
+                ("item".to_string(), "movies/Example.Movie.2024.mkv".to_string()),
+                ("series".to_string(), "example movie".to_string()),
+                ("library".to_string(), "library-main".to_string()),
+                ("library".to_string(), "default".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn execution_mode_validation_allows_only_supported_modes() {
+        assert!(is_valid_execution_mode("full_plan"));
+        assert!(is_valid_execution_mode("organize_only"));
+        assert!(is_valid_execution_mode("process_only"));
+        assert!(!is_valid_execution_mode("dry_run"));
+        assert!(!is_valid_execution_mode(""));
+    }
+
+    async fn setup_acceptance_pool() -> SqlitePool {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite should initialize");
+
+        sqlx::query(
+            "CREATE TABLE item_plans (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                relative_path       TEXT NOT NULL,
+                status              TEXT NOT NULL,
+                current_revision_id INTEGER,
+                created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("item_plans table should be created");
+
+        sqlx::query(
+            "CREATE TABLE item_plan_revisions (
+                id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_plan_id                INTEGER NOT NULL,
+                revision_number             INTEGER NOT NULL,
+                source                      TEXT NOT NULL,
+                local_facts_json            TEXT NOT NULL,
+                ai_intake_json              TEXT,
+                metadata_resolution_json    TEXT,
+                organization_json           TEXT,
+                processing_json             TEXT,
+                audio_strategy_json         TEXT,
+                recommendation_json         TEXT NOT NULL,
+                followups_json              TEXT NOT NULL,
+                warnings_json               TEXT NOT NULL,
+                created_at                  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("item_plan_revisions table should be created");
+
+        sqlx::query(
+            "CREATE TABLE item_plan_acceptance (
+                id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+                item_plan_id                    INTEGER NOT NULL,
+                accepted_revision_id            INTEGER NOT NULL,
+                accepted_metadata_json          TEXT,
+                accepted_processing_json        TEXT,
+                accepted_audio_strategy_json    TEXT,
+                accepted_execution_mode         TEXT NOT NULL,
+                created_at                      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )",
+        )
+        .execute(&pool)
+        .await
+        .expect("item_plan_acceptance table should be created");
+
+        pool
+    }
+
+    async fn seed_plan_with_revision(pool: &SqlitePool, relative_path: &str) {
+        sqlx::query(
+            "INSERT INTO item_plans (relative_path, status, current_revision_id)
+             VALUES (?, 'Draft', NULL)",
+        )
+        .bind(relative_path)
+        .execute(pool)
+        .await
+        .expect("plan insert should succeed");
+
+        let plan_id: i64 = sqlx::query_scalar("SELECT id FROM item_plans WHERE relative_path = ?")
+            .bind(relative_path)
+            .fetch_one(pool)
+            .await
+            .expect("plan id should be available");
+
+        sqlx::query(
+            "INSERT INTO item_plan_revisions (
+                item_plan_id,
+                revision_number,
+                source,
+                local_facts_json,
+                recommendation_json,
+                followups_json,
+                warnings_json
+             ) VALUES (?, 1, 'test', '{}', '{\"category\":\"keep\",\"reason\":\"ok\",\"confidence\":0.9}', '[]', '[]')",
+        )
+        .bind(plan_id)
+        .execute(pool)
+        .await
+        .expect("revision insert should succeed");
+
+        let revision_id: i64 = sqlx::query_scalar("SELECT id FROM item_plan_revisions WHERE item_plan_id = ?")
+            .bind(plan_id)
+            .fetch_one(pool)
+            .await
+            .expect("revision id should be available");
+
+        sqlx::query("UPDATE item_plans SET current_revision_id = ? WHERE id = ?")
+            .bind(revision_id)
+            .bind(plan_id)
+            .execute(pool)
+            .await
+            .expect("plan current revision should be set");
+    }
+
+    #[tokio::test]
+    async fn accept_plan_rejects_invalid_execution_mode_without_insert() {
+        let pool = setup_acceptance_pool().await;
+        seed_plan_with_revision(&pool, "movies/sample.mkv").await;
+
+        let error = accept_plan_for_item(
+            &pool,
+            "movies/sample.mkv",
+            None,
+            None,
+            None,
+            "dry_run",
+        )
+        .await
+        .expect_err("invalid execution mode must fail");
+        assert!(error.to_string().contains("invalid execution mode"));
+
+        let acceptance_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_plan_acceptance")
+            .fetch_one(&pool)
+            .await
+            .expect("count query should succeed");
+        assert_eq!(acceptance_rows, 0);
+    }
+
+    #[tokio::test]
+    async fn accept_plan_inserts_acceptance_and_marks_plan_approved() {
+        let pool = setup_acceptance_pool().await;
+        seed_plan_with_revision(&pool, "movies/sample.mkv").await;
+
+        let envelope = accept_plan_for_item(
+            &pool,
+            "movies/sample.mkv",
+            None,
+            None,
+            None,
+            "full_plan",
+        )
+        .await
+        .expect("valid execution mode should succeed");
+        assert_eq!(envelope.plan.status, "Approved");
+
+        let acceptance_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_plan_acceptance")
+            .fetch_one(&pool)
+            .await
+            .expect("count query should succeed");
+        assert_eq!(acceptance_rows, 1);
+    }
 }

@@ -2961,14 +2961,64 @@ pub async fn save_audio_preference(
     State(state): State<Arc<AppState>>,
     Json(req): Json<SaveAudioPrefRequest>,
 ) -> impl axum::response::IntoResponse {
-    let scope_key = req.scope_key.unwrap_or(req.path);
+    let scope_type = req.scope_type.trim().to_ascii_lowercase();
+    if !matches!(scope_type.as_str(), "item" | "series" | "movie" | "collection" | "library") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "scope_type must be one of: item, series, movie, collection, library",
+        )
+            .into_response();
+    }
+
+    let scope_key = req
+        .scope_key
+        .unwrap_or(req.path)
+        .trim()
+        .to_string();
+    if scope_key.is_empty() {
+        return (StatusCode::BAD_REQUEST, "scope_key cannot be empty").into_response();
+    }
+
+    let default_policy = req.default_audio_track_policy.trim().to_ascii_lowercase();
+    if !matches!(
+        default_policy.as_str(),
+        "preserve_original_default" | "prefer_night_listening_default"
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "default_audio_track_policy must be preserve_original_default or prefer_night_listening_default",
+        )
+            .into_response();
+    }
+
+    let normalization_mode = req.normalization_mode.trim().to_ascii_lowercase();
+    if !matches!(
+        normalization_mode.as_str(),
+        "disabled" | "normalize_all" | "normalize_primary_and_alternate"
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "normalization_mode must be disabled, normalize_all, or normalize_primary_and_alternate",
+        )
+            .into_response();
+    }
+
+    let night_layout = req.night_listening_layout.trim().to_ascii_lowercase();
+    if !matches!(night_layout.as_str(), "stereo" | "two_point_one") {
+        return (
+            StatusCode::BAD_REQUEST,
+            "night_listening_layout must be stereo or two_point_one",
+        )
+            .into_response();
+    }
+
     match crate::planner::save_audio_preference(
         &state.pool,
-        &req.scope_type,
+        &scope_type,
         &scope_key,
-        &req.default_audio_track_policy,
-        &req.normalization_mode,
-        &req.night_listening_layout,
+        &default_policy,
+        &normalization_mode,
+        &night_layout,
     )
     .await
     {

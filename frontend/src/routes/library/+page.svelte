@@ -7,13 +7,12 @@
 		acceptLibraryPlanMetadata,
 		autoSelectLibraryInternetMetadataBulk,
 		createOrRefreshLibraryPlan,
-		createBulkIntakeReviews,
-		createIntakeReview,
 		fetchConfig,
 		fetchCurrentLibraryPlan,
 		fetchLibrary,
 		fetchLibraryArtwork,
 		fetchLibraryPlanHistory,
+		saveLibraryPlanAudioPreference,
 		saveConfig,
 		sendLibraryPlanFollowup,
 		triggerLibraryRescan,
@@ -40,6 +39,7 @@
 		type InternetMetadataMatch,
 		type InternetMetadataResponse,
 		type ItemPlanEnvelope,
+		type ItemPlanRevision,
 		type PlanHistoryResponse,
 		type LibraryResponse,
 		type LibraryRoots,
@@ -232,6 +232,7 @@
 	let plannerStatus = $state('');
 	let plannerFollowup = $state('');
 	let plannerExecutionMode = $state<ReviewExecutionMode>('full_plan');
+	let plannerPreferenceScope = $state<'item' | 'series' | 'movie' | 'library'>('item');
 	let bulkActionFailedPaths = $state<string[]>([]);
 	let bulkInternetFailedPaths = $state<string[]>([]);
 	let libraryLoading = $state(true);
@@ -511,6 +512,7 @@
 		plannerStatus = '';
 		plannerFollowup = '';
 		plannerExecutionMode = 'full_plan';
+		plannerPreferenceScope = 'item';
 		bulkActionFailedPaths = [];
 		bulkInternetFailedPaths = [];
 		metadataLoading = true;
@@ -586,6 +588,97 @@
 
 	function plannerFollowups(): string[] {
 		return parsePlannerJson<string[]>(plannerRevision()?.followups_json ?? null) ?? [];
+	}
+
+	function plannerRevisionDiffs(): Array<{ revision: ItemPlanRevision; changes: string[] }> {
+		if (!plannerHistory || plannerHistory.revisions.length === 0) {
+			return [];
+		}
+
+		const ordered = [...plannerHistory.revisions].sort(
+			(a, b) => a.revision_number - b.revision_number
+		);
+		const output: Array<{ revision: ItemPlanRevision; changes: string[] }> = [];
+
+		for (let index = 0; index < ordered.length; index += 1) {
+			const current = ordered[index];
+			const previous = index > 0 ? ordered[index - 1] : null;
+			const currentRecommendation = parsePlannerJson<{ category?: string; reason?: string }>(
+				current.recommendation_json
+			);
+			const previousRecommendation = previous
+				? parsePlannerJson<{ category?: string; reason?: string }>(previous.recommendation_json)
+				: null;
+			const currentProcessing = parsePlannerJson<{ action?: string }>(current.processing_json);
+			const previousProcessing = previous
+				? parsePlannerJson<{ action?: string }>(previous.processing_json)
+				: null;
+			const currentMetadata = parsePlannerJson<{ selected_candidate?: InternetMetadataMatch | null }>(
+				current.metadata_resolution_json
+			);
+			const previousMetadata = previous
+				? parsePlannerJson<{ selected_candidate?: InternetMetadataMatch | null }>(
+						previous.metadata_resolution_json
+					)
+				: null;
+			const currentWarnings = parsePlannerJson<string[]>(current.warnings_json) ?? [];
+			const previousWarnings = previous
+				? parsePlannerJson<string[]>(previous.warnings_json) ?? []
+				: [];
+			const currentFollowups = parsePlannerJson<string[]>(current.followups_json) ?? [];
+			const previousFollowups = previous
+				? parsePlannerJson<string[]>(previous.followups_json) ?? []
+				: [];
+
+			const changes: string[] = [];
+			if (!previous) {
+				changes.push('Initial planner revision created');
+			} else {
+				if (currentRecommendation?.category !== previousRecommendation?.category) {
+					changes.push(
+						`recommendation: ${previousRecommendation?.category ?? 'unset'} -> ${currentRecommendation?.category ?? 'unset'}`
+					);
+				}
+				if ((currentRecommendation?.reason ?? '') !== (previousRecommendation?.reason ?? '')) {
+					changes.push('recommendation rationale updated');
+				}
+				if (currentProcessing?.action !== previousProcessing?.action) {
+					changes.push(
+						`processing action: ${previousProcessing?.action ?? 'unset'} -> ${currentProcessing?.action ?? 'unset'}`
+					);
+				}
+
+				const currentCandidate = currentMetadata?.selected_candidate;
+				const previousCandidate = previousMetadata?.selected_candidate;
+				const currentCandidateKey = currentCandidate
+					? `${currentCandidate.provider}|${currentCandidate.title}|${currentCandidate.year ?? ''}`
+					: '';
+				const previousCandidateKey = previousCandidate
+					? `${previousCandidate.provider}|${previousCandidate.title}|${previousCandidate.year ?? ''}`
+					: '';
+				if (currentCandidateKey !== previousCandidateKey) {
+					const currentLabel = currentCandidate
+						? `${currentCandidate.title}${currentCandidate.year ? ` (${currentCandidate.year})` : ''}`
+						: 'none';
+					changes.push(`metadata candidate changed to ${currentLabel}`);
+				}
+
+				if (currentWarnings.length !== previousWarnings.length) {
+					changes.push(`warnings: ${previousWarnings.length} -> ${currentWarnings.length}`);
+				}
+				if (currentFollowups.length !== previousFollowups.length) {
+					changes.push(`follow-up notes: ${previousFollowups.length} -> ${currentFollowups.length}`);
+				}
+			}
+
+			if (changes.length === 0) {
+				changes.push('No material change detected');
+			}
+
+			output.push({ revision: current, changes });
+		}
+
+		return output.slice(-6).reverse();
 	}
 
 	async function loadPlanner(path: string) {
@@ -695,6 +788,51 @@
 			await Promise.all([loadLibrary(), refreshManagedItemStore()]);
 		} catch (error) {
 			plannerError = error instanceof Error ? error.message : 'Failed to accept planner execution';
+		} finally {
+			plannerActionLoading = false;
+		}
+	}
+
+	async function savePlannerAudioPreferenceForSelected() {
+		if (!selectedItem || !plannerEnvelope) return;
+		const audioStrategy = plannerAudioStrategy();
+		const metadataResolution = plannerMetadataResolution();
+		if (!audioStrategy) {
+			plannerError = 'No planner audio strategy is available to save.';
+			return;
+		}
+
+		let scopeKey = selectedItem.relative_path;
+		if (plannerPreferenceScope === 'series') {
+			scopeKey = metadataResolution?.selected_candidate?.title?.trim().toLowerCase() ?? scopeKey;
+		}
+		if (plannerPreferenceScope === 'movie') {
+			const match = metadataResolution?.selected_candidate;
+			scopeKey =
+				match?.imdb_id ??
+				`${match?.title?.trim().toLowerCase() ?? ''}|${match?.year ?? ''}`;
+		}
+		if (plannerPreferenceScope === 'library') {
+			scopeKey = selectedItem.library_id ?? 'default';
+		}
+
+		plannerActionLoading = true;
+		plannerError = '';
+		plannerStatus = '';
+		try {
+			await saveLibraryPlanAudioPreference({
+				path: selectedItem.relative_path,
+				scope_type: plannerPreferenceScope,
+				scope_key: scopeKey,
+				default_audio_track_policy:
+					audioStrategy.default_track_policy ?? 'preserve_original_default',
+				normalization_mode: audioStrategy.mode ?? 'disabled',
+				night_listening_layout: audioStrategy.night_listening_layout ?? 'stereo'
+			});
+			plannerStatus = `Saved audio preference at ${plannerPreferenceScope} scope.`;
+		} catch (error) {
+			plannerError =
+				error instanceof Error ? error.message : 'Failed to save audio preference';
 		} finally {
 			plannerActionLoading = false;
 		}
@@ -874,7 +1012,7 @@
 		}
 	}
 
-	async function runBulkCreateReview() {
+	async function runBulkCreatePlanner() {
 		if (selectedPaths.size === 0) return;
 		bulkActionLoading = true;
 		bulkActionStatus = '';
@@ -882,35 +1020,47 @@
 		rowActionError = '';
 		const paths = Array.from(selectedPaths);
 		try {
-			const response = await createBulkIntakeReviews(paths);
-			const createdJobs = response.jobs;
-			const failedPaths = response.failures.map((failure) => failure.path);
+			const failedPaths: string[] = [];
+			const batchSize = 4;
+			for (let index = 0; index < paths.length; index += batchSize) {
+				const batch = paths.slice(index, index + batchSize);
+				const outcomes = await Promise.allSettled(
+					batch.map((path) => createOrRefreshLibraryPlan(path, 'create_or_refresh'))
+				);
+				for (let outcomeIndex = 0; outcomeIndex < outcomes.length; outcomeIndex += 1) {
+					if (outcomes[outcomeIndex].status === 'rejected') {
+						failedPaths.push(batch[outcomeIndex]);
+					}
+				}
+			}
+
+			const successCount = paths.length - failedPaths.length;
 			bulkActionFailedPaths = failedPaths;
 			selectedPaths = new Set(failedPaths);
-			if (createdJobs.length > 0) {
-				const existingIds = new Set(createdJobs.map((job) => job.id));
-				jobStore.jobs = [...createdJobs, ...jobStore.jobs.filter((job) => !existingIds.has(job.id))];
-			}
-			bulkActionStatus = response.failure_count === 0
-				? `${response.success_count} AI review job(s) created.`
-				: `${response.success_count} AI review job(s) created, ${response.failure_count} failed. Failed items remain selected.`;
+			bulkActionStatus = failedPaths.length === 0
+				? `${successCount} planner revision(s) created.`
+				: `${successCount} planner revision(s) created, ${failedPaths.length} failed. Failed items remain selected.`;
 			await Promise.all([loadLibrary(), refreshManagedItemStore()]);
 		} catch (error) {
-			bulkActionStatus = error instanceof Error ? error.message : 'Bulk review creation failed';
+			bulkActionStatus = error instanceof Error ? error.message : 'Bulk planner creation failed';
 		} finally {
 			bulkActionLoading = false;
 		}
 	}
 
-	async function createReview(item: LibraryEntry) {
-		rowActionBusy = { ...rowActionBusy, [item.relative_path]: 'review' };
+	async function createPlanner(item: LibraryEntry) {
+		rowActionBusy = { ...rowActionBusy, [item.relative_path]: 'planner' };
 		rowActionError = '';
 		try {
-			const job = await createIntakeReview(item.relative_path);
-			jobStore.jobs = [job, ...jobStore.jobs.filter((existing) => existing.id !== job.id)];
-			await Promise.all([loadLibrary(), refreshManagedItemStore()]);
+			const plan = await createOrRefreshLibraryPlan(item.relative_path, 'create_or_refresh');
+			if (selectedItem?.relative_path === item.relative_path) {
+				plannerEnvelope = plan;
+				plannerStatus = 'Planner revision refreshed for this item.';
+			} else {
+				await loadMetadata(item);
+			}
 		} catch (error) {
-			rowActionError = error instanceof Error ? error.message : 'Failed to create AI review';
+			rowActionError = error instanceof Error ? error.message : 'Failed to create planner revision';
 		} finally {
 			rowActionBusy = { ...rowActionBusy, [item.relative_path]: '' };
 		}
@@ -1454,7 +1604,7 @@
 	<section class="mb-4 flex items-center gap-3 rounded-xl border border-[color:var(--accent)]/30 bg-[color:var(--accent)]/5 px-4 py-2.5">
 		<span class="text-sm font-semibold text-[color:var(--ink-strong)]">{selectedPaths.size} selected</span>
 		<div class="flex gap-2">
-			<button class="rounded-lg bg-[color:var(--accent)] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50" onclick={runBulkCreateReview} disabled={bulkActionLoading || bulkInternetLoading}>{bulkActionLoading ? 'Working…' : 'Create Reviews'}</button>
+			<button class="rounded-lg bg-[color:var(--accent)] px-3 py-1.5 text-xs font-semibold text-white disabled:opacity-50" onclick={runBulkCreatePlanner} disabled={bulkActionLoading || bulkInternetLoading}>{bulkActionLoading ? 'Working…' : 'Create Plans'}</button>
 			<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => runBulkManagedStatus('REVIEWED')} disabled={bulkActionLoading || bulkInternetLoading}>{bulkActionLoading ? 'Working…' : 'Mark Reviewed'}</button>
 			<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => runBulkManagedStatus('KEPT_ORIGINAL')} disabled={bulkActionLoading || bulkInternetLoading}>{bulkActionLoading ? 'Working…' : 'Keep Original'}</button>
 			<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => runBulkInternetLookup(false)} disabled={bulkInternetLoading}>{bulkInternetLoading ? 'Working…' : 'Bulk Lookup Metadata'}</button>
@@ -1583,8 +1733,8 @@
 															V
 														</button>
 														{#if (item.managed_status ?? 'UNPROCESSED') === 'UNPROCESSED'}
-															<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md bg-[color:var(--accent)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-white disabled:opacity-50" title="Create AI Review" aria-label="Create AI Review" onclick={(event) => { event.stopPropagation(); createReview(item); }} disabled={!!rowActionBusy[item.relative_path]}>
-																{rowActionBusy[item.relative_path] === 'review' ? '...' : 'AI'}
+															<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md bg-[color:var(--accent)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-white disabled:opacity-50" title="Create Planner Revision" aria-label="Create Planner Revision" onclick={(event) => { event.stopPropagation(); createPlanner(item); }} disabled={!!rowActionBusy[item.relative_path]}>
+																{rowActionBusy[item.relative_path] === 'planner' ? '...' : 'PLN'}
 															</button>
 															<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-[color:var(--line)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-[color:var(--ink-strong)] disabled:opacity-50" title="Mark Reviewed" aria-label="Mark Reviewed" onclick={(event) => { event.stopPropagation(); updateManagedStatus(item, 'REVIEWED'); }} disabled={!!rowActionBusy[item.relative_path]}>
 																{rowActionBusy[item.relative_path] === 'REVIEWED' ? '...' : 'OK'}
@@ -1718,8 +1868,8 @@
 														V
 													</button>
 													{#if (item.managed_status ?? 'UNPROCESSED') === 'UNPROCESSED'}
-														<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md bg-[color:var(--accent)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-white disabled:opacity-50" title="Create AI Review" aria-label="Create AI Review" onclick={(event) => { event.stopPropagation(); createReview(item); }} disabled={!!rowActionBusy[item.relative_path]}>
-															{rowActionBusy[item.relative_path] === 'review' ? '...' : 'AI'}
+														<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md bg-[color:var(--accent)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-white disabled:opacity-50" title="Create Planner Revision" aria-label="Create Planner Revision" onclick={(event) => { event.stopPropagation(); createPlanner(item); }} disabled={!!rowActionBusy[item.relative_path]}>
+															{rowActionBusy[item.relative_path] === 'planner' ? '...' : 'PLN'}
 														</button>
 														<button class="inline-flex h-6 min-w-6 items-center justify-center rounded-md border border-[color:var(--line)] px-1 text-[9px] font-bold uppercase tracking-[0.08em] text-[color:var(--ink-strong)] disabled:opacity-50" title="Mark Reviewed" aria-label="Mark Reviewed" onclick={(event) => { event.stopPropagation(); updateManagedStatus(item, 'REVIEWED'); }} disabled={!!rowActionBusy[item.relative_path]}>
 															{rowActionBusy[item.relative_path] === 'REVIEWED' ? '...' : 'OK'}
@@ -1784,8 +1934,8 @@
 									<td class="px-4 py-3 align-top" onclick={(e) => e.stopPropagation()}>
 										<div class="flex flex-wrap gap-2">
 										{#if (item.managed_status ?? 'UNPROCESSED') === 'UNPROCESSED'}
-											<button class="rounded-md bg-[color:var(--accent)] px-2.5 py-1.5 text-[10px] font-semibold text-white disabled:opacity-50" onclick={() => createReview(item)} disabled={!!rowActionBusy[item.relative_path]}>
-												{rowActionBusy[item.relative_path] === 'review' ? 'Building…' : 'Create Review'}
+											<button class="rounded-md bg-[color:var(--accent)] px-2.5 py-1.5 text-[10px] font-semibold text-white disabled:opacity-50" onclick={() => createPlanner(item)} disabled={!!rowActionBusy[item.relative_path]}>
+												{rowActionBusy[item.relative_path] === 'planner' ? 'Planning…' : 'Create Plan'}
 											</button>
 											<button class="rounded-md border border-[color:var(--line)] px-2.5 py-1.5 text-[10px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={() => updateManagedStatus(item, 'REVIEWED')} disabled={!!rowActionBusy[item.relative_path]}>
 												{rowActionBusy[item.relative_path] === 'REVIEWED' ? 'Saving…' : 'Mark Reviewed'}
@@ -2073,9 +2223,18 @@
 									</button>
 								</div>
 
-								<div class="mt-2 grid gap-2 sm:grid-cols-[auto_auto_auto_minmax(0,1fr)] sm:items-center">
+								<div class="mt-2 grid gap-2 sm:grid-cols-[auto_auto_auto_auto_auto_minmax(0,1fr)] sm:items-center">
 									<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-[11px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={acceptPlannerMetadataForSelected} disabled={plannerActionLoading || !metadataResolution?.selected_candidate}>
 										Accept Metadata
+									</button>
+									<select class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-[11px] text-[color:var(--ink-strong)]" bind:value={plannerPreferenceScope}>
+										<option value="item">save:item</option>
+										<option value="series">save:series</option>
+										<option value="movie">save:movie</option>
+										<option value="library">save:library</option>
+									</select>
+									<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-[11px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={savePlannerAudioPreferenceForSelected} disabled={plannerActionLoading || !audioStrategy}>
+										Save Audio Pref
 									</button>
 									<select class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-[11px] text-[color:var(--ink-strong)]" bind:value={plannerExecutionMode}>
 										<option value="full_plan">full_plan</option>
@@ -2089,6 +2248,24 @@
 										<div class="text-[11px] text-[color:var(--ink-muted)]">History: {plannerHistory.revisions.length} revisions, {plannerHistory.messages.length} messages</div>
 									{/if}
 								</div>
+
+								{#if plannerHistory}
+									{@const revisionDiffs = plannerRevisionDiffs()}
+									<div class="mt-2 rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.45)] px-3 py-2">
+										<div class="section-label">Revision Deltas</div>
+										<div class="mt-2 space-y-2">
+											{#each revisionDiffs as diff (diff.revision.id)}
+												<div class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-2.5 py-2 text-[11px]">
+													<div class="flex flex-wrap items-center justify-between gap-2 text-[color:var(--ink-muted)]">
+														<span>Revision #{diff.revision.revision_number} · {diff.revision.source}</span>
+														<span>{formatTimestamp(Date.parse(diff.revision.created_at) / 1000)}</span>
+													</div>
+													<div class="mt-1 text-[color:var(--ink-strong)]">{diff.changes.join(' • ')}</div>
+												</div>
+											{/each}
+										</div>
+									</div>
+								{/if}
 
 								{#if plannerStatus}
 									<div class="mt-2 rounded-lg border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-3 py-2 text-xs text-[color:var(--olive)]">{plannerStatus}</div>
