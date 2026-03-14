@@ -636,6 +636,19 @@ pub async fn get_plan_history(pool: &SqlitePool, plan_id: i64) -> Result<Vec<Ite
     Ok(revisions)
 }
 
+pub async fn get_plan_messages(pool: &SqlitePool, plan_id: i64) -> Result<Vec<ItemPlanMessage>> {
+    let messages = sqlx::query_as::<_, ItemPlanMessage>(
+        "SELECT id, item_plan_id, revision_id, role, message_text, created_at
+         FROM item_plan_messages
+         WHERE item_plan_id = ?
+         ORDER BY id ASC",
+    )
+    .bind(plan_id)
+    .fetch_all(pool)
+    .await?;
+    Ok(messages)
+}
+
 pub async fn get_latest_revision_for_plan(
     pool: &SqlitePool,
     plan_id: i64,

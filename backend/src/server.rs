@@ -2581,27 +2581,72 @@ pub struct AcceptMetadataRequest {
     pub accepted_metadata_json: Option<serde_json::Value>,
 }
 
+#[derive(Serialize)]
+struct AcceptMetadataResponse {
+    plan: crate::planner::ItemPlanEnvelope,
+    saved_selection: Option<SelectedInternetMetadataResponse>,
+}
+
 pub async fn accept_metadata(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AcceptMetadataRequest>,
 ) -> impl axum::response::IntoResponse {
-    match crate::planner::accept_plan_for_item(
+    let accepted_plan = match crate::planner::accept_plan_for_item(
         &state.pool,
         &req.path,
-        req.accepted_metadata_json,
+        req.accepted_metadata_json.clone(),
         None,
         None,
         "metadata_only",
     )
     .await
     {
-        Ok(plan) => Json(plan).into_response(),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to accept metadata: {error}"),
-        )
-            .into_response(),
-    }
+        Ok(plan) => plan,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to accept metadata: {error}"),
+            )
+                .into_response()
+        }
+    };
+
+    let selected_from_request = req
+        .accepted_metadata_json
+        .and_then(|value| serde_json::from_value::<internet_metadata::InternetMetadataMatch>(value).ok());
+
+    let selected_from_plan = accepted_plan
+        .latest_revision
+        .as_ref()
+        .and_then(|revision| revision.metadata_resolution_json.as_ref())
+        .and_then(|json| {
+            serde_json::from_str::<crate::planner::PlannerMetadataResolution>(json)
+                .ok()
+                .and_then(|resolution| resolution.selected_candidate)
+        });
+
+    let selected = selected_from_request.or(selected_from_plan);
+
+    let saved_selection = if let Some(selected) = selected.as_ref() {
+        match save_selected_library_internet_metadata_for_path(&state, req.path.trim(), selected).await {
+            Ok(saved) => Some(saved),
+            Err(error) => {
+                return (
+                    error.status,
+                    format!("metadata accepted but save failed: {}", error.message),
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        None
+    };
+
+    Json(AcceptMetadataResponse {
+        plan: accepted_plan,
+        saved_selection,
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -2700,6 +2745,7 @@ pub struct PlanHistoryResponse {
     pub path: String,
     pub plan: crate::planner::ItemPlan,
     pub revisions: Vec<crate::planner::ItemPlanRevision>,
+    pub messages: Vec<crate::planner::ItemPlanMessage>,
 }
 
 pub async fn get_plan_history(
@@ -2718,16 +2764,28 @@ pub async fn get_plan_history(
         }
     };
 
-    match crate::planner::get_plan_history(&state.pool, plan.id).await {
-        Ok(revisions) => Json(PlanHistoryResponse {
+    let revisions = match crate::planner::get_plan_history(&state.pool, plan.id).await {
+        Ok(revisions) => revisions,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load plan history: {error}"),
+            )
+                .into_response()
+        }
+    };
+
+    match crate::planner::get_plan_messages(&state.pool, plan.id).await {
+        Ok(messages) => Json(PlanHistoryResponse {
             path: query.path,
             plan,
             revisions,
+            messages,
         })
         .into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to load plan history: {error}"),
+            format!("failed to load plan messages: {error}"),
         )
             .into_response(),
     }
