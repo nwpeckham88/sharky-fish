@@ -1,8 +1,11 @@
-use sqlx::{FromRow, SqlitePool};
+use crate::config::AppConfig;
 use crate::filesystem_audit::FileSystemFacts;
-use crate::internet_metadata::InternetMetadataMatch;
-use crate::messages::{MediaProbe};
+use crate::internet_metadata::{self, InternetMetadataMatch, InternetMetadataResponse};
+use crate::messages::MediaProbe;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sqlx::{FromRow, SqlitePool};
 
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct ItemPlan {
@@ -66,6 +69,12 @@ pub struct ItemAudioPreference {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ItemPlanEnvelope {
+    pub plan: ItemPlan,
+    pub latest_revision: Option<ItemPlanRevision>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ItemPlanStatus {
     Draft,
     PendingOperator,
@@ -120,43 +129,490 @@ pub struct PlannerLocalFacts {
     pub existing_job_id: Option<i64>,
 }
 
-use anyhow::Result;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannerAiIntake {
+    pub media_kind_guess: String,
+    pub title_guess: Option<String>,
+    pub year_guess: Option<u16>,
+    pub search_queries: Vec<String>,
+    pub confidence: f64,
+    pub ambiguities: Vec<String>,
+    pub operator_questions: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannerMetadataResolution {
+    pub query_attempted: String,
+    pub candidate_count: usize,
+    pub selected_candidate_index: Option<usize>,
+    pub selected_candidate: Option<InternetMetadataMatch>,
+    pub provider_used: Option<String>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannerProcessingProposal {
+    pub action: ProcessingAction,
+    pub ffmpeg_arguments: Vec<String>,
+    pub requires_two_pass: bool,
+    pub rationale: String,
+    pub risk_notes: Vec<String>,
+    pub better_source_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannerOrganizationProposal {
+    pub organize_needed: bool,
+    pub target_hint: Option<String>,
+    pub rationale: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlannerRecommendation {
+    pub category: String,
+    pub reason: String,
+    pub confidence: f64,
+}
+
+#[derive(Debug, Clone)]
+struct PlannerDerivedData {
+    ai_intake: PlannerAiIntake,
+    metadata_resolution: PlannerMetadataResolution,
+    organization: PlannerOrganizationProposal,
+    processing: PlannerProcessingProposal,
+    audio_strategy: PlannerAudioStrategy,
+    recommendation: PlannerRecommendation,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct LibraryIndexFactsRow {
+    file_path: String,
+    device_id: i64,
+    inode: i64,
+    link_count: i64,
+    size_bytes: i64,
+    modified_at: i64,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct ProbeRow {
+    probe_json: String,
+}
+
+#[derive(Debug, Clone, FromRow)]
+struct SelectedMetadataRow {
+    provider: String,
+    title: String,
+    year: Option<i64>,
+    media_kind: String,
+    imdb_id: Option<String>,
+    tvdb_id: Option<i64>,
+    overview: Option<String>,
+    rating: Option<f64>,
+    genres_json: String,
+    poster_url: Option<String>,
+    backdrop_url: Option<String>,
+    source_url: Option<String>,
+}
 
 pub async fn gather_local_facts(pool: &SqlitePool, relative_path: &str) -> Result<PlannerLocalFacts> {
-    // Stub implementation
-    anyhow::bail!("gather_local_facts not yet implemented")
+    let index_row = sqlx::query_as::<_, LibraryIndexFactsRow>(
+        "SELECT file_path, device_id, inode, link_count, size_bytes, modified_at
+         FROM library_index
+         WHERE relative_path = ?
+         LIMIT 1",
+    )
+    .bind(relative_path)
+    .fetch_optional(pool)
+    .await?;
+
+    let (absolute_path, fs_facts) = if let Some(row) = index_row {
+        let link_count = row.link_count.max(1) as u64;
+        (
+            row.file_path,
+            FileSystemFacts {
+                device_id: row.device_id.max(0) as u64,
+                inode: row.inode.max(0) as u64,
+                link_count,
+                size_bytes: row.size_bytes.max(0) as u64,
+                modified_at: row.modified_at.max(0) as u64,
+                is_hard_linked: link_count > 1,
+            },
+        )
+    } else {
+        (relative_path.to_string(), FileSystemFacts::default())
+    };
+
+    let probe = sqlx::query_as::<_, ProbeRow>(
+        "SELECT probe_json
+         FROM media_metadata
+         WHERE file_path = ?
+         LIMIT 1",
+    )
+    .bind(&absolute_path)
+    .fetch_optional(pool)
+    .await?
+    .and_then(|row| serde_json::from_str::<MediaProbe>(&row.probe_json).ok());
+
+    let selected_metadata = sqlx::query_as::<_, SelectedMetadataRow>(
+        "SELECT provider, title, year, media_kind, imdb_id, tvdb_id, overview,
+                rating, genres_json, poster_url, backdrop_url, source_url
+         FROM selected_internet_metadata
+         WHERE relative_path = ?
+         LIMIT 1",
+    )
+    .bind(relative_path)
+    .fetch_optional(pool)
+    .await?
+    .map(|row| {
+        let genres = serde_json::from_str::<Vec<String>>(&row.genres_json).unwrap_or_default();
+        InternetMetadataMatch {
+            provider: row.provider,
+            title: row.title,
+            year: row.year.and_then(|value| u16::try_from(value).ok()),
+            media_kind: row.media_kind,
+            imdb_id: row.imdb_id,
+            tvdb_id: row.tvdb_id.and_then(|value| u64::try_from(value).ok()),
+            overview: row.overview,
+            rating: row.rating,
+            genres,
+            poster_url: row.poster_url,
+            backdrop_url: row.backdrop_url,
+            source_url: row.source_url,
+        }
+    });
+
+    let existing_job_id = sqlx::query_scalar::<_, i64>(
+        "SELECT id FROM jobs WHERE file_path = ? ORDER BY id DESC LIMIT 1",
+    )
+    .bind(relative_path)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(PlannerLocalFacts {
+        relative_path: relative_path.to_string(),
+        absolute_path,
+        fs_facts,
+        probe,
+        selected_metadata,
+        existing_job_id,
+    })
 }
 
-pub async fn run_ai_intake() -> Result<()> {
-    // Stub implementation
-    anyhow::bail!("run_ai_intake not yet implemented")
+fn infer_media_kind_from_path(relative_path: &str) -> String {
+    let lowered = relative_path.to_ascii_lowercase();
+    if lowered.contains("s01")
+        || lowered.contains("e01")
+        || lowered.contains("season")
+        || lowered.contains("episodes")
+    {
+        "series".to_string()
+    } else {
+        "movie".to_string()
+    }
 }
 
-pub async fn resolve_metadata_candidates() -> Result<()> {
-    // Stub implementation
-    anyhow::bail!("resolve_metadata_candidates not yet implemented")
+fn stem_title_guess(relative_path: &str) -> String {
+    let stem = std::path::Path::new(relative_path)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or(relative_path);
+    stem
+        .replace('.', " ")
+        .replace('_', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-pub async fn rank_metadata_candidates() -> Result<()> {
-    // Stub implementation
-    anyhow::bail!("rank_metadata_candidates not yet implemented")
+fn year_guess_from_text(value: &str) -> Option<u16> {
+    for token in value.split(|ch: char| !ch.is_ascii_digit()) {
+        if token.len() == 4 {
+            if let Ok(year) = token.parse::<u16>() {
+                if (1900..=2100).contains(&year) {
+                    return Some(year);
+                }
+            }
+        }
+    }
+    None
 }
 
-pub async fn build_processing_proposal() -> Result<()> {
-    // Stub implementation
-    anyhow::bail!("build_processing_proposal not yet implemented")
+pub async fn run_ai_intake(relative_path: &str, followups: &[String]) -> Result<PlannerAiIntake> {
+    let media_kind_guess = infer_media_kind_from_path(relative_path);
+    let title_guess = Some(stem_title_guess(relative_path));
+    let year_guess = title_guess.as_deref().and_then(year_guess_from_text);
+    let mut search_queries = Vec::new();
+    if let Some(title) = title_guess.as_ref() {
+        search_queries.push(title.clone());
+        if let Some(year) = year_guess {
+            search_queries.push(format!("{title} {year}"));
+        }
+    }
+
+    let mut ambiguities = Vec::new();
+    if followups.is_empty() {
+        ambiguities.push("No operator guidance provided yet".to_string());
+    }
+
+    Ok(PlannerAiIntake {
+        media_kind_guess,
+        title_guess,
+        year_guess,
+        search_queries,
+        confidence: 0.55,
+        ambiguities,
+        operator_questions: vec![
+            "Confirm exact title/year if this is a remake or alternate cut.".to_string(),
+        ],
+    })
 }
 
-pub async fn apply_followup() -> Result<()> {
-    // Stub implementation
-    anyhow::bail!("apply_followup not yet implemented")
+fn score_candidate(candidate: &InternetMetadataMatch, ai: &PlannerAiIntake) -> i64 {
+    let mut score = 0_i64;
+    if candidate.media_kind.eq_ignore_ascii_case(&ai.media_kind_guess) {
+        score += 50;
+    }
+    if let (Some(title_guess), true) = (
+        ai.title_guess.as_ref(),
+        candidate
+            .title
+            .to_ascii_lowercase()
+            .contains(&ai.title_guess.as_deref().unwrap_or_default().to_ascii_lowercase()),
+    ) {
+        if !title_guess.is_empty() {
+            score += 40;
+        }
+    }
+    if let (Some(candidate_year), Some(guess_year)) = (candidate.year, ai.year_guess) {
+        let delta = (candidate_year as i32 - guess_year as i32).abs();
+        score += i64::from(20_i32.saturating_sub(delta));
+    }
+    score
 }
 
+pub async fn resolve_metadata_candidates(
+    config: &AppConfig,
+    relative_path: &str,
+    ai_intake: &PlannerAiIntake,
+) -> Result<PlannerMetadataResolution> {
+    let result: Result<InternetMetadataResponse> =
+        internet_metadata::lookup_for_library_path(config, relative_path).await;
 
+    let response = match result {
+        Ok(value) => value,
+        Err(error) => {
+            return Ok(PlannerMetadataResolution {
+                query_attempted: ai_intake
+                    .search_queries
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| relative_path.to_string()),
+                candidate_count: 0,
+                selected_candidate_index: None,
+                selected_candidate: None,
+                provider_used: None,
+                warnings: vec![format!("metadata lookup failed: {error}")],
+            })
+        }
+    };
 
-pub async fn get_plan_for_item(pool: &sqlx::SqlitePool, relative_path: &str) -> anyhow::Result<Option<ItemPlan>> {
+    let mut best_index: Option<usize> = None;
+    let mut best_score = i64::MIN;
+    for (idx, candidate) in response.matches.iter().enumerate() {
+        let score = score_candidate(candidate, ai_intake);
+        if score > best_score {
+            best_score = score;
+            best_index = Some(idx);
+        }
+    }
+
+    let selected_candidate = best_index.and_then(|idx| response.matches.get(idx).cloned());
+
+    Ok(PlannerMetadataResolution {
+        query_attempted: response.query,
+        candidate_count: response.matches.len(),
+        selected_candidate_index: best_index,
+        selected_candidate,
+        provider_used: response.provider_used,
+        warnings: response.warnings,
+    })
+}
+
+fn re_source_reason(probe: &MediaProbe) -> Option<String> {
+    let video = probe
+        .streams
+        .iter()
+        .find(|stream| stream.codec_type == "video")?;
+    let codec = video.codec_name.trim().to_ascii_lowercase();
+    let width = video.width.unwrap_or(0);
+    let height = video.height.unwrap_or(0);
+    let bitrate_mbps = video.bit_rate.map(|value| value as f64 / 1_000_000.0)?;
+
+    let is_uhd = width >= 3800 || height >= 2100;
+    let is_avc = matches!(codec.as_str(), "h264" | "avc" | "avc1");
+
+    if is_uhd && is_avc && bitrate_mbps <= 16.0 {
+        return Some(format!(
+            "This 4K AVC stream is about {:.1} Mbps, so re-source may be safer than another lossy transcode.",
+            bitrate_mbps
+        ));
+    }
+
+    None
+}
+
+pub async fn build_processing_proposal(
+    local_facts: &PlannerLocalFacts,
+    metadata_resolution: &PlannerMetadataResolution,
+) -> Result<(PlannerProcessingProposal, PlannerAudioStrategy)> {
+    let mut risk_notes = Vec::new();
+    if local_facts.fs_facts.is_hard_linked {
+        risk_notes.push(
+            "Processing will create a new file and break current hard-link sharing.".to_string(),
+        );
+    }
+
+    let better_source_reason = local_facts.probe.as_ref().and_then(re_source_reason);
+
+    let action = if better_source_reason.is_some() {
+        ProcessingAction::ReSource
+    } else if metadata_resolution.selected_candidate.is_none() {
+        ProcessingAction::NeedsOperatorInput
+    } else {
+        ProcessingAction::KeepAsIs
+    };
+
+    let rationale = match action {
+        ProcessingAction::ReSource => {
+            "Current source appears low quality for the content class; recommend re-source.".to_string()
+        }
+        ProcessingAction::NeedsOperatorInput => {
+            "Metadata match is ambiguous; hold processing until operator confirms identity.".to_string()
+        }
+        _ => "No immediate processing action required in this revision.".to_string(),
+    };
+
+    let processing = PlannerProcessingProposal {
+        action,
+        ffmpeg_arguments: Vec::new(),
+        requires_two_pass: false,
+        rationale,
+        risk_notes,
+        better_source_reason,
+    };
+
+    let audio_strategy = PlannerAudioStrategy {
+        mode: AudioNormalizationMode::Disabled,
+        night_listening_layout: Some(NightListeningLayout::Stereo),
+        default_track_policy: DefaultAudioTrackPolicy::PreserveOriginalDefault,
+        rationale: "Preserve original mix by default until title-specific guidance is provided."
+            .to_string(),
+    };
+
+    Ok((processing, audio_strategy))
+}
+
+fn build_organization_proposal(
+    relative_path: &str,
+    metadata_resolution: &PlannerMetadataResolution,
+) -> PlannerOrganizationProposal {
+    let Some(selected) = metadata_resolution.selected_candidate.as_ref() else {
+        return PlannerOrganizationProposal {
+            organize_needed: false,
+            target_hint: None,
+            rationale: "Metadata is unresolved, so no deterministic organize target is suggested yet."
+                .to_string(),
+        };
+    };
+
+    let normalized_path = relative_path.to_ascii_lowercase();
+    let normalized_title = selected.title.to_ascii_lowercase();
+    let in_place = normalized_path.contains(&normalized_title);
+
+    if in_place {
+        PlannerOrganizationProposal {
+            organize_needed: false,
+            target_hint: None,
+            rationale: "Path already appears aligned with selected metadata naming.".to_string(),
+        }
+    } else {
+        let year_suffix = selected
+            .year
+            .map(|year| format!(" ({year})"))
+            .unwrap_or_default();
+        PlannerOrganizationProposal {
+            organize_needed: true,
+            target_hint: Some(format!("{}/{}{}", selected.title, selected.title, year_suffix)),
+            rationale: "Selected metadata title does not appear in current path; organize is recommended."
+                .to_string(),
+        }
+    }
+}
+
+fn build_recommendation(
+    metadata_resolution: &PlannerMetadataResolution,
+    processing: &PlannerProcessingProposal,
+) -> PlannerRecommendation {
+    if matches!(processing.action, ProcessingAction::ReSource) {
+        return PlannerRecommendation {
+            category: "re_source".to_string(),
+            reason: processing
+                .better_source_reason
+                .clone()
+                .unwrap_or_else(|| "Planner recommends better source".to_string()),
+            confidence: 0.8,
+        };
+    }
+    if metadata_resolution.selected_candidate.is_none() {
+        return PlannerRecommendation {
+            category: "needs_operator_input".to_string(),
+            reason: "Metadata match is ambiguous.".to_string(),
+            confidence: 0.45,
+        };
+    }
+    PlannerRecommendation {
+        category: "keep".to_string(),
+        reason: "Metadata resolved and no mandatory processing flags were triggered.".to_string(),
+        confidence: 0.7,
+    }
+}
+
+async fn derive_plan_data(
+    config: &AppConfig,
+    relative_path: &str,
+    local_facts: &PlannerLocalFacts,
+    followups: &[String],
+) -> Result<PlannerDerivedData> {
+    let ai_intake = run_ai_intake(relative_path, followups).await?;
+    let metadata_resolution = resolve_metadata_candidates(config, relative_path, &ai_intake).await?;
+    let organization = build_organization_proposal(relative_path, &metadata_resolution);
+    let (processing, audio_strategy) =
+        build_processing_proposal(local_facts, &metadata_resolution).await?;
+    let recommendation = build_recommendation(&metadata_resolution, &processing);
+
+    let mut warnings = metadata_resolution.warnings.clone();
+    warnings.extend(processing.risk_notes.iter().cloned());
+
+    Ok(PlannerDerivedData {
+        ai_intake,
+        metadata_resolution,
+        organization,
+        processing,
+        audio_strategy,
+        recommendation,
+        warnings,
+    })
+}
+
+pub async fn get_plan_for_item(pool: &SqlitePool, relative_path: &str) -> Result<Option<ItemPlan>> {
     let plan = sqlx::query_as::<_, ItemPlan>(
-        "SELECT id, relative_path, status, current_revision_id, created_at, updated_at FROM item_plans WHERE relative_path = ?"
+        "SELECT id, relative_path, status, current_revision_id, created_at, updated_at
+         FROM item_plans
+         WHERE relative_path = ?
+         ORDER BY updated_at DESC, id DESC
+         LIMIT 1",
     )
     .bind(relative_path)
     .fetch_optional(pool)
@@ -164,12 +620,357 @@ pub async fn get_plan_for_item(pool: &sqlx::SqlitePool, relative_path: &str) -> 
     Ok(plan)
 }
 
-pub async fn get_plan_history(pool: &sqlx::SqlitePool, plan_id: i64) -> anyhow::Result<Vec<ItemPlanRevision>> {
+pub async fn get_plan_history(pool: &SqlitePool, plan_id: i64) -> Result<Vec<ItemPlanRevision>> {
     let revisions = sqlx::query_as::<_, ItemPlanRevision>(
-        "SELECT id, item_plan_id, revision_number, source, local_facts_json, ai_intake_json, metadata_resolution_json, organization_json, processing_json, audio_strategy_json, recommendation_json, followups_json, warnings_json, created_at FROM item_plan_revisions WHERE item_plan_id = ? ORDER BY revision_number DESC"
+        "SELECT id, item_plan_id, revision_number, source, local_facts_json,
+                ai_intake_json, metadata_resolution_json, organization_json,
+                processing_json, audio_strategy_json, recommendation_json,
+                followups_json, warnings_json, created_at
+         FROM item_plan_revisions
+         WHERE item_plan_id = ?
+         ORDER BY revision_number DESC",
     )
     .bind(plan_id)
     .fetch_all(pool)
     .await?;
     Ok(revisions)
+}
+
+pub async fn get_latest_revision_for_plan(
+    pool: &SqlitePool,
+    plan_id: i64,
+) -> Result<Option<ItemPlanRevision>> {
+    let revision = sqlx::query_as::<_, ItemPlanRevision>(
+        "SELECT id, item_plan_id, revision_number, source, local_facts_json,
+                ai_intake_json, metadata_resolution_json, organization_json,
+                processing_json, audio_strategy_json, recommendation_json,
+                followups_json, warnings_json, created_at
+         FROM item_plan_revisions
+         WHERE item_plan_id = ?
+         ORDER BY revision_number DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(plan_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(revision)
+}
+
+pub async fn get_plan_envelope_for_item(
+    pool: &SqlitePool,
+    relative_path: &str,
+) -> Result<Option<ItemPlanEnvelope>> {
+    let Some(plan) = get_plan_for_item(pool, relative_path).await? else {
+        return Ok(None);
+    };
+    let latest_revision = get_latest_revision_for_plan(pool, plan.id).await?;
+    Ok(Some(ItemPlanEnvelope {
+        plan,
+        latest_revision,
+    }))
+}
+
+pub async fn create_or_refresh_plan(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    relative_path: &str,
+    source: &str,
+) -> Result<ItemPlanEnvelope> {
+    let local_facts = gather_local_facts(pool, relative_path).await?;
+    let derived = derive_plan_data(config, relative_path, &local_facts, &[]).await?;
+
+    let local_facts_json = serde_json::to_string(&local_facts)?;
+    let ai_intake_json = serde_json::to_string(&derived.ai_intake)?;
+    let metadata_resolution_json = serde_json::to_string(&derived.metadata_resolution)?;
+    let organization_json = serde_json::to_string(&derived.organization)?;
+    let processing_json = serde_json::to_string(&derived.processing)?;
+    let audio_strategy_json = serde_json::to_string(&derived.audio_strategy)?;
+    let recommendation_json = serde_json::to_string(&derived.recommendation)?;
+    let empty_followups = serde_json::to_string(&Vec::<String>::new())?;
+    let warnings_json = serde_json::to_string(&derived.warnings)?;
+
+    let mut tx = pool.begin().await?;
+
+    let existing_plan = sqlx::query_as::<_, ItemPlan>(
+        "SELECT id, relative_path, status, current_revision_id, created_at, updated_at
+         FROM item_plans
+         WHERE relative_path = ?
+         ORDER BY updated_at DESC, id DESC
+         LIMIT 1",
+    )
+    .bind(relative_path)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let plan_id = if let Some(plan) = existing_plan {
+        plan.id
+    } else {
+        sqlx::query(
+            "INSERT INTO item_plans (relative_path, status, current_revision_id)
+             VALUES (?, 'Draft', NULL)",
+        )
+        .bind(relative_path)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query_scalar::<_, i64>("SELECT last_insert_rowid()")
+            .fetch_one(&mut *tx)
+            .await?
+    };
+
+    let next_revision_number = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(revision_number), 0) + 1
+         FROM item_plan_revisions
+         WHERE item_plan_id = ?",
+    )
+    .bind(plan_id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO item_plan_revisions (
+            item_plan_id,
+            revision_number,
+            source,
+            local_facts_json,
+            ai_intake_json,
+            metadata_resolution_json,
+                organization_json,
+            processing_json,
+            audio_strategy_json,
+            recommendation_json,
+            followups_json,
+            warnings_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(plan_id)
+    .bind(next_revision_number)
+    .bind(source)
+    .bind(local_facts_json)
+    .bind(ai_intake_json)
+    .bind(metadata_resolution_json)
+    .bind(organization_json)
+    .bind(processing_json)
+    .bind(audio_strategy_json)
+    .bind(recommendation_json)
+    .bind(empty_followups)
+    .bind(warnings_json)
+    .execute(&mut *tx)
+    .await?;
+
+    let revision_id = sqlx::query_scalar::<_, i64>("SELECT last_insert_rowid()")
+        .fetch_one(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "UPDATE item_plans
+         SET status = 'Draft',
+             current_revision_id = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?",
+    )
+    .bind(revision_id)
+    .bind(plan_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let envelope = get_plan_envelope_for_item(pool, relative_path).await?;
+    Ok(envelope.expect("plan exists after refresh"))
+}
+
+pub async fn apply_followup_for_item(
+    pool: &SqlitePool,
+    config: &AppConfig,
+    relative_path: &str,
+    message: &str,
+) -> Result<ItemPlanEnvelope> {
+    let envelope = if let Some(envelope) = get_plan_envelope_for_item(pool, relative_path).await? {
+        envelope
+    } else {
+        create_or_refresh_plan(pool, config, relative_path, "followup-bootstrap").await?
+    };
+
+    let base_followups: Vec<String> = envelope
+        .latest_revision
+        .as_ref()
+        .and_then(|revision| serde_json::from_str::<Vec<String>>(&revision.followups_json).ok())
+        .unwrap_or_default();
+
+    let mut followups = base_followups;
+    followups.push(message.to_string());
+
+    let local_facts = gather_local_facts(pool, relative_path).await?;
+    let derived = derive_plan_data(config, relative_path, &local_facts, &followups).await?;
+
+    let local_facts_json = serde_json::to_string(&local_facts)?;
+    let ai_intake_json = serde_json::to_string(&derived.ai_intake)?;
+    let metadata_resolution_json = serde_json::to_string(&derived.metadata_resolution)?;
+    let organization_json = serde_json::to_string(&derived.organization)?;
+    let processing_json = serde_json::to_string(&derived.processing)?;
+    let audio_strategy_json = serde_json::to_string(&derived.audio_strategy)?;
+    let followups_json = serde_json::to_string(&followups)?;
+    let recommendation_json = serde_json::to_string(&derived.recommendation)?;
+    let warnings_json = serde_json::to_string(&derived.warnings)?;
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(
+        "INSERT INTO item_plan_messages (item_plan_id, revision_id, role, message_text)
+         VALUES (?, ?, 'operator', ?)",
+    )
+    .bind(envelope.plan.id)
+    .bind(envelope.latest_revision.as_ref().map(|revision| revision.id))
+    .bind(message)
+    .execute(&mut *tx)
+    .await?;
+
+    let next_revision_number = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(MAX(revision_number), 0) + 1
+         FROM item_plan_revisions
+         WHERE item_plan_id = ?",
+    )
+    .bind(envelope.plan.id)
+    .fetch_one(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO item_plan_revisions (
+            item_plan_id,
+            revision_number,
+            source,
+            local_facts_json,
+            ai_intake_json,
+            metadata_resolution_json,
+                organization_json,
+            processing_json,
+            audio_strategy_json,
+            recommendation_json,
+            followups_json,
+            warnings_json
+            ) VALUES (?, ?, 'followup', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(envelope.plan.id)
+    .bind(next_revision_number)
+    .bind(local_facts_json)
+    .bind(ai_intake_json)
+    .bind(metadata_resolution_json)
+    .bind(organization_json)
+    .bind(processing_json)
+    .bind(audio_strategy_json)
+    .bind(recommendation_json)
+    .bind(followups_json)
+    .bind(warnings_json)
+    .execute(&mut *tx)
+    .await?;
+
+    let revision_id = sqlx::query_scalar::<_, i64>("SELECT last_insert_rowid()")
+        .fetch_one(&mut *tx)
+        .await?;
+
+    sqlx::query(
+        "UPDATE item_plans
+         SET current_revision_id = ?,
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?",
+    )
+    .bind(revision_id)
+    .bind(envelope.plan.id)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "INSERT INTO item_plan_messages (item_plan_id, revision_id, role, message_text)
+         VALUES (?, ?, 'planner', ?)",
+    )
+    .bind(envelope.plan.id)
+    .bind(revision_id)
+    .bind("Follow-up received; created a new planner revision.")
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let updated = get_plan_envelope_for_item(pool, relative_path).await?;
+    Ok(updated.expect("plan exists after followup"))
+}
+
+pub async fn accept_plan_for_item(
+    pool: &SqlitePool,
+    relative_path: &str,
+    accepted_metadata_json: Option<Value>,
+    accepted_processing_json: Option<Value>,
+    accepted_audio_strategy_json: Option<Value>,
+    execution_mode: &str,
+) -> Result<ItemPlanEnvelope> {
+    let Some(envelope) = get_plan_envelope_for_item(pool, relative_path).await? else {
+        anyhow::bail!("no plan exists for path: {relative_path}");
+    };
+    let Some(latest_revision) = envelope.latest_revision.as_ref() else {
+        anyhow::bail!("plan has no revision to accept");
+    };
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(
+        "INSERT INTO item_plan_acceptance (
+            item_plan_id,
+            accepted_revision_id,
+            accepted_metadata_json,
+            accepted_processing_json,
+            accepted_audio_strategy_json,
+            accepted_execution_mode
+         ) VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(envelope.plan.id)
+    .bind(latest_revision.id)
+    .bind(accepted_metadata_json.map(|value| value.to_string()))
+    .bind(accepted_processing_json.map(|value| value.to_string()))
+    .bind(accepted_audio_strategy_json.map(|value| value.to_string()))
+    .bind(execution_mode)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        "UPDATE item_plans
+         SET status = 'Approved',
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ?",
+    )
+    .bind(envelope.plan.id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    let updated = get_plan_envelope_for_item(pool, relative_path).await?;
+    Ok(updated.expect("plan exists after acceptance"))
+}
+
+pub async fn save_audio_preference(
+    pool: &SqlitePool,
+    scope_type: &str,
+    scope_key: &str,
+    default_audio_track_policy: &str,
+    normalization_mode: &str,
+    night_listening_layout: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO item_audio_preferences (
+            scope_type,
+            scope_key,
+            default_audio_track_policy,
+            normalization_mode,
+            night_listening_layout,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+    )
+    .bind(scope_type)
+    .bind(scope_key)
+    .bind(default_audio_track_policy)
+    .bind(normalization_mode)
+    .bind(night_listening_layout)
+    .execute(pool)
+    .await?;
+    Ok(())
 }

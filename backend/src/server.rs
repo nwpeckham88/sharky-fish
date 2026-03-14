@@ -115,7 +115,25 @@ pub fn build_router(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/api/backlog/summary", get(get_backlog_summary))
         .route("/api/backlog/items", get(list_backlog_items))
-        .route("/api/jobs", get(list_jobs)).route("/api/library/plan", axum::routing::post(create_or_refresh_plan).get(get_current_plan)).route("/api/library/plan/followup", axum::routing::post(send_followup)).route("/api/library/plan/accept-metadata", axum::routing::post(accept_metadata)).route("/api/library/plan/accept", axum::routing::post(accept_plan)).route("/api/library/plan/audio-preference", axum::routing::post(save_audio_preference)).route("/api/library/plan/history", get(get_plan_history))
+        .route("/api/jobs", get(list_jobs))
+        .route(
+            "/api/library/plan",
+            axum::routing::post(create_or_refresh_plan).get(get_current_plan),
+        )
+        .route(
+            "/api/library/plan/followup",
+            axum::routing::post(send_followup),
+        )
+        .route(
+            "/api/library/plan/accept-metadata",
+            axum::routing::post(accept_metadata),
+        )
+        .route("/api/library/plan/accept", axum::routing::post(accept_plan))
+        .route(
+            "/api/library/plan/audio-preference",
+            axum::routing::post(save_audio_preference),
+        )
+        .route("/api/library/plan/history", get(get_plan_history))
         .route("/api/jobs/{id}/approve", axum::routing::post(approve_job))
         .route(
             "/api/jobs/{id}/approve-mode",
@@ -2500,10 +2518,18 @@ pub struct CreatePlanRequest {
 }
 
 pub async fn create_or_refresh_plan(
-    State(_state): State<Arc<AppState>>,
-    Json(_req): Json<CreatePlanRequest>,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreatePlanRequest>,
 ) -> impl axum::response::IntoResponse {
-    axum::http::StatusCode::NOT_IMPLEMENTED
+    let config = state.config.read().await.clone();
+    match crate::planner::create_or_refresh_plan(&state.pool, &config, &req.path, &req.mode).await {
+        Ok(plan) => Json(plan).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to create or refresh plan: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
@@ -2515,10 +2541,14 @@ pub async fn get_current_plan(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PlanQuery>,
 ) -> impl axum::response::IntoResponse {
-    match crate::planner::get_plan_for_item(&state.pool, &query.path).await {
+    match crate::planner::get_plan_envelope_for_item(&state.pool, &query.path).await {
         Ok(Some(plan)) => Json(plan).into_response(),
-        Ok(None) => axum::http::StatusCode::NOT_FOUND.into_response(),
-        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to load plan: {error}"),
+        )
+            .into_response(),
     }
 }
 
@@ -2529,53 +2559,178 @@ pub struct FollowupRequest {
 }
 
 pub async fn send_followup(
-    State(_state): State<Arc<AppState>>,
-    Json(_req): Json<FollowupRequest>,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<FollowupRequest>,
 ) -> impl axum::response::IntoResponse {
-    axum::http::StatusCode::NOT_IMPLEMENTED
+    let config = state.config.read().await.clone();
+    match crate::planner::apply_followup_for_item(&state.pool, &config, &req.path, &req.message)
+        .await
+    {
+        Ok(plan) => Json(plan).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to apply follow-up: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
 pub struct AcceptMetadataRequest {
     pub path: String,
+    pub accepted_metadata_json: Option<serde_json::Value>,
 }
 
 pub async fn accept_metadata(
-    State(_state): State<Arc<AppState>>,
-    Json(_req): Json<AcceptMetadataRequest>,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AcceptMetadataRequest>,
 ) -> impl axum::response::IntoResponse {
-    axum::http::StatusCode::NOT_IMPLEMENTED
+    match crate::planner::accept_plan_for_item(
+        &state.pool,
+        &req.path,
+        req.accepted_metadata_json,
+        None,
+        None,
+        "metadata_only",
+    )
+    .await
+    {
+        Ok(plan) => Json(plan).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to accept metadata: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
 pub struct AcceptPlanRequest {
     pub path: String,
+    pub accepted_metadata_json: Option<serde_json::Value>,
+    pub accepted_processing_json: Option<serde_json::Value>,
+    pub accepted_audio_strategy_json: Option<serde_json::Value>,
+    pub execution_mode: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct AcceptPlanResponse {
+    pub plan: crate::planner::ItemPlanEnvelope,
+    pub review_job: Option<db::JobWithAnalysis>,
 }
 
 pub async fn accept_plan(
-    State(_state): State<Arc<AppState>>,
-    Json(_req): Json<AcceptPlanRequest>,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AcceptPlanRequest>,
 ) -> impl axum::response::IntoResponse {
-    axum::http::StatusCode::NOT_IMPLEMENTED
+    let execution_mode = req.execution_mode.as_deref().unwrap_or("full_plan");
+    let accepted_plan = match crate::planner::accept_plan_for_item(
+        &state.pool,
+        &req.path,
+        req.accepted_metadata_json,
+        req.accepted_processing_json,
+        req.accepted_audio_strategy_json,
+        execution_mode,
+    )
+    .await
+    {
+        Ok(plan) => plan,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to accept plan: {error}"),
+            )
+                .into_response()
+        }
+    };
+
+    match create_intake_review_job_for_path(&state, req.path.trim()).await {
+        Ok(job) => Json(AcceptPlanResponse {
+            plan: accepted_plan,
+            review_job: Some(job),
+        })
+        .into_response(),
+        Err(error) => (
+            error.status,
+            format!(
+                "plan accepted but review job creation failed: {}",
+                error.message
+            ),
+        )
+            .into_response(),
+    }
 }
 
 #[derive(Deserialize)]
 pub struct SaveAudioPrefRequest {
     pub path: String,
+    pub scope_type: String,
+    pub scope_key: Option<String>,
+    pub default_audio_track_policy: String,
+    pub normalization_mode: String,
+    pub night_listening_layout: String,
 }
 
 pub async fn save_audio_preference(
-    State(_state): State<Arc<AppState>>,
-    Json(_req): Json<SaveAudioPrefRequest>,
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SaveAudioPrefRequest>,
 ) -> impl axum::response::IntoResponse {
-    axum::http::StatusCode::NOT_IMPLEMENTED
+    let scope_key = req.scope_key.unwrap_or(req.path);
+    match crate::planner::save_audio_preference(
+        &state.pool,
+        &req.scope_type,
+        &scope_key,
+        &req.default_audio_track_policy,
+        &req.normalization_mode,
+        &req.night_listening_layout,
+    )
+    .await
+    {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to save audio preference: {error}"),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Serialize)]
+pub struct PlanHistoryResponse {
+    pub path: String,
+    pub plan: crate::planner::ItemPlan,
+    pub revisions: Vec<crate::planner::ItemPlanRevision>,
 }
 
 pub async fn get_plan_history(
-    State(_state): State<Arc<AppState>>,
-    Query(_query): Query<PlanQuery>,
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PlanQuery>,
 ) -> impl axum::response::IntoResponse {
-    axum::http::StatusCode::NOT_IMPLEMENTED
+    let plan = match crate::planner::get_plan_for_item(&state.pool, &query.path).await {
+        Ok(Some(plan)) => plan,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to load plan: {error}"),
+            )
+                .into_response()
+        }
+    };
+
+    match crate::planner::get_plan_history(&state.pool, plan.id).await {
+        Ok(revisions) => Json(PlanHistoryResponse {
+            path: query.path,
+            plan,
+            revisions,
+        })
+        .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to load plan history: {error}"),
+        )
+            .into_response(),
+    }
 }
 
 
