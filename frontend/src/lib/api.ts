@@ -562,6 +562,63 @@ export interface ImprovePromptResponse {
 	prompt: string;
 }
 
+export interface ItemPlan {
+	id: number;
+	relative_path: string;
+	status: string;
+	current_revision_id: number | null;
+	created_at: string;
+	updated_at: string;
+}
+
+export interface ItemPlanRevision {
+	id: number;
+	item_plan_id: number;
+	revision_number: number;
+	source: string;
+	local_facts_json: string;
+	ai_intake_json: string | null;
+	metadata_resolution_json: string | null;
+	organization_json: string | null;
+	processing_json: string | null;
+	audio_strategy_json: string | null;
+	recommendation_json: string;
+	followups_json: string;
+	warnings_json: string;
+	created_at: string;
+}
+
+export interface ItemPlanMessage {
+	id: number;
+	item_plan_id: number;
+	revision_id: number | null;
+	role: string;
+	message_text: string;
+	created_at: string;
+}
+
+export interface ItemPlanEnvelope {
+	plan: ItemPlan;
+	latest_revision: ItemPlanRevision | null;
+}
+
+export interface PlanHistoryResponse {
+	path: string;
+	plan: ItemPlan;
+	revisions: ItemPlanRevision[];
+	messages: ItemPlanMessage[];
+}
+
+export interface AcceptMetadataResponse {
+	plan: ItemPlanEnvelope;
+	saved_selection: SelectedInternetMetadataResponse | null;
+}
+
+export interface AcceptPlanResponse {
+	plan: ItemPlanEnvelope;
+	review_job: Job | null;
+}
+
 export interface LibraryFolder {
 	id: string;
 	name: string;
@@ -883,6 +940,107 @@ export async function fetchSelectedLibraryInternetMetadata(path: string): Promis
 	const res = await fetch(`${BASE}/library/internet/selected?${params.toString()}`);
 	if (res.status === 204) return null;
 	if (!res.ok) throw new Error(`Failed to fetch selected internet metadata for ${path}: ${res.status}`);
+	return res.json();
+}
+
+export async function createOrRefreshLibraryPlan(path: string, mode = 'create_or_refresh'): Promise<ItemPlanEnvelope> {
+	const res = await fetch(`${BASE}/library/plan`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ path, mode })
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to create/refresh plan for ${path}: ${res.status}`);
+	}
+	return res.json();
+}
+
+export async function fetchCurrentLibraryPlan(path: string): Promise<ItemPlanEnvelope | null> {
+	const params = new URLSearchParams({ path });
+	const res = await fetch(`${BASE}/library/plan?${params.toString()}`);
+	if (res.status === 404) return null;
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to fetch current plan for ${path}: ${res.status}`);
+	}
+	return res.json();
+}
+
+export async function sendLibraryPlanFollowup(path: string, message: string): Promise<ItemPlanEnvelope> {
+	const res = await fetch(`${BASE}/library/plan/followup`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ path, message })
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to send follow-up for ${path}: ${res.status}`);
+	}
+	return res.json();
+}
+
+export async function acceptLibraryPlanMetadata(
+	path: string,
+	acceptedMetadataJson?: unknown
+): Promise<AcceptMetadataResponse> {
+	const res = await fetch(`${BASE}/library/plan/accept-metadata`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ path, accepted_metadata_json: acceptedMetadataJson ?? null })
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to accept metadata for ${path}: ${res.status}`);
+	}
+	return res.json();
+}
+
+export async function acceptLibraryPlan(input: {
+	path: string;
+	accepted_metadata_json?: unknown;
+	accepted_processing_json?: unknown;
+	accepted_audio_strategy_json?: unknown;
+	execution_mode?: ReviewExecutionMode;
+}): Promise<AcceptPlanResponse> {
+	const res = await fetch(`${BASE}/library/plan/accept`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(input)
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to accept plan for ${input.path}: ${res.status}`);
+	}
+	return res.json();
+}
+
+export async function saveLibraryPlanAudioPreference(input: {
+	path: string;
+	scope_type: string;
+	scope_key?: string;
+	default_audio_track_policy: string;
+	normalization_mode: string;
+	night_listening_layout: string;
+}): Promise<void> {
+	const res = await fetch(`${BASE}/library/plan/audio-preference`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify(input)
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to save audio preference for ${input.path}: ${res.status}`);
+	}
+}
+
+export async function fetchLibraryPlanHistory(path: string): Promise<PlanHistoryResponse> {
+	const params = new URLSearchParams({ path });
+	const res = await fetch(`${BASE}/library/plan/history?${params.toString()}`);
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to fetch plan history for ${path}: ${res.status}`);
+	}
 	return res.json();
 }
 

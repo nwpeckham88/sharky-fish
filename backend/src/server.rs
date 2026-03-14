@@ -100,6 +100,13 @@ struct HandlerError {
     message: String,
 }
 
+#[derive(Debug, Clone)]
+struct PlannerJobOverride {
+    decision: crate::messages::ProcessingDecision,
+    proposal: crate::messages::ReviewProposal,
+    initial_status: &'static str,
+}
+
 /// Shared application state injected into handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -1151,7 +1158,7 @@ async fn create_intake_review_job(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateIntakeReviewRequest>,
 ) -> impl IntoResponse {
-    match create_intake_review_job_for_path(&state, request.path.trim()).await {
+    match create_intake_review_job_for_path(&state, request.path.trim(), None).await {
         Ok(job) => Json(job).into_response(),
         Err(error) => (error.status, error.message).into_response(),
     }
@@ -1173,7 +1180,7 @@ async fn create_bulk_intake_review_jobs(
 
     for path in request.paths {
         let trimmed = path.trim().to_string();
-        match create_intake_review_job_for_path(&state, &trimmed).await {
+        match create_intake_review_job_for_path(&state, &trimmed, None).await {
             Ok(job) => jobs.push(job),
             Err(error) => failures.push(BulkFailure {
                 path: trimmed,
@@ -1237,6 +1244,7 @@ async fn update_bulk_intake_managed_status(
 async fn create_intake_review_job_for_path(
     state: &Arc<AppState>,
     relative_path: &str,
+    planner_override: Option<PlannerJobOverride>,
 ) -> Result<db::JobWithAnalysis, HandlerError> {
     if relative_path.is_empty() {
         return Err(HandlerError {
@@ -1289,34 +1297,48 @@ async fn create_intake_review_job_for_path(
             message: error.to_string(),
         })?;
 
-    let mut decision = brain::create_processing_decision(
-        &config,
-        &IdentifiedMedia {
-            path: PathBuf::from(&metadata.file_path),
-            probe: metadata.probe.clone(),
-        },
-    )
-    .await
-    .map_err(|error| HandlerError {
-        status: StatusCode::BAD_GATEWAY,
-        message: error.to_string(),
-    })?;
+    let mut decision = if let Some(override_payload) = planner_override.as_ref() {
+        override_payload.decision.clone()
+    } else {
+        brain::create_processing_decision(
+            &config,
+            &IdentifiedMedia {
+                path: PathBuf::from(&metadata.file_path),
+                probe: metadata.probe.clone(),
+            },
+        )
+        .await
+        .map_err(|error| HandlerError {
+            status: StatusCode::BAD_GATEWAY,
+            message: error.to_string(),
+        })?
+    };
 
     let media = IdentifiedMedia {
         path: PathBuf::from(&metadata.file_path),
         probe: metadata.probe.clone(),
     };
-    let proposal = review::build_review_proposal(
-        &config,
-        relative_path,
-        managed_item
-            .as_ref()
-            .and_then(|item| item.library_id.as_deref()),
-        selected_metadata.as_ref(),
-        metadata.filesystem.clone(),
-        &metadata.probe,
-        &decision,
-    );
+    let proposal = if let Some(override_payload) = planner_override.as_ref() {
+        override_payload.proposal.clone()
+    } else {
+        review::build_review_proposal(
+            &config,
+            relative_path,
+            managed_item
+                .as_ref()
+                .and_then(|item| item.library_id.as_deref()),
+            selected_metadata.as_ref(),
+            metadata.filesystem.clone(),
+            &metadata.probe,
+            &decision,
+        )
+    };
+
+    let initial_status = planner_override
+        .as_ref()
+        .map(|value| value.initial_status)
+        .unwrap_or("AWAITING_APPROVAL");
+    let auto_approve = planner_override.is_none() && config.auto_approve_ai_jobs;
 
     let job_id = queue::enqueue_job(
         &state.pool,
@@ -1324,9 +1346,9 @@ async fn create_intake_review_job_for_path(
         &media,
         &mut decision,
         queue::EnqueueJobOptions {
-            auto_approve: config.auto_approve_ai_jobs,
+            auto_approve,
             proposal: Some(&proposal),
-            initial_status_override: Some("AWAITING_APPROVAL"),
+            initial_status_override: Some(initial_status),
             group_key: Some(group.key.as_str()),
             group_label: Some(group.label.as_str()),
             group_kind: group.kind.as_str(),
@@ -1342,7 +1364,7 @@ async fn create_intake_review_job_for_path(
         &state.pool,
         &state.library_path,
         relative_path,
-        "AWAITING_APPROVAL",
+        initial_status,
         &decision,
         None,
         None,
@@ -2669,6 +2691,16 @@ pub async fn accept_plan(
     Json(req): Json<AcceptPlanRequest>,
 ) -> impl axum::response::IntoResponse {
     let execution_mode = req.execution_mode.as_deref().unwrap_or("full_plan");
+    let Some(parsed_execution_mode) = parse_review_execution_mode(execution_mode) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid execution_mode `{execution_mode}`; expected full_plan, organize_only, or process_only"
+            ),
+        )
+            .into_response();
+    };
+    let accepted_processing_json = req.accepted_processing_json.clone();
     let accepted_plan = match crate::planner::accept_plan_for_item(
         &state.pool,
         &req.path,
@@ -2689,22 +2721,231 @@ pub async fn accept_plan(
         }
     };
 
-    match create_intake_review_job_for_path(&state, req.path.trim()).await {
-        Ok(job) => Json(AcceptPlanResponse {
-            plan: accepted_plan,
-            review_job: Some(job),
-        })
-        .into_response(),
-        Err(error) => (
-            error.status,
-            format!(
-                "plan accepted but review job creation failed: {}",
-                error.message
-            ),
+        let planner_override = match build_planner_job_override(
+            req.path.trim(),
+            &accepted_plan,
+            accepted_processing_json,
+        ) {
+            Ok(override_payload) => override_payload,
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("plan accepted but planner payload was invalid: {error}"),
+                )
+                    .into_response();
+            }
+        };
+
+        let mut review_job = match create_intake_review_job_for_path(
+            &state,
+            req.path.trim(),
+            Some(planner_override),
         )
-            .into_response(),
+        .await
+        {
+            Ok(job) => job,
+            Err(error) => {
+                return (
+                    error.status,
+                    format!(
+                        "plan accepted but review job creation failed: {}",
+                        error.message
+                    ),
+                )
+                    .into_response();
+            }
+        };
+
+        let next_status = if parsed_execution_mode == ReviewExecutionMode::OrganizeOnly {
+            "COMPLETED"
+        } else {
+            "APPROVED"
+        };
+
+        let Some(db_job) = (match db::fetch_job(&state.pool, review_job.id).await {
+            Ok(job) => job,
+            Err(error) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("plan accepted but review transition lookup failed: {error}"),
+                )
+                    .into_response();
+            }
+        }) else {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "plan accepted but created job could not be reloaded".to_string(),
+            )
+                .into_response();
+        };
+
+        if let Err((status, message)) = transition_jobs(
+            &state,
+            vec![db_job],
+            Some(parsed_execution_mode),
+            next_status,
+        )
+        .await
+        {
+            return (
+                status,
+                format!("plan accepted and job created, but execution transition failed: {message}"),
+            )
+                .into_response();
+        }
+
+        if let Ok(Some(updated)) = db::fetch_job_with_analysis(&state.pool, review_job.id).await {
+            let mut enriched = enrich_jobs_with_filesystem(vec![updated]).await;
+            if let Some(item) = enriched.pop() {
+                review_job = item;
+            }
     }
+
+        Json(AcceptPlanResponse {
+            plan: accepted_plan,
+            review_job: Some(review_job),
+        })
+        .into_response()
 }
+
+    fn parse_review_execution_mode(value: &str) -> Option<ReviewExecutionMode> {
+        match value {
+            "full_plan" => Some(ReviewExecutionMode::FullPlan),
+            "organize_only" => Some(ReviewExecutionMode::OrganizeOnly),
+            "process_only" => Some(ReviewExecutionMode::ProcessOnly),
+            _ => None,
+        }
+    }
+
+    fn planner_allowed_modes(
+        organize_needed: bool,
+        has_processing: bool,
+    ) -> Vec<ReviewExecutionMode> {
+        let mut allowed_modes = Vec::new();
+        if organize_needed && has_processing {
+            allowed_modes.push(ReviewExecutionMode::FullPlan);
+        }
+        if organize_needed {
+            allowed_modes.push(ReviewExecutionMode::OrganizeOnly);
+        }
+        if has_processing {
+            allowed_modes.push(ReviewExecutionMode::ProcessOnly);
+        }
+        if allowed_modes.is_empty() {
+            allowed_modes.push(ReviewExecutionMode::FullPlan);
+        }
+        allowed_modes
+    }
+
+    fn build_planner_job_override(
+        relative_path: &str,
+        plan: &crate::planner::ItemPlanEnvelope,
+        accepted_processing_json: Option<serde_json::Value>,
+    ) -> Result<PlannerJobOverride, String> {
+        let Some(revision) = plan.latest_revision.as_ref() else {
+            return Err("accepted plan has no revision".to_string());
+        };
+
+        let local_facts: crate::planner::PlannerLocalFacts = serde_json::from_str(&revision.local_facts_json)
+            .map_err(|error| format!("local facts JSON parse failed: {error}"))?;
+        let recommendation: crate::planner::PlannerRecommendation = serde_json::from_str(&revision.recommendation_json)
+            .map_err(|error| format!("recommendation JSON parse failed: {error}"))?;
+        let warnings: Vec<String> = serde_json::from_str(&revision.warnings_json)
+            .unwrap_or_default();
+
+        let organization = revision
+            .organization_json
+            .as_deref()
+            .map(|json| serde_json::from_str::<crate::planner::PlannerOrganizationProposal>(json))
+            .transpose()
+            .map_err(|error| format!("organization JSON parse failed: {error}"))?
+            .unwrap_or(crate::planner::PlannerOrganizationProposal {
+                organize_needed: false,
+                target_hint: None,
+                rationale: "No organization proposal was provided by the planner revision.".to_string(),
+            });
+
+        let metadata_resolution = revision
+            .metadata_resolution_json
+            .as_deref()
+            .map(|json| serde_json::from_str::<crate::planner::PlannerMetadataResolution>(json))
+            .transpose()
+            .map_err(|error| format!("metadata resolution JSON parse failed: {error}"))?;
+
+        let processing = if let Some(value) = accepted_processing_json {
+            serde_json::from_value::<crate::planner::PlannerProcessingProposal>(value)
+                .map_err(|error| format!("accepted processing JSON parse failed: {error}"))?
+        } else {
+            revision
+                .processing_json
+                .as_deref()
+                .map(|json| serde_json::from_str::<crate::planner::PlannerProcessingProposal>(json))
+                .transpose()
+                .map_err(|error| format!("processing JSON parse failed: {error}"))?
+                .unwrap_or(crate::planner::PlannerProcessingProposal {
+                    action: crate::planner::ProcessingAction::KeepAsIs,
+                    ffmpeg_arguments: Vec::new(),
+                    requires_two_pass: false,
+                    rationale: "Planner revision did not include an explicit processing proposal."
+                        .to_string(),
+                    risk_notes: Vec::new(),
+                    better_source_reason: None,
+                })
+        };
+
+        let has_processing = !processing.ffmpeg_arguments.is_empty();
+        let decision = crate::messages::ProcessingDecision {
+            job_id: 0,
+            arguments: processing.ffmpeg_arguments.clone(),
+            requires_two_pass: processing.requires_two_pass,
+            rationale: processing.rationale.clone(),
+        };
+
+        let recommendation_reason = processing
+            .better_source_reason
+            .clone()
+            .or_else(|| Some(recommendation.reason.clone()));
+
+        let proposal = crate::messages::ReviewProposal {
+            relative_path: relative_path.to_string(),
+            filesystem: local_facts.fs_facts,
+            organization: crate::messages::ReviewOrganizationProposal {
+                current_relative_path: relative_path.to_string(),
+                target_relative_path: organization.target_hint,
+                organize_needed: organization.organize_needed,
+                scope: metadata_resolution
+                    .as_ref()
+                    .and_then(|value| value.selected_candidate.as_ref())
+                    .map(|candidate| {
+                        if candidate.media_kind.eq_ignore_ascii_case("movie") {
+                            "movie_folder".to_string()
+                        } else {
+                            "file".to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "file".to_string()),
+            },
+            processing: if has_processing {
+                Some(crate::messages::ReviewProcessingProposal {
+                    arguments: processing.ffmpeg_arguments,
+                    requires_two_pass: processing.requires_two_pass,
+                    rationale: processing.rationale,
+                })
+            } else {
+                None
+            },
+            recommendation: recommendation.category,
+            recommendation_reason,
+            warnings,
+            allowed_modes: planner_allowed_modes(organization.organize_needed, has_processing),
+        };
+
+        Ok(PlannerJobOverride {
+            decision,
+            proposal,
+            initial_status: "AWAITING_APPROVAL",
+        })
+    }
 
 #[derive(Deserialize)]
 pub struct SaveAudioPrefRequest {

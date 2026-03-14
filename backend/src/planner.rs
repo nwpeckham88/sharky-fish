@@ -2,7 +2,7 @@ use crate::config::AppConfig;
 use crate::filesystem_audit::FileSystemFacts;
 use crate::internet_metadata::{self, InternetMetadataMatch, InternetMetadataResponse};
 use crate::messages::MediaProbe;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::{FromRow, SqlitePool};
@@ -339,7 +339,31 @@ fn year_guess_from_text(value: &str) -> Option<u16> {
     None
 }
 
-pub async fn run_ai_intake(relative_path: &str, followups: &[String]) -> Result<PlannerAiIntake> {
+#[derive(Debug, Deserialize)]
+struct LlmPlannerIntakeOutput {
+    media_kind_guess: Option<String>,
+    title_guess: Option<String>,
+    year_guess: Option<u16>,
+    search_queries: Option<Vec<String>>,
+    confidence: Option<f64>,
+    ambiguities: Option<Vec<String>>,
+    operator_questions: Option<Vec<String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct LlmPlannerProcessingOutput {
+    action: Option<String>,
+    rationale: Option<String>,
+    risk_notes: Option<Vec<String>>,
+    better_source_recommended: Option<bool>,
+    better_source_reason: Option<String>,
+    audio_mode: Option<String>,
+    night_listening_layout: Option<String>,
+    default_track_policy: Option<String>,
+    audio_rationale: Option<String>,
+}
+
+fn fallback_ai_intake(relative_path: &str, followups: &[String]) -> PlannerAiIntake {
     let media_kind_guess = infer_media_kind_from_path(relative_path);
     let title_guess = Some(stem_title_guess(relative_path));
     let year_guess = title_guess.as_deref().and_then(year_guess_from_text);
@@ -356,7 +380,7 @@ pub async fn run_ai_intake(relative_path: &str, followups: &[String]) -> Result<
         ambiguities.push("No operator guidance provided yet".to_string());
     }
 
-    Ok(PlannerAiIntake {
+    PlannerAiIntake {
         media_kind_guess,
         title_guess,
         year_guess,
@@ -366,7 +390,212 @@ pub async fn run_ai_intake(relative_path: &str, followups: &[String]) -> Result<
         operator_questions: vec![
             "Confirm exact title/year if this is a remake or alternate cut.".to_string(),
         ],
-    })
+    }
+}
+
+fn planner_system_prompt() -> &'static str {
+    "You are the Sharky Fish planner assistant. Return strict JSON only and never include markdown fences or explanatory prose. Do not invent provider results as facts."
+}
+
+fn build_openai_request(
+    llm_config: &crate::config::LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+) -> (String, serde_json::Value) {
+    let url = format!("{}/chat/completions", llm_config.base_url);
+    let body = serde_json::json!({
+        "model": llm_config.model,
+        "temperature": temperature,
+        "response_format": { "type": "json_object" },
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_prompt }
+        ]
+    });
+    (url, body)
+}
+
+fn build_google_request(
+    llm_config: &crate::config::LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+) -> (String, serde_json::Value) {
+    let url = format!(
+        "{}/models/{}:generateContent",
+        llm_config.base_url.trim_end_matches('/'),
+        llm_config.model
+    );
+    let body = serde_json::json!({
+        "systemInstruction": {
+            "parts": [
+                { "text": system_prompt }
+            ]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    { "text": user_prompt }
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": temperature,
+            "responseMimeType": "application/json"
+        }
+    });
+    (url, body)
+}
+
+fn build_ollama_request(
+    llm_config: &crate::config::LlmConfig,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+) -> (String, serde_json::Value) {
+    let url = format!("{}/api/chat", llm_config.base_url);
+    let body = serde_json::json!({
+        "model": llm_config.model,
+        "stream": false,
+        "format": "json",
+        "options": { "temperature": temperature },
+        "messages": [
+            { "role": "system", "content": system_prompt },
+            { "role": "user", "content": user_prompt }
+        ]
+    });
+    (url, body)
+}
+
+fn extract_llm_content(json: &serde_json::Value) -> Result<&str> {
+    json.pointer("/candidates/0/content/parts/0/text")
+        .or_else(|| json.pointer("/choices/0/message/content"))
+        .or_else(|| json.pointer("/message/content"))
+        .and_then(|value| value.as_str())
+        .context("missing content in LLM response")
+}
+
+async fn call_llm_json<T: for<'de> Deserialize<'de>>(
+    config: &AppConfig,
+    user_prompt: &str,
+    temperature: f64,
+) -> Result<T> {
+    let client = reqwest::Client::new();
+    let llm_config = &config.llm;
+
+    let (url, body) = match llm_config.provider.as_str() {
+        "google" => build_google_request(llm_config, planner_system_prompt(), user_prompt, temperature),
+        "openai" => build_openai_request(llm_config, planner_system_prompt(), user_prompt, temperature),
+        "ollama" => build_ollama_request(llm_config, planner_system_prompt(), user_prompt, temperature),
+        other => anyhow::bail!("unsupported LLM provider: {other}"),
+    };
+
+    let mut req = client.post(&url).json(&body);
+    if llm_config.provider == "google" {
+        if let Some(key) = &llm_config.api_key {
+            req = req.header("x-goog-api-key", key);
+        }
+    } else if let Some(key) = &llm_config.api_key {
+        req = req.bearer_auth(key);
+    }
+
+    let resp = req.send().await.context("LLM HTTP request failed")?;
+    let status = resp.status();
+    if !status.is_success() {
+        let text = resp.text().await.unwrap_or_default();
+        anyhow::bail!("LLM API returned {status}: {text}");
+    }
+
+    let json: serde_json::Value = resp.json().await?;
+    let content = extract_llm_content(&json)?;
+    let parsed = serde_json::from_str::<T>(content)
+        .context("failed to parse planner LLM JSON output")?;
+    Ok(parsed)
+}
+
+fn normalize_media_kind(value: Option<String>, fallback: &str) -> String {
+    match value
+        .unwrap_or_else(|| fallback.to_string())
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "tv" | "show" | "series" | "episode" => "series".to_string(),
+        "movie" | "film" => "movie".to_string(),
+        _ => fallback.to_string(),
+    }
+}
+
+pub async fn run_ai_intake(
+    config: &AppConfig,
+    local_facts: &PlannerLocalFacts,
+    followups: &[String],
+) -> Result<PlannerAiIntake> {
+    let fallback = fallback_ai_intake(&local_facts.relative_path, followups);
+    let probe = local_facts
+        .probe
+        .as_ref()
+        .map(|value| serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_else(|| "null".to_string());
+
+    let followup_block = if followups.is_empty() {
+        "None".to_string()
+    } else {
+        followups.join("\n- ")
+    };
+
+    let prompt = format!(
+        "Create an intake interpretation for one library item.\n\
+         Return strict JSON with fields: media_kind_guess, title_guess, year_guess, search_queries, confidence, ambiguities, operator_questions.\n\
+         Rules:\n\
+         - media_kind_guess must be movie or series.\n\
+         - confidence must be 0.0 to 1.0.\n\
+         - search_queries must prioritize realistic metadata lookup terms.\n\
+         - Do not invent external IDs.\n\n\
+         Relative path: {}\n\
+         Existing selected metadata title: {}\n\
+         Operator followups:\n- {}\n\
+         Probe JSON:\n{}",
+        local_facts.relative_path,
+        local_facts
+            .selected_metadata
+            .as_ref()
+            .map(|value| value.title.as_str())
+            .unwrap_or("none"),
+        followup_block,
+        probe,
+    );
+
+    match call_llm_json::<LlmPlannerIntakeOutput>(config, &prompt, 0.2).await {
+        Ok(parsed) => {
+            let mut search_queries = parsed.search_queries.unwrap_or_default();
+            search_queries.retain(|value| !value.trim().is_empty());
+            if search_queries.is_empty() {
+                search_queries = fallback.search_queries.clone();
+            }
+
+            Ok(PlannerAiIntake {
+                media_kind_guess: normalize_media_kind(parsed.media_kind_guess, &fallback.media_kind_guess),
+                title_guess: parsed.title_guess.or(fallback.title_guess),
+                year_guess: parsed.year_guess.or(fallback.year_guess),
+                search_queries,
+                confidence: parsed.confidence.unwrap_or(fallback.confidence).clamp(0.0, 1.0),
+                ambiguities: parsed.ambiguities.unwrap_or(fallback.ambiguities),
+                operator_questions: parsed
+                    .operator_questions
+                    .unwrap_or(fallback.operator_questions),
+            })
+        }
+        Err(error) => {
+            let mut degraded = fallback;
+            degraded
+                .ambiguities
+                .push(format!("LLM intake unavailable; fallback used: {error}"));
+            Ok(degraded)
+        }
+    }
 }
 
 fn score_candidate(candidate: &InternetMetadataMatch, ai: &PlannerAiIntake) -> i64 {
@@ -392,35 +621,95 @@ fn score_candidate(candidate: &InternetMetadataMatch, ai: &PlannerAiIntake) -> i
     score
 }
 
+fn metadata_match_dedupe_key(candidate: &InternetMetadataMatch) -> String {
+    format!(
+        "{}|{}|{}|{}|{}",
+        candidate.provider,
+        candidate.imdb_id.clone().unwrap_or_default(),
+        candidate
+            .tvdb_id
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+        candidate.title.to_ascii_lowercase(),
+        candidate
+            .year
+            .map(|value| value.to_string())
+            .unwrap_or_default(),
+    )
+}
+
+fn normalize_planner_query(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 pub async fn resolve_metadata_candidates(
     config: &AppConfig,
     relative_path: &str,
     ai_intake: &PlannerAiIntake,
 ) -> Result<PlannerMetadataResolution> {
-    let result: Result<InternetMetadataResponse> =
-        internet_metadata::lookup_for_library_path(config, relative_path).await;
-
-    let response = match result {
-        Ok(value) => value,
-        Err(error) => {
-            return Ok(PlannerMetadataResolution {
-                query_attempted: ai_intake
-                    .search_queries
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| relative_path.to_string()),
-                candidate_count: 0,
-                selected_candidate_index: None,
-                selected_candidate: None,
-                provider_used: None,
-                warnings: vec![format!("metadata lookup failed: {error}")],
-            })
+    let mut queries = Vec::<String>::new();
+    for query in ai_intake.search_queries.iter().take(4) {
+        if let Some(normalized) = normalize_planner_query(query) {
+            queries.push(normalized);
         }
-    };
+    }
+
+    // Preserve path-derived candidates even when AI suggestions are present.
+    let path_fallback_query = relative_path.to_string();
+    if queries.is_empty() {
+        queries.push(path_fallback_query.clone());
+    } else {
+        queries.push(path_fallback_query.clone());
+    }
+
+    let mut seen_queries = std::collections::HashSet::<String>::new();
+    queries.retain(|query| seen_queries.insert(query.to_ascii_lowercase()));
+
+    let mut aggregate_matches: Vec<InternetMetadataMatch> = Vec::new();
+    let mut provider_used: Option<String> = None;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut attempted_queries: Vec<String> = Vec::new();
+
+    for query in &queries {
+        attempted_queries.push(query.clone());
+
+        let result: Result<InternetMetadataResponse> = if query == &path_fallback_query {
+            internet_metadata::lookup_for_library_path(config, relative_path).await
+        } else {
+            internet_metadata::lookup_for_library_path_with_query(config, relative_path, Some(query))
+                .await
+        };
+
+        match result {
+            Ok(response) => {
+                if provider_used.is_none() {
+                    provider_used = response.provider_used.clone();
+                }
+                warnings.extend(
+                    response
+                        .warnings
+                        .into_iter()
+                        .map(|warning| format!("[{query}] {warning}")),
+                );
+                aggregate_matches.extend(response.matches);
+            }
+            Err(error) => {
+                warnings.push(format!("[{query}] metadata lookup failed: {error}"));
+            }
+        }
+    }
+
+    let mut seen_matches = std::collections::HashSet::<String>::new();
+    aggregate_matches.retain(|candidate| seen_matches.insert(metadata_match_dedupe_key(candidate)));
 
     let mut best_index: Option<usize> = None;
     let mut best_score = i64::MIN;
-    for (idx, candidate) in response.matches.iter().enumerate() {
+    for (idx, candidate) in aggregate_matches.iter().enumerate() {
         let score = score_candidate(candidate, ai_intake);
         if score > best_score {
             best_score = score;
@@ -428,16 +717,55 @@ pub async fn resolve_metadata_candidates(
         }
     }
 
-    let selected_candidate = best_index.and_then(|idx| response.matches.get(idx).cloned());
+    let selected_candidate = best_index.and_then(|idx| aggregate_matches.get(idx).cloned());
 
     Ok(PlannerMetadataResolution {
-        query_attempted: response.query,
-        candidate_count: response.matches.len(),
+        query_attempted: attempted_queries.join(" | "),
+        candidate_count: aggregate_matches.len(),
         selected_candidate_index: best_index,
         selected_candidate,
-        provider_used: response.provider_used,
-        warnings: response.warnings,
+        provider_used,
+        warnings,
     })
+}
+
+fn validate_ffmpeg_arguments(arguments: &[String]) -> Result<()> {
+    if arguments.is_empty() {
+        anyhow::bail!("FFmpeg argument list is empty")
+    }
+
+    let mut has_input_placeholder = false;
+    let mut has_output_placeholder = false;
+    let blocked_flags = ["-f", "-progress", "-report", "-y", "-n"];
+
+    for (index, argument) in arguments.iter().enumerate() {
+        if argument == "input.mkv" {
+            has_input_placeholder = true;
+        }
+        if argument == "output.mp4" || argument == "output.m4a" {
+            has_output_placeholder = true;
+        }
+
+        if blocked_flags.contains(&argument.as_str()) {
+            anyhow::bail!("argument `{}` is managed by the backend and not allowed", argument)
+        }
+
+        // Prevent accidental absolute outputs or shell injection style payloads.
+        if index == arguments.len() - 1
+            && (argument.starts_with('/') || argument.contains(';') || argument.contains('|'))
+        {
+            anyhow::bail!("output argument must be an output placeholder")
+        }
+    }
+
+    if !has_input_placeholder {
+        anyhow::bail!("missing required input placeholder `input.mkv`")
+    }
+    if !has_output_placeholder {
+        anyhow::bail!("missing required output placeholder (`output.mp4` or `output.m4a`)")
+    }
+
+    Ok(())
 }
 
 fn re_source_reason(probe: &MediaProbe) -> Option<String> {
@@ -464,8 +792,11 @@ fn re_source_reason(probe: &MediaProbe) -> Option<String> {
 }
 
 pub async fn build_processing_proposal(
+    config: &AppConfig,
+    relative_path: &str,
     local_facts: &PlannerLocalFacts,
     metadata_resolution: &PlannerMetadataResolution,
+    followups: &[String],
 ) -> Result<(PlannerProcessingProposal, PlannerAudioStrategy)> {
     let mut risk_notes = Vec::new();
     if local_facts.fs_facts.is_hard_linked {
@@ -474,9 +805,9 @@ pub async fn build_processing_proposal(
         );
     }
 
-    let better_source_reason = local_facts.probe.as_ref().and_then(re_source_reason);
+    let mut better_source_reason = local_facts.probe.as_ref().and_then(re_source_reason);
 
-    let action = if better_source_reason.is_some() {
+    let fallback_action = if better_source_reason.is_some() {
         ProcessingAction::ReSource
     } else if metadata_resolution.selected_candidate.is_none() {
         ProcessingAction::NeedsOperatorInput
@@ -484,7 +815,7 @@ pub async fn build_processing_proposal(
         ProcessingAction::KeepAsIs
     };
 
-    let rationale = match action {
+    let fallback_rationale = match fallback_action {
         ProcessingAction::ReSource => {
             "Current source appears low quality for the content class; recommend re-source.".to_string()
         }
@@ -494,21 +825,188 @@ pub async fn build_processing_proposal(
         _ => "No immediate processing action required in this revision.".to_string(),
     };
 
-    let processing = PlannerProcessingProposal {
-        action,
-        ffmpeg_arguments: Vec::new(),
-        requires_two_pass: false,
-        rationale,
-        risk_notes,
-        better_source_reason,
+    let probe = local_facts
+        .probe
+        .as_ref()
+        .map(|value| serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string()))
+        .unwrap_or_else(|| "null".to_string());
+    let followup_block = if followups.is_empty() {
+        "None".to_string()
+    } else {
+        followups.join("\n- ")
     };
+    let selected_title = metadata_resolution
+        .selected_candidate
+        .as_ref()
+        .map(|value| value.title.clone())
+        .unwrap_or_else(|| "unresolved".to_string());
 
-    let audio_strategy = PlannerAudioStrategy {
+    let processing_prompt = format!(
+        "Plan processing intent for a library item and return strict JSON with fields:\n\
+         action, rationale, risk_notes, better_source_recommended, better_source_reason, audio_mode, night_listening_layout, default_track_policy, audio_rationale.\n\
+         Allowed action values: keep_as_is, organize_only, process, organize_and_process, re_source, needs_operator_input.\n\
+         Allowed audio_mode values: disabled, normalize_all, normalize_primary_and_alternate.\n\
+         Allowed night_listening_layout values: stereo, two_point_one, null.\n\
+         Allowed default_track_policy values: preserve_original_default, prefer_night_listening_default.\n\n\
+         Relative path: {}\n\
+         Selected metadata title: {}\n\
+         Hard linked: {}\n\
+         Operator followups:\n- {}\n\
+         Probe JSON:\n{}",
+        relative_path,
+        selected_title,
+        local_facts.fs_facts.is_hard_linked,
+        followup_block,
+        probe,
+    );
+
+    let mut action = fallback_action;
+    let mut rationale = fallback_rationale;
+    let mut llm_risk_notes = Vec::<String>::new();
+    let mut audio_strategy = PlannerAudioStrategy {
         mode: AudioNormalizationMode::Disabled,
         night_listening_layout: Some(NightListeningLayout::Stereo),
         default_track_policy: DefaultAudioTrackPolicy::PreserveOriginalDefault,
         rationale: "Preserve original mix by default until title-specific guidance is provided."
             .to_string(),
+    };
+
+    match call_llm_json::<LlmPlannerProcessingOutput>(config, &processing_prompt, 0.2).await {
+        Ok(parsed) => {
+            action = match parsed
+                .action
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "keep_as_is" | "keep" => ProcessingAction::KeepAsIs,
+                "organize_only" | "organize" => ProcessingAction::Organize,
+                "process" => ProcessingAction::Process,
+                "organize_and_process" | "full_plan" => ProcessingAction::OrganizeAndProcess,
+                "re_source" | "resource" => ProcessingAction::ReSource,
+                "needs_operator_input" => ProcessingAction::NeedsOperatorInput,
+                _ => action,
+            };
+            if let Some(value) = parsed.rationale.filter(|value| !value.trim().is_empty()) {
+                rationale = value;
+            }
+            llm_risk_notes = parsed.risk_notes.unwrap_or_default();
+            let mode = match parsed
+                .audio_mode
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "normalize_all" => AudioNormalizationMode::NormalizeAll,
+                "normalize_primary_and_alternate" => AudioNormalizationMode::NormalizePrimaryAndAlternate,
+                _ => AudioNormalizationMode::Disabled,
+            };
+            let layout = match parsed
+                .night_listening_layout
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "two_point_one" | "2.1" => Some(NightListeningLayout::TwoPointOne),
+                "stereo" => Some(NightListeningLayout::Stereo),
+                _ => None,
+            };
+            let policy = match parsed
+                .default_track_policy
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "prefer_night_listening_default" => {
+                    DefaultAudioTrackPolicy::PreferNightListeningDefault
+                }
+                _ => DefaultAudioTrackPolicy::PreserveOriginalDefault,
+            };
+            audio_strategy = PlannerAudioStrategy {
+                mode,
+                night_listening_layout: layout,
+                default_track_policy: policy,
+                rationale: parsed
+                    .audio_rationale
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or_else(|| {
+                        "Preserve original mix by default until title-specific guidance is provided."
+                            .to_string()
+                    }),
+            };
+
+            if parsed.better_source_recommended.unwrap_or(false)
+                && better_source_reason.is_none()
+            {
+                better_source_reason = parsed.better_source_reason;
+            }
+        }
+        Err(error) => {
+            risk_notes.push(format!(
+                "Processing-stage LLM unavailable; fallback recommendation used: {error}"
+            ));
+        }
+    }
+
+    let mut ffmpeg_arguments = Vec::new();
+    let mut requires_two_pass = false;
+    if matches!(action, ProcessingAction::Process | ProcessingAction::OrganizeAndProcess)
+        && local_facts.probe.is_some()
+    {
+        if let Some(probe) = local_facts.probe.clone() {
+            let identified = crate::messages::IdentifiedMedia {
+                path: std::path::PathBuf::from(&local_facts.absolute_path),
+                probe,
+            };
+            match crate::actors::brain::create_processing_decision(config, &identified).await {
+                Ok(decision) => {
+                    match validate_ffmpeg_arguments(&decision.arguments) {
+                        Ok(()) => {
+                            ffmpeg_arguments = decision.arguments;
+                            requires_two_pass = decision.requires_two_pass;
+                            if !decision.rationale.trim().is_empty() {
+                                rationale = format!("{} | {}", rationale, decision.rationale);
+                            }
+                        }
+                        Err(error) => {
+                            risk_notes.push(format!(
+                                "FFmpeg planning returned invalid arguments; downgraded to non-processing recommendation: {error}"
+                            ));
+                            action = if metadata_resolution.selected_candidate.is_none() {
+                                ProcessingAction::NeedsOperatorInput
+                            } else {
+                                ProcessingAction::KeepAsIs
+                            };
+                        }
+                    }
+                }
+                Err(error) => {
+                    risk_notes.push(format!(
+                        "FFmpeg planning call failed; kept non-processing plan: {error}"
+                    ));
+                    action = if metadata_resolution.selected_candidate.is_none() {
+                        ProcessingAction::NeedsOperatorInput
+                    } else {
+                        ProcessingAction::KeepAsIs
+                    };
+                }
+            }
+        }
+    }
+
+    risk_notes.extend(llm_risk_notes);
+
+    let processing = PlannerProcessingProposal {
+        action,
+        ffmpeg_arguments,
+        requires_two_pass,
+        rationale,
+        risk_notes,
+        better_source_reason,
     };
 
     Ok((processing, audio_strategy))
@@ -585,11 +1083,12 @@ async fn derive_plan_data(
     local_facts: &PlannerLocalFacts,
     followups: &[String],
 ) -> Result<PlannerDerivedData> {
-    let ai_intake = run_ai_intake(relative_path, followups).await?;
+    let ai_intake = run_ai_intake(config, local_facts, followups).await?;
     let metadata_resolution = resolve_metadata_candidates(config, relative_path, &ai_intake).await?;
     let organization = build_organization_proposal(relative_path, &metadata_resolution);
     let (processing, audio_strategy) =
-        build_processing_proposal(local_facts, &metadata_resolution).await?;
+        build_processing_proposal(config, relative_path, local_facts, &metadata_resolution, followups)
+            .await?;
     let recommendation = build_recommendation(&metadata_resolution, &processing);
 
     let mut warnings = metadata_resolution.warnings.clone();

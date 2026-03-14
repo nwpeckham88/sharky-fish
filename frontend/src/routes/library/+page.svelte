@@ -3,13 +3,19 @@
 	import { onDestroy, onMount } from 'svelte';
 	import { page } from '$app/state';
 	import {
+		acceptLibraryPlan,
+		acceptLibraryPlanMetadata,
 		autoSelectLibraryInternetMetadataBulk,
+		createOrRefreshLibraryPlan,
 		createBulkIntakeReviews,
 		createIntakeReview,
 		fetchConfig,
+		fetchCurrentLibraryPlan,
 		fetchLibrary,
 		fetchLibraryArtwork,
+		fetchLibraryPlanHistory,
 		saveConfig,
+		sendLibraryPlanFollowup,
 		triggerLibraryRescan,
 		fetchLibraryMetadata,
 		fetchLibraryInternetMetadata,
@@ -33,6 +39,8 @@
 		type LibraryMetadata,
 		type InternetMetadataMatch,
 		type InternetMetadataResponse,
+		type ItemPlanEnvelope,
+		type PlanHistoryResponse,
 		type LibraryResponse,
 		type LibraryRoots,
 		type LibrarySummary,
@@ -40,6 +48,7 @@
 		type LibraryChangeEvent,
 		type LibraryMediaFilter,
 		type LibraryManagedStatusFilter,
+		type ReviewExecutionMode,
 		type LibraryViewMode
 	} from '$lib/api';
 	import { jobStore, libraryState, managedItemStore, refreshManagedItemStore } from '$lib/stores.svelte';
@@ -215,6 +224,14 @@
 	let bulkInternetStatus = $state('');
 	let bulkActionLoading = $state(false);
 	let bulkActionStatus = $state('');
+	let plannerEnvelope = $state<ItemPlanEnvelope | null>(null);
+	let plannerHistory = $state<PlanHistoryResponse | null>(null);
+	let plannerLoading = $state(false);
+	let plannerActionLoading = $state(false);
+	let plannerError = $state('');
+	let plannerStatus = $state('');
+	let plannerFollowup = $state('');
+	let plannerExecutionMode = $state<ReviewExecutionMode>('full_plan');
 	let bulkActionFailedPaths = $state<string[]>([]);
 	let bulkInternetFailedPaths = $state<string[]>([]);
 	let libraryLoading = $state(true);
@@ -488,6 +505,12 @@
 		organizePreview = null;
 		organizeError = '';
 		organizeStatus = '';
+		plannerEnvelope = null;
+		plannerHistory = null;
+		plannerError = '';
+		plannerStatus = '';
+		plannerFollowup = '';
+		plannerExecutionMode = 'full_plan';
 		bulkActionFailedPaths = [];
 		bulkInternetFailedPaths = [];
 		metadataLoading = true;
@@ -506,6 +529,174 @@
 			metadataError = error instanceof Error ? error.message : 'Metadata fetch failed';
 		} finally {
 			metadataLoading = false;
+		}
+		void loadPlanner(item.relative_path);
+	}
+
+	function parsePlannerJson<T>(json: string | null | undefined): T | null {
+		if (!json) return null;
+		try {
+			return JSON.parse(json) as T;
+		} catch {
+			return null;
+		}
+	}
+
+	function plannerRevision() {
+		return plannerEnvelope?.latest_revision ?? null;
+	}
+
+	function plannerMetadataResolution() {
+		return parsePlannerJson<{
+			selected_candidate?: InternetMetadataMatch | null;
+			candidate_count?: number;
+			query_attempted?: string;
+		}>(plannerRevision()?.metadata_resolution_json ?? null);
+	}
+
+	function plannerRecommendation() {
+		return parsePlannerJson<{ category?: string; reason?: string; confidence?: number }>(
+			plannerRevision()?.recommendation_json ?? null
+		);
+	}
+
+	function plannerProcessing() {
+		return parsePlannerJson<{
+			action?: string;
+			ffmpeg_arguments?: string[];
+			requires_two_pass?: boolean;
+			rationale?: string;
+			risk_notes?: string[];
+			better_source_reason?: string | null;
+		}>(plannerRevision()?.processing_json ?? null);
+	}
+
+	function plannerAudioStrategy() {
+		return parsePlannerJson<{
+			mode?: string;
+			night_listening_layout?: string | null;
+			default_track_policy?: string;
+			rationale?: string;
+		}>(plannerRevision()?.audio_strategy_json ?? null);
+	}
+
+	function plannerWarnings(): string[] {
+		return parsePlannerJson<string[]>(plannerRevision()?.warnings_json ?? null) ?? [];
+	}
+
+	function plannerFollowups(): string[] {
+		return parsePlannerJson<string[]>(plannerRevision()?.followups_json ?? null) ?? [];
+	}
+
+	async function loadPlanner(path: string) {
+		plannerLoading = true;
+		plannerError = '';
+		try {
+			plannerEnvelope = await fetchCurrentLibraryPlan(path);
+		} catch (error) {
+			plannerError = error instanceof Error ? error.message : 'Failed to load planner state';
+		} finally {
+			plannerLoading = false;
+		}
+	}
+
+	async function createOrRefreshPlannerForSelected() {
+		if (!selectedItem) return;
+		plannerActionLoading = true;
+		plannerError = '';
+		plannerStatus = '';
+		try {
+			plannerEnvelope = await createOrRefreshLibraryPlan(selectedItem.relative_path, 'create_or_refresh');
+			plannerStatus = 'Planner revision refreshed for this item.';
+		} catch (error) {
+			plannerError = error instanceof Error ? error.message : 'Failed to refresh planner';
+		} finally {
+			plannerActionLoading = false;
+		}
+	}
+
+	async function sendPlannerFollowupForSelected() {
+		if (!selectedItem || !plannerFollowup.trim()) return;
+		plannerActionLoading = true;
+		plannerError = '';
+		plannerStatus = '';
+		try {
+			plannerEnvelope = await sendLibraryPlanFollowup(selectedItem.relative_path, plannerFollowup.trim());
+			plannerFollowup = '';
+			plannerStatus = 'Follow-up accepted and a new planner revision was created.';
+		} catch (error) {
+			plannerError = error instanceof Error ? error.message : 'Failed to send follow-up';
+		} finally {
+			plannerActionLoading = false;
+		}
+	}
+
+	async function loadPlannerHistoryForSelected() {
+		if (!selectedItem) return;
+		plannerActionLoading = true;
+		plannerError = '';
+		try {
+			plannerHistory = await fetchLibraryPlanHistory(selectedItem.relative_path);
+			plannerStatus = `Loaded ${plannerHistory.revisions.length} planner revision(s).`;
+		} catch (error) {
+			plannerError = error instanceof Error ? error.message : 'Failed to load planner history';
+		} finally {
+			plannerActionLoading = false;
+		}
+	}
+
+	async function acceptPlannerMetadataForSelected() {
+		if (!selectedItem || !plannerEnvelope) return;
+		const selectedFromPlan = plannerMetadataResolution()?.selected_candidate ?? null;
+		plannerActionLoading = true;
+		plannerError = '';
+		plannerStatus = '';
+		try {
+			const response = await acceptLibraryPlanMetadata(
+				selectedItem.relative_path,
+				selectedFromPlan ?? undefined
+			);
+			plannerEnvelope = response.plan;
+			if (response.saved_selection?.selected) {
+				selectedInternetMatch = response.saved_selection.selected;
+				const related = await fetchRelatedLibraryInternetMetadataPaths(selectedItem.relative_path).catch(() => ({ paths: [] }));
+				relatedPaths = related.paths;
+			}
+			plannerStatus = 'Planner metadata acceptance saved.';
+			await Promise.all([loadLibrary(), refreshManagedItemStore()]);
+		} catch (error) {
+			plannerError = error instanceof Error ? error.message : 'Failed to accept planner metadata';
+		} finally {
+			plannerActionLoading = false;
+		}
+	}
+
+	async function acceptPlannerExecutionForSelected() {
+		if (!selectedItem || !plannerEnvelope) return;
+		const revision = plannerRevision();
+		plannerActionLoading = true;
+		plannerError = '';
+		plannerStatus = '';
+		try {
+			const response = await acceptLibraryPlan({
+				path: selectedItem.relative_path,
+				accepted_metadata_json: plannerMetadataResolution()?.selected_candidate ?? undefined,
+				accepted_processing_json: parsePlannerJson<Record<string, unknown>>(revision?.processing_json ?? null) ?? undefined,
+				accepted_audio_strategy_json: parsePlannerJson<Record<string, unknown>>(revision?.audio_strategy_json ?? null) ?? undefined,
+				execution_mode: plannerExecutionMode
+			});
+			plannerEnvelope = response.plan;
+			if (response.review_job) {
+				jobStore.jobs = [response.review_job, ...jobStore.jobs.filter((job) => job.id !== response.review_job?.id)];
+			}
+			plannerStatus = response.review_job
+				? `Planner accepted and review job #${response.review_job.id} created.`
+				: 'Planner accepted.';
+			await Promise.all([loadLibrary(), refreshManagedItemStore()]);
+		} catch (error) {
+			plannerError = error instanceof Error ? error.message : 'Failed to accept planner execution';
+		} finally {
+			plannerActionLoading = false;
 		}
 	}
 
@@ -1776,6 +1967,135 @@
 							<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-xs font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={runManualInternetLookup} disabled={internetMetadataLoading || !manualMetadataQuery.trim()}>
 								Search Override
 							</button>
+						</div>
+
+						<div class="mt-3 rounded-lg border border-[color:var(--line)] px-3 py-3">
+							<div class="mb-2 flex flex-wrap items-center justify-between gap-2">
+								<div class="section-label">AI Planner</div>
+								<div class="flex flex-wrap gap-2">
+									<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-[11px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={createOrRefreshPlannerForSelected} disabled={plannerActionLoading || plannerLoading}>
+										{plannerActionLoading ? 'Working…' : plannerEnvelope ? 'Refresh Planner' : 'Create Planner'}
+									</button>
+									<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-1.5 text-[11px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={loadPlannerHistoryForSelected} disabled={plannerActionLoading || plannerLoading || !plannerEnvelope}>
+										Load History
+									</button>
+								</div>
+							</div>
+
+							{#if plannerLoading}
+								<div class="text-xs text-[color:var(--ink-muted)]">Loading planner state…</div>
+							{:else if plannerError}
+								<div class="rounded-lg border border-[color:rgba(138,75,67,0.22)] bg-[color:rgba(138,75,67,0.08)] px-3 py-2 text-xs text-[color:var(--danger)]">{plannerError}</div>
+							{:else if plannerEnvelope?.latest_revision}
+								{@const revision = plannerRevision()}
+								{@const recommendation = plannerRecommendation()}
+								{@const processing = plannerProcessing()}
+								{@const metadataResolution = plannerMetadataResolution()}
+								{@const audioStrategy = plannerAudioStrategy()}
+								{@const warnings = plannerWarnings()}
+								{@const followups = plannerFollowups()}
+								<div class="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+									<div class="rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.45)] px-3 py-2">
+										<div class="section-label">Plan Status</div>
+										<div class="mt-1 text-sm font-semibold text-[color:var(--ink-strong)]">{plannerEnvelope.plan.status}</div>
+										<div class="mt-1 text-[11px] text-[color:var(--ink-muted)]">Revision #{revision?.revision_number} · {revision?.source}</div>
+									</div>
+									<div class="rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.45)] px-3 py-2">
+										<div class="section-label">Recommendation</div>
+										<div class="mt-1 text-sm font-semibold text-[color:var(--ink-strong)]">{recommendation?.category ?? 'unknown'}</div>
+										{#if recommendation?.reason}
+											<div class="mt-1 text-[11px] text-[color:var(--ink-muted)]">{recommendation.reason}</div>
+										{/if}
+									</div>
+									<div class="rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.45)] px-3 py-2">
+										<div class="section-label">Metadata Resolution</div>
+										<div class="mt-1 text-sm font-semibold text-[color:var(--ink-strong)]">{metadataResolution?.candidate_count ?? 0} candidate(s)</div>
+										{#if metadataResolution?.selected_candidate}
+											<div class="mt-1 text-[11px] text-[color:var(--ink-muted)]">Suggested: {metadataResolution.selected_candidate.title}{metadataResolution.selected_candidate.year ? ` (${metadataResolution.selected_candidate.year})` : ''}</div>
+										{/if}
+									</div>
+								</div>
+
+								<div class="mt-2 rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.45)] px-3 py-2">
+									<div class="section-label">Processing Proposal</div>
+									<div class="mt-1 text-sm font-semibold text-[color:var(--ink-strong)]">{processing?.action ?? 'unknown'}</div>
+									{#if processing?.rationale}
+										<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{processing.rationale}</div>
+									{/if}
+									{#if (processing?.ffmpeg_arguments?.length ?? 0) > 0}
+										<details class="mt-2">
+											<summary class="cursor-pointer text-[11px] font-semibold uppercase tracking-[0.1em] text-[color:var(--ink-muted)]">FFmpeg Arguments</summary>
+											<div class="mt-2 break-all rounded-lg bg-[color:rgba(244,236,223,0.7)] px-2 py-2 font-mono text-[11px] text-[color:var(--ink-strong)]">
+												{processing?.ffmpeg_arguments?.join(' ')}
+											</div>
+										</details>
+									{/if}
+								</div>
+
+								{#if audioStrategy}
+									<div class="mt-2 rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.45)] px-3 py-2">
+										<div class="section-label">Audio Strategy</div>
+										<div class="mt-1 text-xs text-[color:var(--ink-muted)]">
+											Mode: <span class="font-semibold text-[color:var(--ink-strong)]">{audioStrategy.mode ?? 'unknown'}</span>
+											{#if audioStrategy.night_listening_layout}
+												 · Night layout: <span class="font-semibold text-[color:var(--ink-strong)]">{audioStrategy.night_listening_layout}</span>
+											{/if}
+										</div>
+										{#if audioStrategy.rationale}
+											<div class="mt-1 text-xs text-[color:var(--ink-muted)]">{audioStrategy.rationale}</div>
+										{/if}
+									</div>
+								{/if}
+
+								{#if warnings.length > 0}
+									<div class="mt-2 rounded-lg border border-[color:rgba(164,79,45,0.22)] bg-[color:rgba(164,79,45,0.08)] px-3 py-2 text-xs text-[color:var(--accent-deep)]">
+										{warnings.join(' • ')}
+									</div>
+								{/if}
+
+								{#if followups.length > 0}
+									<div class="mt-2 rounded-lg border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.45)] px-3 py-2 text-xs text-[color:var(--ink-muted)]">
+										<div class="mb-1 section-label">Follow-up Context</div>
+										{followups.join(' • ')}
+									</div>
+								{/if}
+
+								<div class="mt-2 grid gap-2 sm:grid-cols-[minmax(0,1fr)_auto]">
+									<input
+										class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-xs text-[color:var(--ink-strong)]"
+										type="text"
+										placeholder="Planner follow-up: e.g. keep commentary, avoid video transcode"
+										bind:value={plannerFollowup}
+										onkeydown={(event) => { if (event.key === 'Enter') { event.preventDefault(); void sendPlannerFollowupForSelected(); } }}
+									/>
+									<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-[11px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={sendPlannerFollowupForSelected} disabled={plannerActionLoading || !plannerFollowup.trim()}>
+										Send Follow-up
+									</button>
+								</div>
+
+								<div class="mt-2 grid gap-2 sm:grid-cols-[auto_auto_auto_minmax(0,1fr)] sm:items-center">
+									<button class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-[11px] font-semibold text-[color:var(--ink-strong)] disabled:opacity-50" onclick={acceptPlannerMetadataForSelected} disabled={plannerActionLoading || !metadataResolution?.selected_candidate}>
+										Accept Metadata
+									</button>
+									<select class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-[11px] text-[color:var(--ink-strong)]" bind:value={plannerExecutionMode}>
+										<option value="full_plan">full_plan</option>
+										<option value="organize_only">organize_only</option>
+										<option value="process_only">process_only</option>
+									</select>
+									<button class="rounded-lg bg-[color:var(--accent)] px-3 py-2 text-[11px] font-semibold text-white disabled:opacity-50" onclick={acceptPlannerExecutionForSelected} disabled={plannerActionLoading}>
+										Accept Plan
+									</button>
+									{#if plannerHistory}
+										<div class="text-[11px] text-[color:var(--ink-muted)]">History: {plannerHistory.revisions.length} revisions, {plannerHistory.messages.length} messages</div>
+									{/if}
+								</div>
+
+								{#if plannerStatus}
+									<div class="mt-2 rounded-lg border border-[color:rgba(106,142,72,0.25)] bg-[color:rgba(106,142,72,0.1)] px-3 py-2 text-xs text-[color:var(--olive)]">{plannerStatus}</div>
+								{/if}
+							{:else}
+								<div class="text-xs text-[color:var(--ink-muted)]">No planner revision exists yet for this item. Use Create Planner to generate one.</div>
+							{/if}
 						</div>
 					</div>
 					<div class="grid gap-2 sm:grid-cols-2">
