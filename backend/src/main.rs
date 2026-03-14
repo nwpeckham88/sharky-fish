@@ -14,6 +14,8 @@ mod qbittorrent;
 mod review;
 mod server;
 mod sidecar;
+mod planner;
+
 
 use crate::actors::{
     brain::BrainActor, forge::ForgeActor, identifier::IdentifierActor, queue::QueueActor,

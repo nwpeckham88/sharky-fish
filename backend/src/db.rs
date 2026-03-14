@@ -308,6 +308,82 @@ async fn run_migrations(pool: &SqlitePool) -> Result<()> {
     .await?;
 
     sqlx::query(
+        "CREATE TABLE IF NOT EXISTS item_plans (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            relative_path       TEXT NOT NULL,
+            status              TEXT NOT NULL,
+            current_revision_id INTEGER,
+            created_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS item_plan_revisions (
+            id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_plan_id                INTEGER NOT NULL REFERENCES item_plans(id) ON DELETE CASCADE,
+            revision_number             INTEGER NOT NULL,
+            source                      TEXT NOT NULL,
+            local_facts_json            TEXT NOT NULL,
+            ai_intake_json              TEXT,
+            metadata_resolution_json    TEXT,
+            organization_json           TEXT,
+            processing_json             TEXT,
+            audio_strategy_json         TEXT,
+            recommendation_json         TEXT NOT NULL,
+            followups_json              TEXT NOT NULL,
+            warnings_json               TEXT NOT NULL,
+            created_at                  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS item_plan_messages (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_plan_id    INTEGER NOT NULL REFERENCES item_plans(id) ON DELETE CASCADE,
+            revision_id     INTEGER REFERENCES item_plan_revisions(id) ON DELETE CASCADE,
+            role            TEXT NOT NULL,
+            message_text    TEXT NOT NULL,
+            created_at      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS item_plan_acceptance (
+            id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_plan_id                    INTEGER NOT NULL REFERENCES item_plans(id) ON DELETE CASCADE,
+            accepted_revision_id            INTEGER NOT NULL REFERENCES item_plan_revisions(id) ON DELETE CASCADE,
+            accepted_metadata_json          TEXT,
+            accepted_processing_json        TEXT,
+            accepted_audio_strategy_json    TEXT,
+            accepted_execution_mode         TEXT NOT NULL,
+            created_at                      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS item_audio_preferences (
+            id                              INTEGER PRIMARY KEY AUTOINCREMENT,
+            scope_type                      TEXT NOT NULL,
+            scope_key                       TEXT NOT NULL,
+            default_audio_track_policy      TEXT NOT NULL,
+            normalization_mode              TEXT NOT NULL,
+            night_listening_layout          TEXT NOT NULL,
+            updated_at                      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
         "INSERT INTO library_scan_state (id, status, scanned_items, total_items)
          VALUES (1, 'idle', 0, 0)
          ON CONFLICT(id) DO NOTHING",

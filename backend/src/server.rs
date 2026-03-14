@@ -115,7 +115,7 @@ pub fn build_router(state: AppState) -> Router {
     let mut app = Router::new()
         .route("/api/backlog/summary", get(get_backlog_summary))
         .route("/api/backlog/items", get(list_backlog_items))
-        .route("/api/jobs", get(list_jobs))
+        .route("/api/jobs", get(list_jobs)).route("/api/library/plan", axum::routing::post(create_or_refresh_plan).get(get_current_plan)).route("/api/library/plan/followup", axum::routing::post(send_followup)).route("/api/library/plan/accept-metadata", axum::routing::post(accept_metadata)).route("/api/library/plan/accept", axum::routing::post(accept_plan)).route("/api/library/plan/audio-preference", axum::routing::post(save_audio_preference)).route("/api/library/plan/history", get(get_plan_history))
         .route("/api/jobs/{id}/approve", axum::routing::post(approve_job))
         .route(
             "/api/jobs/{id}/approve-mode",
@@ -2491,3 +2491,91 @@ async fn update_library(
 
     Json(folder).into_response()
 }
+
+// Planner endpoints
+#[derive(Deserialize)]
+pub struct CreatePlanRequest {
+    pub path: String,
+    pub mode: String,
+}
+
+pub async fn create_or_refresh_plan(
+    State(_state): State<Arc<AppState>>,
+    Json(_req): Json<CreatePlanRequest>,
+) -> impl axum::response::IntoResponse {
+    axum::http::StatusCode::NOT_IMPLEMENTED
+}
+
+#[derive(Deserialize)]
+pub struct PlanQuery {
+    pub path: String,
+}
+
+pub async fn get_current_plan(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<PlanQuery>,
+) -> impl axum::response::IntoResponse {
+    match crate::planner::get_plan_for_item(&state.pool, &query.path).await {
+        Ok(Some(plan)) => Json(plan).into_response(),
+        Ok(None) => axum::http::StatusCode::NOT_FOUND.into_response(),
+        Err(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct FollowupRequest {
+    pub path: String,
+    pub message: String,
+}
+
+pub async fn send_followup(
+    State(_state): State<Arc<AppState>>,
+    Json(_req): Json<FollowupRequest>,
+) -> impl axum::response::IntoResponse {
+    axum::http::StatusCode::NOT_IMPLEMENTED
+}
+
+#[derive(Deserialize)]
+pub struct AcceptMetadataRequest {
+    pub path: String,
+}
+
+pub async fn accept_metadata(
+    State(_state): State<Arc<AppState>>,
+    Json(_req): Json<AcceptMetadataRequest>,
+) -> impl axum::response::IntoResponse {
+    axum::http::StatusCode::NOT_IMPLEMENTED
+}
+
+#[derive(Deserialize)]
+pub struct AcceptPlanRequest {
+    pub path: String,
+}
+
+pub async fn accept_plan(
+    State(_state): State<Arc<AppState>>,
+    Json(_req): Json<AcceptPlanRequest>,
+) -> impl axum::response::IntoResponse {
+    axum::http::StatusCode::NOT_IMPLEMENTED
+}
+
+#[derive(Deserialize)]
+pub struct SaveAudioPrefRequest {
+    pub path: String,
+}
+
+pub async fn save_audio_preference(
+    State(_state): State<Arc<AppState>>,
+    Json(_req): Json<SaveAudioPrefRequest>,
+) -> impl axum::response::IntoResponse {
+    axum::http::StatusCode::NOT_IMPLEMENTED
+}
+
+pub async fn get_plan_history(
+    State(_state): State<Arc<AppState>>,
+    Query(_query): Query<PlanQuery>,
+) -> impl axum::response::IntoResponse {
+    axum::http::StatusCode::NOT_IMPLEMENTED
+}
+
+
