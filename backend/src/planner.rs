@@ -45,41 +45,10 @@ pub struct ItemPlanMessage {
     pub created_at: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
-pub struct ItemPlanAcceptance {
-    pub id: i64,
-    pub item_plan_id: i64,
-    pub accepted_revision_id: i64,
-    pub accepted_metadata_json: Option<String>,
-    pub accepted_processing_json: Option<String>,
-    pub accepted_audio_strategy_json: Option<String>,
-    pub accepted_execution_mode: String,
-    pub created_at: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ItemAudioPreference {
-    pub id: i64,
-    pub scope_type: String,
-    pub scope_key: String,
-    pub default_audio_track_policy: String,
-    pub normalization_mode: String,
-    pub night_listening_layout: String,
-    pub updated_at: String,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ItemPlanEnvelope {
     pub plan: ItemPlan,
     pub latest_revision: Option<ItemPlanRevision>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ItemPlanStatus {
-    Draft,
-    PendingOperator,
-    Approved,
-    Rejected,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

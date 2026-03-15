@@ -35,6 +35,12 @@ pub struct AppConfig {
     /// Max simultaneous bulk metadata requests before returning backpressure.
     #[serde(default = "default_bulk_metadata_max_inflight")]
     pub bulk_metadata_max_inflight: usize,
+    /// Global cap for simultaneous LLM requests initiated by HTTP handlers.
+    #[serde(default = "default_llm_max_inflight")]
+    pub llm_max_inflight: usize,
+    /// Minimum spacing in milliseconds between starting LLM requests.
+    #[serde(default = "default_llm_min_interval_ms")]
+    pub llm_min_interval_ms: u64,
     /// Golden Standards: encoding rules the LLM must respect.
     #[serde(default)]
     pub golden_standards: GoldenStandards,
@@ -199,6 +205,14 @@ fn default_bulk_metadata_concurrency() -> usize {
 
 fn default_bulk_metadata_max_inflight() -> usize {
     2
+}
+
+fn default_llm_max_inflight() -> usize {
+    1
+}
+
+fn default_llm_min_interval_ms() -> u64 {
+    250
 }
 
 fn default_metadata_provider() -> String {
@@ -426,6 +440,8 @@ impl Default for AppConfig {
             scan_queue_capacity: default_scan_queue_capacity(),
             bulk_metadata_concurrency: default_bulk_metadata_concurrency(),
             bulk_metadata_max_inflight: default_bulk_metadata_max_inflight(),
+            llm_max_inflight: default_llm_max_inflight(),
+            llm_min_interval_ms: default_llm_min_interval_ms(),
             golden_standards: GoldenStandards::default(),
             playback_context: String::new(),
             library_view_mode: default_library_view_mode(),

@@ -33,8 +33,8 @@ use sqlx::SqlitePool;
 use std::convert::Infallible;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{RwLock, Semaphore, broadcast};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore, broadcast};
 use tokio_stream::wrappers::BroadcastStream;
 use tower::ServiceExt as _;
 use tower_http::cors::CorsLayer;
@@ -124,6 +124,9 @@ pub struct AppState {
     pub ingest_path: PathBuf,
     pub config: Arc<RwLock<AppConfig>>,
     pub bulk_metadata_request_limiter: Arc<Semaphore>,
+    pub llm_request_limiter: Arc<Semaphore>,
+    pub llm_min_interval_ms: u64,
+    pub llm_last_started_at: Arc<Mutex<Option<Instant>>>,
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -1166,6 +1169,32 @@ fn job_relative_path(library_path: &Path, file_path: &str) -> Option<String> {
         .map(|value| value.to_string_lossy().replace('\\', "/"))
 }
 
+async fn acquire_llm_slot(state: &Arc<AppState>) -> Result<OwnedSemaphorePermit, HandlerError> {
+    let permit = state
+        .llm_request_limiter
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| HandlerError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "LLM request limiter is unavailable".to_string(),
+        })?;
+
+    let min_interval = Duration::from_millis(state.llm_min_interval_ms);
+    if !min_interval.is_zero() {
+        let mut last_started = state.llm_last_started_at.lock().await;
+        if let Some(previous) = *last_started {
+            let elapsed = previous.elapsed();
+            if elapsed < min_interval {
+                tokio::time::sleep(min_interval - elapsed).await;
+            }
+        }
+        *last_started = Some(Instant::now());
+    }
+
+    Ok(permit)
+}
+
 async fn create_intake_review_job(
     State(state): State<Arc<AppState>>,
     Json(request): Json<CreateIntakeReviewRequest>,
@@ -1312,6 +1341,7 @@ async fn create_intake_review_job_for_path(
     let mut decision = if let Some(override_payload) = planner_override.as_ref() {
         override_payload.decision.clone()
     } else {
+        let _llm_permit = acquire_llm_slot(state).await?;
         brain::create_processing_decision(
             &config,
             &IdentifiedMedia {
@@ -2555,6 +2585,11 @@ pub async fn create_or_refresh_plan(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CreatePlanRequest>,
 ) -> impl axum::response::IntoResponse {
+    let _llm_permit = match acquire_llm_slot(&state).await {
+        Ok(permit) => permit,
+        Err(error) => return (error.status, error.message).into_response(),
+    };
+
     let config = state.config.read().await.clone();
     match crate::planner::create_or_refresh_plan(&state.pool, &config, &req.path, &req.mode).await {
         Ok(plan) => Json(plan).into_response(),
@@ -2590,6 +2625,18 @@ async fn create_or_refresh_plan_bulk(
             });
             continue;
         }
+
+        let _llm_permit = match acquire_llm_slot(&state).await {
+            Ok(permit) => permit,
+            Err(error) => {
+                failures.push(BulkFailure {
+                    path: trimmed,
+                    error: error.message,
+                });
+                continue;
+            }
+        };
+
         match crate::planner::create_or_refresh_plan(
             &state.pool,
             &config,
@@ -2645,6 +2692,11 @@ pub async fn send_followup(
     State(state): State<Arc<AppState>>,
     Json(req): Json<FollowupRequest>,
 ) -> impl axum::response::IntoResponse {
+    let _llm_permit = match acquire_llm_slot(&state).await {
+        Ok(permit) => permit,
+        Err(error) => return (error.status, error.message).into_response(),
+    };
+
     let config = state.config.read().await.clone();
     match crate::planner::apply_followup_for_item(&state.pool, &config, &req.path, &req.message)
         .await
@@ -3195,6 +3247,9 @@ mod tests {
             ingest_path,
             config: Arc::new(RwLock::new(cfg)),
             bulk_metadata_request_limiter: Arc::new(Semaphore::new(2)),
+            llm_request_limiter: Arc::new(Semaphore::new(1)),
+            llm_min_interval_ms: 0,
+            llm_last_started_at: Arc::new(Mutex::new(None)),
         };
 
         build_router(state)

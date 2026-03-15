@@ -513,6 +513,8 @@ export interface AppConfig {
 	scan_queue_capacity: number;
 	bulk_metadata_concurrency: number;
 	bulk_metadata_max_inflight: number;
+	llm_max_inflight: number;
+	llm_min_interval_ms: number;
 	golden_standards: GoldenStandards;
 	playback_context: string;
 	library_view_mode: LibraryViewMode;

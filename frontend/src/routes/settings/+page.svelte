@@ -51,6 +51,10 @@
 
 	async function save() {
 		if (!config) return;
+		config.max_io_concurrency = Math.max(1, Math.min(32, Math.trunc(config.max_io_concurrency || 1)));
+		config.metadata_prewarm_limit = Math.max(0, Math.min(5000, Math.trunc(config.metadata_prewarm_limit || 0)));
+		config.llm_max_inflight = Math.max(1, Math.min(8, Math.trunc(config.llm_max_inflight || 1)));
+		config.llm_min_interval_ms = Math.max(0, Math.min(5000, Math.trunc(config.llm_min_interval_ms || 0)));
 		saving = true;
 		toast = null;
 		try {
@@ -963,6 +967,16 @@ ${normalizedContext}`;
 						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">Metadata Prewarm Limit</span>
 						<input type="number" bind:value={config.metadata_prewarm_limit} min="0" max="5000" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]" />
 						<span class="mt-1 block text-xs text-[color:var(--ink-muted)]">Number of recent items to probe on startup</span>
+					</label>
+					<label class="block">
+						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">LLM Max In-Flight Requests <span class="font-normal">(restart required)</span></span>
+						<input type="number" bind:value={config.llm_max_inflight} min="1" max="8" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]" />
+						<span class="mt-1 block text-xs text-[color:var(--ink-muted)]">Global ceiling for simultaneous LLM calls across planner and review endpoints. Lower values reduce API burst risk.</span>
+					</label>
+					<label class="block">
+						<span class="mb-1 block text-xs font-semibold text-[color:var(--ink-muted)]">LLM Request Spacing (ms) <span class="font-normal">(restart required)</span></span>
+						<input type="number" bind:value={config.llm_min_interval_ms} min="0" max="5000" step="25" class="w-full rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-3 py-2 text-sm text-[color:var(--ink-strong)]" />
+						<span class="mt-1 block text-xs text-[color:var(--ink-muted)]">Minimum delay between starting LLM requests. Useful for providers with strict rate limits.</span>
 					</label>
 					<label class="flex items-start gap-3">
 						<input type="checkbox" bind:checked={config.scan_compute_checksums} class="mt-1 rounded border-[color:var(--line)] accent-[color:var(--accent)]" />

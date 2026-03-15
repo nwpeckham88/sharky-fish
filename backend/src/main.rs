@@ -29,6 +29,7 @@ use crate::server::{AppState, build_router};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 use tracing::{info, warn};
 
@@ -196,6 +197,9 @@ async fn main() -> Result<()> {
         bulk_metadata_request_limiter: Arc::new(Semaphore::new(
             cfg.bulk_metadata_max_inflight.max(1),
         )),
+        llm_request_limiter: Arc::new(Semaphore::new(cfg.llm_max_inflight.max(1))),
+        llm_min_interval_ms: cfg.llm_min_interval_ms,
+        llm_last_started_at: Arc::new(tokio::sync::Mutex::new(Some(Instant::now()))),
     };
     let app = build_router(state);
     let addr = format!("0.0.0.0:{}", port);
