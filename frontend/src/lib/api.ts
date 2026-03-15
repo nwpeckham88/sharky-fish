@@ -113,6 +113,13 @@ export interface BulkCreateReviewResponse {
 	failures: BulkFailure[];
 }
 
+export interface BulkCreatePlanResponse {
+	plans: ItemPlanEnvelope[];
+	success_count: number;
+	failure_count: number;
+	failures: BulkFailure[];
+}
+
 export interface BulkManagedStatusResponse {
 	success_count: number;
 	failure_count: number;
@@ -952,6 +959,19 @@ export async function createOrRefreshLibraryPlan(path: string, mode = 'create_or
 	if (!res.ok) {
 		const text = await res.text();
 		throw new Error(text || `Failed to create/refresh plan for ${path}: ${res.status}`);
+	}
+	return res.json();
+}
+
+export async function createOrRefreshLibraryPlanBulk(paths: string[]): Promise<BulkCreatePlanResponse> {
+	const res = await fetch(`${BASE}/library/plan/bulk`, {
+		method: 'POST',
+		headers: { 'Content-Type': 'application/json' },
+		body: JSON.stringify({ paths })
+	});
+	if (!res.ok) {
+		const text = await res.text();
+		throw new Error(text || `Failed to create/refresh bulk plans: ${res.status}`);
 	}
 	return res.json();
 }

@@ -84,6 +84,14 @@ struct BulkCreateReviewResponse {
 }
 
 #[derive(Serialize)]
+struct BulkCreatePlanResponse {
+    plans: Vec<crate::planner::ItemPlanEnvelope>,
+    success_count: usize,
+    failure_count: usize,
+    failures: Vec<BulkFailure>,
+}
+
+#[derive(Serialize)]
 struct BulkManagedStatusResponse {
     success_count: usize,
     failure_count: usize,
@@ -130,6 +138,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/library/plan/followup",
             axum::routing::post(send_followup),
+        )
+        .route(
+            "/api/library/plan/bulk",
+            axum::routing::post(create_or_refresh_plan_bulk),
         )
         .route(
             "/api/library/plan/accept-metadata",
@@ -2554,6 +2566,55 @@ pub async fn create_or_refresh_plan(
     }
 }
 
+async fn create_or_refresh_plan_bulk(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BulkPathsRequest>,
+) -> impl axum::response::IntoResponse {
+    if req.paths.is_empty() {
+        return (StatusCode::BAD_REQUEST, "paths are required").into_response();
+    }
+    if req.paths.len() > 500 {
+        return (StatusCode::BAD_REQUEST, "too many paths").into_response();
+    }
+
+    let config = state.config.read().await.clone();
+    let mut plans = Vec::new();
+    let mut failures = Vec::new();
+
+    for path in req.paths {
+        let trimmed = path.trim().to_string();
+        if trimmed.is_empty() {
+            failures.push(BulkFailure {
+                path: path.to_string(),
+                error: "path is required".to_string(),
+            });
+            continue;
+        }
+        match crate::planner::create_or_refresh_plan(
+            &state.pool,
+            &config,
+            &trimmed,
+            "create_or_refresh",
+        )
+        .await
+        {
+            Ok(plan) => plans.push(plan),
+            Err(error) => failures.push(BulkFailure {
+                path: trimmed,
+                error: error.to_string(),
+            }),
+        }
+    }
+
+    Json(BulkCreatePlanResponse {
+        success_count: plans.len(),
+        failure_count: failures.len(),
+        plans,
+        failures,
+    })
+    .into_response()
+}
+
 #[derive(Deserialize)]
 pub struct PlanQuery {
     pub path: String,
@@ -3079,6 +3140,141 @@ pub async fn get_plan_history(
             format!("failed to load plan messages: {error}"),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode};
+    use serde::Deserialize;
+
+    #[derive(Debug, Deserialize)]
+    struct BulkPlanResponseBody {
+        success_count: usize,
+        failure_count: usize,
+        failures: Vec<BulkFailureBody>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct BulkFailureBody {
+        path: String,
+        error: String,
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("sharky-fish-{name}-{nonce}"))
+    }
+
+    async fn build_test_app() -> Router {
+        let root = unique_temp_path("server-tests");
+        let library_path = root.join("library");
+        let ingest_path = root.join("ingest");
+        let config_path = root.join("config");
+        std::fs::create_dir_all(&library_path).expect("library path should be created");
+        std::fs::create_dir_all(&ingest_path).expect("ingest path should be created");
+        std::fs::create_dir_all(&config_path).expect("config path should be created");
+
+        let mut cfg = AppConfig::default();
+        cfg.data_path = library_path.to_string_lossy().to_string();
+        cfg.ingest_path = ingest_path.to_string_lossy().to_string();
+        cfg.config_path = config_path.to_string_lossy().to_string();
+
+        let db_path = config_path.join("test.db");
+        let pool = db::init_pool(&db_path).await.expect("db should initialize");
+        let (sse_tx, _) = broadcast::channel::<SseEvent>(32);
+        let state = AppState {
+            pool,
+            sse_tx,
+            library_path,
+            ingest_path,
+            config: Arc::new(RwLock::new(cfg)),
+            bulk_metadata_request_limiter: Arc::new(Semaphore::new(2)),
+        };
+
+        build_router(state)
+    }
+
+    #[tokio::test]
+    async fn bulk_plan_rejects_empty_paths() {
+        let app = build_test_app().await;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/library/plan/bulk")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"paths":[]}"#))
+            .expect("request should build");
+
+        let response = app.oneshot(request).await.expect("request should complete");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("body should be utf-8");
+        assert!(text.contains("paths are required"));
+    }
+
+    #[tokio::test]
+    async fn bulk_plan_rejects_more_than_500_paths() {
+        let app = build_test_app().await;
+        let paths: Vec<String> = (0..501)
+            .map(|index| format!("movies/item-{index}.mkv"))
+            .collect();
+        let body = serde_json::json!({ "paths": paths });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/library/plan/bulk")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request should build");
+
+        let response = app.oneshot(request).await.expect("request should complete");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let text = String::from_utf8(body.to_vec()).expect("body should be utf-8");
+        assert!(text.contains("too many paths"));
+    }
+
+    #[tokio::test]
+    async fn bulk_plan_returns_mixed_payload_shape() {
+        let app = build_test_app().await;
+        let body = serde_json::json!({
+            "paths": [
+                "movies/Example.Movie.2024.mkv",
+                "   "
+            ]
+        });
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/library/plan/bulk")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .expect("request should build");
+
+        let response = app.oneshot(request).await.expect("request should complete");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body should be readable");
+        let payload: BulkPlanResponseBody = serde_json::from_slice(&body)
+            .expect("payload should parse");
+
+        assert_eq!(payload.success_count + payload.failure_count, 2);
+        assert!(payload.failure_count >= 1);
+        if let Some(failure) = payload.failures.first() {
+            assert!(!failure.path.is_empty());
+            assert!(!failure.error.is_empty());
+        }
     }
 }
 

@@ -7,6 +7,7 @@
 		acceptLibraryPlanMetadata,
 		autoSelectLibraryInternetMetadataBulk,
 		createOrRefreshLibraryPlan,
+		createOrRefreshLibraryPlanBulk,
 		fetchConfig,
 		fetchCurrentLibraryPlan,
 		fetchLibrary,
@@ -233,6 +234,7 @@
 	let plannerFollowup = $state('');
 	let plannerExecutionMode = $state<ReviewExecutionMode>('full_plan');
 	let plannerPreferenceScope = $state<'item' | 'series' | 'movie' | 'library'>('item');
+	let plannerExpandedHistoryRevisions = $state<Set<number>>(new Set());
 	let bulkActionFailedPaths = $state<string[]>([]);
 	let bulkInternetFailedPaths = $state<string[]>([]);
 	let libraryLoading = $state(true);
@@ -513,6 +515,7 @@
 		plannerFollowup = '';
 		plannerExecutionMode = 'full_plan';
 		plannerPreferenceScope = 'item';
+		plannerExpandedHistoryRevisions = new Set();
 		bulkActionFailedPaths = [];
 		bulkInternetFailedPaths = [];
 		metadataLoading = true;
@@ -681,6 +684,20 @@
 		return output.slice(-6).reverse();
 	}
 
+	function togglePlannerHistoryRevision(revisionId: number) {
+		const next = new Set(plannerExpandedHistoryRevisions);
+		if (next.has(revisionId)) {
+			next.delete(revisionId);
+		} else {
+			next.add(revisionId);
+		}
+		plannerExpandedHistoryRevisions = next;
+	}
+
+	function plannerHistoryRevisionExpanded(revisionId: number): boolean {
+		return plannerExpandedHistoryRevisions.has(revisionId);
+	}
+
 	async function loadPlanner(path: string) {
 		plannerLoading = true;
 		plannerError = '';
@@ -730,6 +747,7 @@
 		plannerError = '';
 		try {
 			plannerHistory = await fetchLibraryPlanHistory(selectedItem.relative_path);
+			plannerExpandedHistoryRevisions = new Set();
 			plannerStatus = `Loaded ${plannerHistory.revisions.length} planner revision(s).`;
 		} catch (error) {
 			plannerError = error instanceof Error ? error.message : 'Failed to load planner history';
@@ -1014,27 +1032,27 @@
 
 	async function runBulkCreatePlanner() {
 		if (selectedPaths.size === 0) return;
+		if (selectedPaths.size > 500) {
+			bulkActionStatus = 'Select 500 items or fewer for one bulk planner request.';
+			return;
+		}
 		bulkActionLoading = true;
 		bulkActionStatus = '';
 		bulkActionFailedPaths = [];
 		rowActionError = '';
 		const paths = Array.from(selectedPaths);
 		try {
-			const failedPaths: string[] = [];
-			const batchSize = 4;
-			for (let index = 0; index < paths.length; index += batchSize) {
-				const batch = paths.slice(index, index + batchSize);
-				const outcomes = await Promise.allSettled(
-					batch.map((path) => createOrRefreshLibraryPlan(path, 'create_or_refresh'))
+			const response = await createOrRefreshLibraryPlanBulk(paths);
+			const failedPaths = response.failures.map((failure) => failure.path);
+			const successCount = response.success_count;
+			if (selectedItem) {
+				const selectedPlan = response.plans.find(
+					(plan) => plan.plan.relative_path === selectedItem?.relative_path
 				);
-				for (let outcomeIndex = 0; outcomeIndex < outcomes.length; outcomeIndex += 1) {
-					if (outcomes[outcomeIndex].status === 'rejected') {
-						failedPaths.push(batch[outcomeIndex]);
-					}
+				if (selectedPlan) {
+					plannerEnvelope = selectedPlan;
 				}
 			}
-
-			const successCount = paths.length - failedPaths.length;
 			bulkActionFailedPaths = failedPaths;
 			selectedPaths = new Set(failedPaths);
 			bulkActionStatus = failedPaths.length === 0
@@ -2258,9 +2276,54 @@
 												<div class="rounded-lg border border-[color:var(--line)] bg-[color:var(--panel-strong)] px-2.5 py-2 text-[11px]">
 													<div class="flex flex-wrap items-center justify-between gap-2 text-[color:var(--ink-muted)]">
 														<span>Revision #{diff.revision.revision_number} · {diff.revision.source}</span>
-														<span>{formatTimestamp(Date.parse(diff.revision.created_at) / 1000)}</span>
+														<div class="flex items-center gap-2">
+															<span>{formatTimestamp(Date.parse(diff.revision.created_at) / 1000)}</span>
+															<button class="rounded-md border border-[color:var(--line)] px-2 py-0.5 text-[10px] font-semibold text-[color:var(--ink-strong)]" onclick={() => togglePlannerHistoryRevision(diff.revision.id)}>
+																{plannerHistoryRevisionExpanded(diff.revision.id) ? 'Hide' : 'Inspect'}
+															</button>
+														</div>
 													</div>
 													<div class="mt-1 text-[color:var(--ink-strong)]">{diff.changes.join(' • ')}</div>
+													{#if plannerHistoryRevisionExpanded(diff.revision.id)}
+														{@const recommendation = parsePlannerJson<{ category?: string; reason?: string; confidence?: number }>(diff.revision.recommendation_json)}
+														{@const processing = parsePlannerJson<{ action?: string; rationale?: string; ffmpeg_arguments?: string[] }>(diff.revision.processing_json)}
+														{@const metadataResolution = parsePlannerJson<{ selected_candidate?: InternetMetadataMatch | null }>(diff.revision.metadata_resolution_json)}
+														{@const warnings = parsePlannerJson<string[]>(diff.revision.warnings_json) ?? []}
+														{@const followups = parsePlannerJson<string[]>(diff.revision.followups_json) ?? []}
+														<div class="mt-2 grid gap-2 sm:grid-cols-2">
+															<div class="rounded-md border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.45)] px-2 py-1.5">
+																<div class="section-label">Recommendation</div>
+																<div class="mt-1 text-[color:var(--ink-strong)]">{recommendation?.category ?? 'unknown'} ({recommendation?.confidence ?? 0})</div>
+																{#if recommendation?.reason}
+																	<div class="mt-1 text-[color:var(--ink-muted)]">{recommendation.reason}</div>
+																{/if}
+															</div>
+															<div class="rounded-md border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.45)] px-2 py-1.5">
+																<div class="section-label">Processing</div>
+																<div class="mt-1 text-[color:var(--ink-strong)]">{processing?.action ?? 'unknown'}</div>
+																{#if processing?.rationale}
+																	<div class="mt-1 text-[color:var(--ink-muted)]">{processing.rationale}</div>
+																{/if}
+																{#if (processing?.ffmpeg_arguments?.length ?? 0) > 0}
+																	<div class="mt-1 break-all font-mono text-[10px] text-[color:var(--ink-muted)]">{processing?.ffmpeg_arguments?.join(' ')}</div>
+																{/if}
+															</div>
+															<div class="rounded-md border border-[color:var(--line)] bg-[color:rgba(255,248,237,0.45)] px-2 py-1.5 sm:col-span-2">
+																<div class="section-label">Metadata Candidate</div>
+																{#if metadataResolution?.selected_candidate}
+																	<div class="mt-1 text-[color:var(--ink-strong)]">{metadataResolution.selected_candidate.title}{metadataResolution.selected_candidate.year ? ` (${metadataResolution.selected_candidate.year})` : ''} · {metadataResolution.selected_candidate.provider.toUpperCase()}</div>
+																{:else}
+																	<div class="mt-1 text-[color:var(--ink-muted)]">No selected candidate</div>
+																{/if}
+																{#if warnings.length > 0}
+																	<div class="mt-1 text-[color:var(--accent-deep)]">Warnings: {warnings.join(' • ')}</div>
+																{/if}
+																{#if followups.length > 0}
+																	<div class="mt-1 text-[color:var(--ink-muted)]">Follow-ups: {followups.join(' • ')}</div>
+																{/if}
+															</div>
+														</div>
+													{/if}
 												</div>
 											{/each}
 										</div>

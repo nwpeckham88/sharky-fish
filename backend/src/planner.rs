@@ -805,7 +805,10 @@ fn parse_default_track_policy(value: &str) -> DefaultAudioTrackPolicy {
 }
 
 fn is_valid_execution_mode(value: &str) -> bool {
-    matches!(value, "full_plan" | "organize_only" | "process_only")
+    matches!(
+        value,
+        "full_plan" | "organize_only" | "process_only" | "metadata_only"
+    )
 }
 
 fn movie_scope_key(candidate: &InternetMetadataMatch) -> String {
@@ -1718,6 +1721,7 @@ mod tests {
         assert!(is_valid_execution_mode("full_plan"));
         assert!(is_valid_execution_mode("organize_only"));
         assert!(is_valid_execution_mode("process_only"));
+        assert!(is_valid_execution_mode("metadata_only"));
         assert!(!is_valid_execution_mode("dry_run"));
         assert!(!is_valid_execution_mode(""));
     }
