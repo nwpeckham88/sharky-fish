@@ -40,6 +40,14 @@ impl IdentifierActor {
     pub async fn run(mut self) -> Result<()> {
         info!("identifier: actor started");
         while let Some(event) = self.rx.recv().await {
+            if !path_in_configured_library(&event.path, &self.config).await {
+                info!(
+                    file = %event.path.display(),
+                    "identifier: skipping event outside configured media libraries"
+                );
+                continue;
+            }
+
             let tx = self.tx.clone();
             let io_semaphore = self.io_semaphore.clone();
             let config = self.config.clone();
@@ -130,6 +138,24 @@ impl IdentifierActor {
     }
 }
 
+async fn path_in_configured_library(path: &Path, config: &Arc<RwLock<AppConfig>>) -> bool {
+    let cfg = config.read().await;
+    let media_root = Path::new(&cfg.data_path);
+    let Ok(relative) = path.strip_prefix(media_root) else {
+        return false;
+    };
+
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    cfg.libraries.iter().any(|library| {
+        let prefix = if library.path.ends_with('/') {
+            library.path.clone()
+        } else {
+            format!("{}/", library.path)
+        };
+        relative == library.path || relative.starts_with(&prefix)
+    })
+}
+
 fn should_retry_probe_failure(error: &anyhow::Error, path: &Path) -> bool {
     if !path.exists() {
         return true;
@@ -140,4 +166,48 @@ fn should_retry_probe_failure(error: &anyhow::Error, path: &Path) -> bool {
         || message.contains("invalid data")
         || message.contains("moov atom not found")
         || message.contains("resource temporarily unavailable")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::LibraryFolder;
+
+    fn test_config() -> Arc<RwLock<AppConfig>> {
+        let mut cfg = AppConfig::default();
+        cfg.data_path = "/data/media".to_string();
+        cfg.libraries = vec![
+            LibraryFolder {
+                id: "movies".to_string(),
+                name: "Movies".to_string(),
+                path: "movies".to_string(),
+                media_type: "movie".to_string(),
+            },
+            LibraryFolder {
+                id: "tv".to_string(),
+                name: "TV".to_string(),
+                path: "tv".to_string(),
+                media_type: "tv".to_string(),
+            },
+        ];
+        Arc::new(RwLock::new(cfg))
+    }
+
+    #[tokio::test]
+    async fn path_in_configured_library_accepts_known_library_paths() {
+        let cfg = test_config();
+        assert!(
+            path_in_configured_library(Path::new("/data/media/movies/Big.Fish.2003.mkv"), &cfg)
+                .await
+        );
+        assert!(path_in_configured_library(Path::new("/data/media/tv/Show/S01E01.mkv"), &cfg).await);
+    }
+
+    #[tokio::test]
+    async fn path_in_configured_library_rejects_outside_or_unmapped_paths() {
+        let cfg = test_config();
+        assert!(!path_in_configured_library(Path::new("/data/downloads/radarr/file.mkv"), &cfg).await);
+        assert!(!path_in_configured_library(Path::new("/data/media/music/track.flac"), &cfg).await);
+        assert!(!path_in_configured_library(Path::new("/otherroot/movies/file.mkv"), &cfg).await);
+    }
 }

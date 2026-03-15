@@ -7,6 +7,7 @@ use crate::messages::{LibraryIndexScanProgress, SseEvent};
 use anyhow::Result;
 use futures::stream::StreamExt;
 use sqlx::SqlitePool;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -132,70 +133,92 @@ pub async fn run_full_rescan(
             }
             debug!(path = %producer_root.display(), "library scan: walking filesystem");
 
-            for entry in walkdir::WalkDir::new(&producer_root)
-                .follow_links(false)
-                .into_iter()
-                .filter_entry(|entry| {
-                    let rel = entry
-                        .path()
-                        .strip_prefix(&producer_root)
-                        .unwrap_or(entry.path())
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    !is_excluded_relative_path(&rel, &producer_excludes)
-                })
-                .filter_map(|entry| entry.ok())
-                .filter(|entry| entry.file_type().is_file())
-            {
-                let path = entry.path();
-                let Some(media_type) = detect_media_type(path) else {
+            if producer_libraries.is_empty() {
+                warn!("library scan: no configured libraries; skipping file discovery");
+                return Ok(());
+            }
+
+            let mut seen_relative_paths = HashSet::<String>::new();
+            for library in &producer_libraries {
+                let library_root = producer_root.join(&library.path);
+                if !library_root.exists() {
+                    warn!(
+                        library_id = %library.id,
+                        path = %library_root.display(),
+                        "library scan: configured library path does not exist; skipping"
+                    );
                     continue;
-                };
-
-                let metadata = match entry.metadata() {
-                    Ok(value) => value,
-                    Err(_) => continue,
-                };
-
-                let modified_at = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-                    .map(|value| value.as_secs())
-                    .unwrap_or(0);
-                let relative_path = relative_path_string(&producer_root, path);
-                let file_name = path
-                    .file_name()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let extension = path
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                let facts = filesystem_audit::file_system_facts(&metadata);
-
-                let discovered = producer_total.fetch_add(1, Ordering::Relaxed) + 1;
-                if discovered.is_multiple_of(500) {
-                    debug!(discovered, "library scan: discovery progress");
                 }
-                let candidate = IndexCandidate {
-                    relative_path: relative_path.clone(),
-                    file_path: path.display().to_string(),
-                    file_name,
-                    extension,
-                    media_type: media_type.to_string(),
-                    size_bytes: metadata.len(),
-                    modified_at,
-                    device_id: facts.device_id,
-                    inode: facts.inode,
-                    link_count: facts.link_count,
-                    library_id: match_library_id(&relative_path, &producer_libraries),
-                };
 
-                if tx.blocking_send(candidate).is_err() {
-                    break;
+                for entry in walkdir::WalkDir::new(&library_root)
+                    .follow_links(false)
+                    .into_iter()
+                    .filter_entry(|entry| {
+                        let rel = entry
+                            .path()
+                            .strip_prefix(&producer_root)
+                            .unwrap_or(entry.path())
+                            .to_string_lossy()
+                            .replace('\\', "/");
+                        !is_excluded_relative_path(&rel, &producer_excludes)
+                    })
+                    .filter_map(|entry| entry.ok())
+                    .filter(|entry| entry.file_type().is_file())
+                {
+                    let path = entry.path();
+                    let Some(media_type) = detect_media_type(path) else {
+                        continue;
+                    };
+
+                    let metadata = match entry.metadata() {
+                        Ok(value) => value,
+                        Err(_) => continue,
+                    };
+
+                    let modified_at = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+                        .map(|value| value.as_secs())
+                        .unwrap_or(0);
+                    let relative_path = relative_path_string(&producer_root, path);
+                    if !seen_relative_paths.insert(relative_path.clone()) {
+                        continue;
+                    }
+
+                    let file_name = path
+                        .file_name()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or_default()
+                        .to_string();
+                    let extension = path
+                        .extension()
+                        .and_then(|value| value.to_str())
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    let facts = filesystem_audit::file_system_facts(&metadata);
+
+                    let discovered = producer_total.fetch_add(1, Ordering::Relaxed) + 1;
+                    if discovered.is_multiple_of(500) {
+                        debug!(discovered, "library scan: discovery progress");
+                    }
+                    let candidate = IndexCandidate {
+                        relative_path: relative_path.clone(),
+                        file_path: path.display().to_string(),
+                        file_name,
+                        extension,
+                        media_type: media_type.to_string(),
+                        size_bytes: metadata.len(),
+                        modified_at,
+                        device_id: facts.device_id,
+                        inode: facts.inode,
+                        link_count: facts.link_count,
+                        library_id: Some(library.id.clone()),
+                    };
+
+                    if tx.blocking_send(candidate).is_err() {
+                        break;
+                    }
                 }
             }
 
@@ -431,6 +454,12 @@ pub async fn apply_library_path_change(
     };
 
     let library_id = match_library_id(&relative_path, libraries);
+    if library_id.is_none() {
+        db::delete_library_index_entry(pool, &relative_path).await?;
+        managed_items::remove_missing_item(pool, &relative_path).await?;
+        return Ok(());
+    }
+
     db::upsert_library_index_entry(
         pool,
         &relative_path,
@@ -525,6 +554,9 @@ async fn refresh_media_for_metadata_sidecar(
             None
         };
         let library_id = match_library_id(&relative_path, libraries);
+        if library_id.is_none() {
+            continue;
+        }
 
         db::upsert_library_index_entry(
             pool,

@@ -78,9 +78,7 @@ impl WatcherActor {
 
         let mut watched_any = false;
         watched_any |= watch_path(&mut watcher, &ingest_path, "ingest");
-        if library_path != ingest_path {
-            watched_any |= watch_path(&mut watcher, &library_path, "library");
-        }
+        watched_any |= watch_path(&mut watcher, &library_path, "library");
 
         if !watched_any {
             warn!(
